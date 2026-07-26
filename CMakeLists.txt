@@ -31,6 +31,7 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
     src/dbsp_extension.cpp
     src/dbsp_recovery.cpp
     src/dbsp_crash_marker.cpp
+    src/dbsp_wal_manager.cpp
 )
 
 target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
@@ -69,6 +70,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/benchmark_runner.cpp")
         src/dbsp_extension.cpp
         src/dbsp_recovery.cpp
         src/dbsp_crash_marker.cpp
+        src/dbsp_wal_manager.cpp
     )
     target_include_directories(benchmark_runner PRIVATE
         ${DUCKDB_SOURCE_DIR}/src/include

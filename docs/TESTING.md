@@ -42,6 +42,13 @@ Tip mode uses scan-and-diff for UPDATE/DELETE paths whose old write-capture
 API is unavailable. Holistic aggregate values remain in memory on tip while
 table, join, and top-K spill paths remain enabled and tested.
 
+The tip port retains the circuit-state checkpoint format from upstream. The
+fork WAL improvement is available as an optional logical-delta journal; WAL
+serialization uses DuckDB's native value serializer and is flushed after
+successful captured-delta application. Recovery still treats committed
+DuckDB storage and circuit checkpoints as authoritative, rather than applying
+an independent sink snapshot on top of rebuilt state.
+
 Benchmarks and the soak test build alongside but are not part of ctest:
 
 ```bash
