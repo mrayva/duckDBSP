@@ -32,6 +32,7 @@
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_recovery.hpp"
+#include "dbsp_wal_manager.hpp"
 #ifndef DBSP_TIP_PORT
 #include "dbsp_write_capture.hpp"
 #endif
@@ -1225,6 +1226,27 @@ private:
     for (const auto &[table, delta] : merged) {
       if (!manager.apply_captured_delta(table, delta, &context)) {
         return false;
+      }
+      // The database remains the source of truth for recovery. WAL records
+      // the successfully applied logical delta for crash diagnostics and
+      // optional replay tooling; a logging failure never changes query
+      // correctness or causes the already-applied delta to be retried.
+      auto &wal = get_wal_manager();
+      if (wal.is_enabled()) {
+        for (const auto &[row, weight] : delta) {
+          if (weight > 0) {
+            for (int64_t i = 0; i < weight; i++) {
+              wal.log_insert(table, row);
+            }
+          } else {
+            for (int64_t i = 0; i > weight; i--) {
+              wal.log_delete(table, row);
+            }
+          }
+        }
+        if (!wal.flush()) {
+          std::cerr << "DBSP WAL flush failed: " << wal.last_error() << "\n";
+        }
       }
     }
     return true;

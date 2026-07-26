@@ -98,6 +98,7 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp
     )
     target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
                           duckdb_generated_extension_loader
@@ -137,6 +138,7 @@ add_dbsp_integration_test(distinct_ddl integration/test_distinct_ddl.cpp)
 add_dbsp_integration_test(set_ops_integration integration/test_set_ops.cpp)
 add_dbsp_integration_test(crash_recovery_phase1 integration/test_crash_recovery_phase1.cpp)
 add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_phase2.cpp)
+add_dbsp_integration_test(wal_recovery integration/test_wal.cpp)
 if(NOT DBSP_TIP_PORT)
     add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
 endif()
@@ -149,7 +151,8 @@ add_executable(bench_planner_eval
     benchmarks/bench_planner_eval.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
 target_link_libraries(bench_planner_eval catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
@@ -169,7 +172,8 @@ add_executable(bench_write_capture
     benchmarks/bench_write_capture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
 target_link_libraries(bench_write_capture catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
@@ -182,7 +186,8 @@ add_executable(bench_window
     benchmarks/bench_window.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
 target_link_libraries(bench_window catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
@@ -196,7 +201,8 @@ add_executable(bench_dataplane
     benchmarks/bench_dataplane.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
 target_link_libraries(bench_dataplane catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
@@ -209,7 +215,8 @@ add_executable(soak_differential
     benchmarks/soak_differential.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
 target_link_libraries(soak_differential catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)

@@ -1,6 +1,7 @@
 #include "dbsp_recovery.hpp"
 #include "dbsp_crash_marker.hpp"
 #include "dbsp_cdc.hpp"
+#include "dbsp_wal_manager.hpp"
 #include <filesystem>
 #include <iostream>
 #include <chrono>
@@ -91,7 +92,15 @@ bool DBSPRecoveryManager::initialize_persistence(duckdb::ClientContext &context)
 
     // Initialize _dbsp_views table via CDC manager
     auto &cdc_manager = get_cdc_manager(context);
-    return cdc_manager.initialize_persistence_table(context);
+    if (!cdc_manager.initialize_persistence_table(context)) {
+      return false;
+    }
+    if (!recovery_path_.empty() && !get_wal_manager().initialize()) {
+      std::cerr << "Failed to initialize WAL: "
+                << get_wal_manager().last_error() << std::endl;
+      return false;
+    }
+    return true;
 
   } catch (const std::exception &e) {
     std::cerr << "Failed to initialize persistence: " << e.what() << std::endl;

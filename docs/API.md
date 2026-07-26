@@ -739,6 +739,11 @@ correctness-first scan-and-diff path. The public SQL functions and automatic
 refresh semantics remain available; O(delta) capture claims above apply to
 the pinned release build only.
 
+Tip builds also retain the upstream circuit-state checkpoint path and expose
+the forked WAL journal internally for durable logical-delta diagnostics. WAL
+records are type-preserving, but DuckDB storage remains authoritative during
+recovery; WAL is not applied on top of a freshly rebuilt circuit state.
+
 Turn auto-sync off for bulk loads (each autocommit INSERT pays a scoped
 scan) and run one `dbsp_sync()` afterwards.
 
