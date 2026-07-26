@@ -20,7 +20,7 @@ endif()
 # Standalone builds own a DuckDB tree. When loaded by DuckDB's extension
 # build, the parent already owns DuckDB and adding it again creates duplicate
 # extension targets.
-if(NOT DBSP_USE_PARENT_DUCKDB)
+if(NOT DBSP_USE_PARENT_DUCKDB AND NOT TARGET duckdb_static)
     set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_SHELL ON CACHE BOOL "" FORCE)
     set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
