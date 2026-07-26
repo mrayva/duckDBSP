@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(TARGET_NAME dbsp)
 set(EXT_VERSION_DBSP "0.1.0")
+option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" OFF)
 
 # DuckDB source directory (set via command line or default)
 set(DUCKDB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/duckdb" CACHE PATH "Path to DuckDB source")
@@ -37,6 +38,7 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${DUCKDB_SOURCE_DIR}/src/include
     ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
+    ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
 )
 
 # SaaS-fork engine hook consumer. ON requires the patched submodule
@@ -46,6 +48,9 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
 option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
 if(DBSP_ENGINE_HOOK)
     target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_ENGINE_HOOK)
+endif()
+if(DBSP_TIP_PORT)
+    target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_TIP_PORT)
 endif()
 
 message(STATUS "")

@@ -8,15 +8,39 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-All tests build in `test/build_test` (32 binaries registered with
-ctest):
+For the pinned DuckDB release build:
 
 ```bash
-cd test/build_test
-cmake .. && make -j8
-ctest                       # full suite, ~15-45s
-./test_planner_frontend     # the big differential suite on its own
+cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
+cmake --build build -j8
+ctest --test-dir build --output-on-failure
+build/test/test_planner_frontend # the big differential suite on its own
 ```
+
+### DuckDB tip port
+
+Tip builds use the current DuckDB source tree and an explicit compatibility
+mode:
+
+```bash
+cmake -S . -B build-tip \
+  -DDUCKDB_SOURCE_DIR=/path/to/duckdb \
+  -DDBSP_TIP_PORT=ON \
+  -DDBSP_ENGINE_HOOK=OFF
+cmake --build build-tip -j4
+ctest --test-dir build-tip --output-on-failure -j1 --timeout 120
+```
+
+The supported tip baseline is the CTest suite plus the planner, CDC, and
+recursive integration suites. The validated baseline is 36/36 CTest tests
+passing and 88/88 planner cases passing. Legacy tests that directly require
+the removed write-capture, optimizer plan-tee, or engine-hook APIs are
+excluded in tip mode; this is an intentional compatibility boundary, not a
+silent pass.
+
+Tip mode uses scan-and-diff for UPDATE/DELETE paths whose old write-capture
+API is unavailable. Holistic aggregate values remain in memory on tip while
+table, join, and top-K spill paths remain enabled and tested.
 
 Benchmarks and the soak test build alongside but are not part of ctest:
 
@@ -96,7 +120,7 @@ bands — regressions here have reverted otherwise-working designs.
 - Randomized generators always include NULLs and duplicate values.
 - New state machinery ships with a property test against a plain
   in-memory oracle (see `test_zset.cpp`, `test_spill_store.cpp`).
-- Bench numbers quoted in commits come from `test/build_test` (release
+- Bench numbers quoted in commits come from `build` (release
   flags); sanitizer-build numbers are 20-30x slower and never quoted.
 
 For questions or issues, see [CONTRIBUTING.md](../CONTRIBUTING.md).

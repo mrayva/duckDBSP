@@ -732,6 +732,13 @@ failures fall back loudly (`capture_guard_fallbacks` counter).
 Correctness never depends on capture; the design is in
 `docs/DESIGN_WRITE_CAPTURE.md`.
 
+**DuckDB tip compatibility:** the write-capture and optimizer plan-tee APIs
+used by the release path are not present in current DuckDB tip. In
+`DBSP_TIP_PORT` builds, unsupported UPDATE/DELETE shapes therefore use the
+correctness-first scan-and-diff path. The public SQL functions and automatic
+refresh semantics remain available; O(delta) capture claims above apply to
+the pinned release build only.
+
 Turn auto-sync off for bulk loads (each autocommit INSERT pays a scoped
 scan) and run one `dbsp_sync()` afterwards.
 

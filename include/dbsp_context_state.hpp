@@ -32,7 +32,9 @@
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_recovery.hpp"
+#ifndef DBSP_TIP_PORT
 #include "dbsp_write_capture.hpp"
+#endif
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -42,6 +44,11 @@
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+#ifdef DBSP_TIP_PORT
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#endif
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -542,7 +549,10 @@ private:
   static std::string base_table_name(const duckdb::TableRef *ref) {
     if (ref && ref->type == duckdb::TableReferenceType::BASE_TABLE) {
       auto &base = ref->Cast<duckdb::BaseTableRef>();
-      return dotted_ref(base.catalog_name, base.schema_name, base.table_name);
+      const auto &name = base.GetQualifiedName();
+      return dotted_ref(name.Catalog().GetIdentifierName(),
+                        name.Schema().GetIdentifierName(),
+                        name.Name().GetIdentifierName());
     }
     return {};
   }
@@ -585,6 +595,58 @@ private:
         }
       }
     }
+#ifdef DBSP_TIP_PORT
+    duckdb::Parser parser;
+    try {
+      parser.ParseQuery(query);
+    } catch (...) {
+      out.kind = StmtClass::WRITE_UNKNOWN;
+      return out;
+    }
+    if (parser.statements.size() != 1) {
+      out.kind = parser.statements.empty() ? StmtClass::NONE
+                                           : StmtClass::WRITE_UNKNOWN;
+      return out;
+    }
+    auto &stmt = *parser.statements[0];
+    auto qualified_ref = [](const duckdb::QualifiedName &name) {
+      return dotted_ref(name.Catalog().GetIdentifierName(),
+                        name.Schema().GetIdentifierName(),
+                        name.Name().GetIdentifierName());
+    };
+    switch (stmt.type) {
+    case duckdb::StatementType::SELECT_STATEMENT:
+    case duckdb::StatementType::EXPLAIN_STATEMENT:
+    case duckdb::StatementType::PREPARE_STATEMENT:
+    case duckdb::StatementType::TRANSACTION_STATEMENT:
+      out.kind = StmtClass::READ;
+      return out;
+    case duckdb::StatementType::INSERT_STATEMENT: {
+      auto &insert = stmt.Cast<duckdb::InsertStatement>();
+      out.table = qualified_ref(insert.node->qualified_name);
+      out.kind = insert.node->on_conflict_info ? StmtClass::WRITE_KNOWN
+                                                : StmtClass::INSERT_OK;
+      return out;
+    }
+    case duckdb::StatementType::DELETE_STATEMENT: {
+      auto &del = stmt.Cast<duckdb::DeleteStatement>();
+      out.table = base_table_name(del.node->table.get());
+      out.kind = out.table.empty() ? StmtClass::WRITE_UNKNOWN
+                                   : StmtClass::WRITE_KNOWN;
+      return out;
+    }
+    case duckdb::StatementType::UPDATE_STATEMENT: {
+      auto &upd = stmt.Cast<duckdb::UpdateStatement>();
+      out.table = base_table_name(upd.node->table.get());
+      out.kind = out.table.empty() ? StmtClass::WRITE_UNKNOWN
+                                   : StmtClass::WRITE_KNOWN;
+      return out;
+    }
+    default:
+      out.kind = StmtClass::WRITE_UNKNOWN;
+      return out;
+    }
+#else
     duckdb::Parser parser;
     try {
       parser.ParseQuery(query);
@@ -630,6 +692,7 @@ private:
       out.kind = StmtClass::WRITE_UNKNOWN;
       return out;
     }
+#endif
   }
 
   // Merge one statement's classification into the transaction's sync scope
@@ -813,6 +876,11 @@ private:
   // expressions cast to their column types. Declining is always safe —
   // the statement stays on the scan-and-diff path.
   void try_write_capture(duckdb::ClientContext &context, CDCManager &manager) {
+#ifdef DBSP_TIP_PORT
+    (void)context;
+    (void)manager;
+    return;
+#else
     if (!manager.write_capture_enabled()) {
       return;
     }
@@ -975,6 +1043,7 @@ private:
     capture_.wrote_capture = true;
     capture_.active = true;
     stmt_.captured = true;
+#endif
   }
 
   // Commit guard part 3: re-read the captured rowids from committed
@@ -995,7 +1064,16 @@ private:
     }
     std::string col_list;
     for (const auto &col : schema->columns) {
-      col_list += ", " + quote_ident(col.name);
+      std::string quoted = "\"";
+      for (char ch : col.name) {
+        if (ch == '"') {
+          quoted += "\"\"";
+        } else {
+          quoted += ch;
+        }
+      }
+      quoted += "\"";
+      col_list += ", " + quoted;
     }
     constexpr size_t kBatch = 512;
     for (size_t start = 0; start < rows.size();) {

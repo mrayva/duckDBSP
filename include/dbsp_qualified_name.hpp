@@ -60,8 +60,9 @@ inline bool is_valid_table_reference(const std::string &name) {
 
 // Canonical dotted key for a resolved table.
 inline std::string canonical_table_key(const duckdb::TableCatalogEntry &entry) {
-  return entry.ParentCatalog().GetName() + "." + entry.ParentSchema().name +
-         "." + entry.name;
+  return entry.ParentCatalog().GetName().GetIdentifierName() + "." +
+         entry.ParentSchema().name.GetIdentifierName() + "." +
+         entry.name.GetIdentifierName();
 }
 
 // Resolve a user-supplied table reference (bare or dotted) through the
@@ -70,21 +71,20 @@ inline duckdb::optional_ptr<duckdb::TableCatalogEntry>
 resolve_table_entry(duckdb::ClientContext &context, const std::string &ref) {
   try {
     auto qn = duckdb::QualifiedName::Parse(ref);
-    if (qn.catalog == INVALID_CATALOG) {
-      qn.catalog = "";
-    }
-    if (qn.schema == INVALID_SCHEMA) {
-      qn.schema = "";
-    }
+    const auto catalog = qn.Catalog().GetIdentifierName();
+    const auto schema = qn.Schema().GetIdentifierName();
+    const auto name = qn.Name().GetIdentifierName();
     auto entry = duckdb::Catalog::GetEntry<duckdb::TableCatalogEntry>(
-        context, qn.catalog, qn.schema, qn.name,
+        context, duckdb::Identifier(catalog), duckdb::Identifier(schema),
+        duckdb::Identifier(name),
         duckdb::OnEntryNotFound::RETURN_NULL);
-    if (!entry && qn.catalog.empty() && !qn.schema.empty()) {
+    if (!entry && catalog.empty() && !schema.empty()) {
       // Two-part refs are ambiguous: Parse() reads "a.li" as schema.table,
       // but "a" may be a catalog (ATTACH ... AS a). Mirror the binder and
       // retry with the first part as the catalog.
       entry = duckdb::Catalog::GetEntry<duckdb::TableCatalogEntry>(
-          context, qn.schema, "", qn.name,
+          context, duckdb::Identifier(schema), duckdb::Identifier(),
+          duckdb::Identifier(name),
           duckdb::OnEntryNotFound::RETURN_NULL);
     }
     return entry;

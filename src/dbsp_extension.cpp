@@ -50,7 +50,9 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
 #include "dbsp_engine_hook.hpp"
+#ifndef DBSP_TIP_PORT
 #include "dbsp_plan_tee.hpp"
+#endif
 #include "dbsp_recovery.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
@@ -292,11 +294,21 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
         "dbsp_notify_insert/delete(table, val1, val2, ...)");
   }
 
-  data->table_name = input.inputs[0].GetValue<string>();
+  data->table_name = CanonicalTableRef(
+      context, input.inputs[0].GetValue<string>());
 
-  // Convert values to DuckDBRow
+  // Manual notifications arrive through ANY arguments, so their runtime
+  // types are often wider than the tracked table (e.g. DOUBLE for a
+  // DECIMAL column). Normalize them to the table schema before hashing and
+  // propagating; CDC rows must have the same logical types as scanned rows.
+  const auto *schema =
+      dbsp_native::get_cdc_manager(context).get_table_schema(data->table_name);
   for (idx_t i = 1; i < input.inputs.size(); i++) {
-    data->row.columns.push_back(input.inputs[i]);
+    auto value = input.inputs[i];
+    if (schema && i - 1 < schema->columns.size()) {
+      value = value.DefaultCastAs(schema->columns[i - 1].type);
+    }
+    data->row.columns.push_back(std::move(value));
   }
 
   return_types.push_back(LogicalType::VARCHAR);
@@ -2262,7 +2274,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
   // D2 plan tee: exact captured deltas for DML shapes the design-1
   // pre-image SELECT declines (docs/DESIGN_WRITE_CAPTURE.md)
+#ifndef DBSP_TIP_PORT
   dbsp_native::register_plan_tee(config);
+#endif
 
   // SaaS-fork engine hook: exact commit deltas straight from the patched
   // engine (patches/v1.5.4-dbsp-txn-callback.patch). Returns false (no-op)
