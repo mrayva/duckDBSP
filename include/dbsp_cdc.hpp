@@ -49,6 +49,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 
 namespace dbsp_native {
 
@@ -1894,7 +1895,8 @@ private:
 
       // Table must exist - we can't create tables from within table functions
       auto existing = schema_entry.GetEntry(
-          catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
+          catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
+          duckdb::Identifier(storage_table));
       if (!existing) {
         last_error_ =
             "Storage table '" + storage_table +
@@ -1948,7 +1950,8 @@ public:
 
       // Check if storage table exists
       auto table_ptr = schema_entry.GetEntry(
-          catalog_txn, duckdb::CatalogType::TABLE_ENTRY, storage_table);
+          catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
+          duckdb::Identifier(storage_table));
       if (!table_ptr) {
         // Table doesn't exist - nothing to load
         return true;
@@ -3081,7 +3084,7 @@ private:
 
       for (auto &col : table_entry.GetColumns().Logical()) {
         ColumnInfo col_info;
-        col_info.name = col.Name();
+        col_info.name = col.Name().GetIdentifierName();
         col_info.type = col.Type();
         schema.columns.push_back(col_info);
       }

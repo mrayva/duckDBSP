@@ -131,17 +131,34 @@ LOAD '/path/to/dbsp.duckdb_extension';
 
 ### Running Tests
 
+For the pinned release tree:
+
 ```bash
-# Build and run the full suite (unit + integration)
-cd test/build_test
-cmake .. && make -j8
-ctest
+cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
+cmake --build build -j8
+ctest --test-dir build --output-on-failure
+```
+
+For a current DuckDB tip checkout, use the explicit tip compatibility port:
+
+```bash
+cmake -S . -B build-tip \
+  -DDUCKDB_SOURCE_DIR=/path/to/duckdb \
+  -DDBSP_TIP_PORT=ON \
+  -DDBSP_ENGINE_HOOK=OFF
+cmake --build build-tip -j4
+ctest --test-dir build-tip --output-on-failure -j1 --timeout 120
 
 # Benchmarks (built but not part of ctest)
-make bench_planner_eval soak_differential
-./bench_planner_eval
-SOAK_ROUNDS=60 ./soak_differential "[soak]"
+cmake --build build-tip --target bench_planner_eval soak_differential -j4
+build-tip/test/bench_planner_eval
+SOAK_ROUNDS=60 build-tip/test/soak_differential "[soak]"
 ```
+
+The supported tip baseline excludes tests tied to DuckDB's removed
+write-capture, optimizer plan-tee, and engine-hook APIs. See
+[docs/TESTING.md](docs/TESTING.md) for the exact boundary and validated
+counts.
 
 ### Test Coverage
 
@@ -323,11 +340,15 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Captured autocommit INSERT (1M-row table)** | ~1.0 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
-*Apple M-series, release build (`test/build_test`), 100k-row deltas unless
+*Apple M-series, release build (`build`), 100k-row deltas unless
 noted; reproduce with `bench_planner_eval` / `bench_write_capture`.
 Explicit INSERT-only transactions and whitelisted UPDATE/DELETE
 statements (including autocommit) commit O(Δ) via captured deltas; other
 writes pay the scan-and-diff sync (docs/DESIGN_WRITE_CAPTURE.md).*
+
+Those captured-delta and plan-tee figures describe the pinned release build;
+tip mode falls back to scan-and-diff where the corresponding upstream APIs
+are no longer available.
 
 ## Project Structure
 

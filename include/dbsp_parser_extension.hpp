@@ -210,26 +210,47 @@ inline ParserExtensionParseResult ParseRefreshMaterializedView(const string &que
 }
 
 // Main parse function - tries all statement types
-inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info, const string &query) {
+inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info,
+                                                        const vector<SimpleToken> &tokens) {
+    if (tokens.empty()) {
+        return ParserExtensionParseResult();
+    }
+
+    // Tip DuckDB invokes parser extensions with the token tail at the PEG
+    // failure point. Rebuild a valid SQL string and restore keywords already
+    // consumed by the core parser when necessary.
+    string query;
+    for (idx_t i = 0; i < tokens.size(); i++) {
+        if (i > 0) {
+            query += " ";
+        }
+        query += tokens[i].text;
+    }
+    auto first = StringUtil::Upper(tokens[0].text);
+    if (first == "MATERIALIZED") {
+        query = "CREATE " + query;
+    } else if (first == "VIEW") {
+        query = "CREATE MATERIALIZED " + query;
+    }
+
     auto query_upper = StringUtil::Upper(query);
+    ParserExtensionParseResult result;
 
     // Try CREATE MATERIALIZED VIEW
     if (query_upper.find("CREATE MATERIALIZED VIEW") == 0) {
-        return ParseCreateMaterializedView(query);
+        result = ParseCreateMaterializedView(query);
+    } else if (query_upper.find("DROP MATERIALIZED VIEW") == 0) {
+        result = ParseDropMaterializedView(query);
+    } else if (query_upper.find("REFRESH MATERIALIZED VIEW") == 0) {
+        result = ParseRefreshMaterializedView(query);
+    } else {
+        return ParserExtensionParseResult();
     }
 
-    // Try DROP MATERIALIZED VIEW
-    if (query_upper.find("DROP MATERIALIZED VIEW") == 0) {
-        return ParseDropMaterializedView(query);
+    if (result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+        result.consumed_tokens = NumericCast<int64_t>(tokens.size());
     }
-
-    // Try REFRESH MATERIALIZED VIEW
-    if (query_upper.find("REFRESH MATERIALIZED VIEW") == 0) {
-        return ParseRefreshMaterializedView(query);
-    }
-
-    // Not a materialized view statement
-    return ParserExtensionParseResult();
+    return result;
 }
 
 //===--------------------------------------------------------------------===//
