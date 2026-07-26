@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(TARGET_NAME dbsp)
 set(EXT_VERSION_DBSP "0.1.0")
 option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" OFF)
+option(DBSP_USE_PARENT_DUCKDB
+       "Use DuckDB targets from the containing extension build" OFF)
 
 # DuckDB source directory (set via command line or default)
 set(DUCKDB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/duckdb" CACHE PATH "Path to DuckDB source")
@@ -15,11 +17,15 @@ if(NOT EXISTS "${DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
     message(FATAL_ERROR "DuckDB source not found at ${DUCKDB_SOURCE_DIR}. Run build.sh to fetch it.")
 endif()
 
-# Build DuckDB as a subdirectory
-set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHELL ON CACHE BOOL "" FORCE)
-set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
-add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
+# Standalone builds own a DuckDB tree. When loaded by DuckDB's extension
+# build, the parent already owns DuckDB and adding it again creates duplicate
+# extension targets.
+if(NOT DBSP_USE_PARENT_DUCKDB)
+    set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SHELL ON CACHE BOOL "" FORCE)
+    set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
+    add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
+endif()
 
 # Extension source
 # Extension build
