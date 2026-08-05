@@ -22,6 +22,11 @@ if(NOT TARGET duckdb_static)
     add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 endif()
 
+# The duckdb/ submodule tracks current DuckDB main (see root CMakeLists.txt);
+# declared here too since CI configures this directory directly as its own
+# root (cmake -S test -B test/build_test), where the root option() never runs.
+option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
+
 # SaaS-fork engine hook consumer (see root CMakeLists.txt). ON requires the
 # patched submodule; OFF = stock-mode build (hook test excluded).
 # Deliberately NOT a global compile definition: the hook-active flag is

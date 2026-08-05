@@ -6,7 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(TARGET_NAME dbsp)
 set(EXT_VERSION_DBSP "0.1.0")
-option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" OFF)
+# The duckdb/ submodule tracks current DuckDB main (bumped regularly), so
+# the tip compatibility path is the only one the submodule pin actually
+# supports; pass -DDBSP_TIP_PORT=OFF only against a separately checked-out
+# pre-tip DuckDB tree (e.g. an old release branch).
+option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
 option(DBSP_USE_PARENT_DUCKDB
        "Use DuckDB targets from the containing extension build" OFF)
 
