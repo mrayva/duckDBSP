@@ -8,39 +8,48 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-For the pinned DuckDB release build:
+The `duckdb/` submodule tracks current DuckDB main (bumped regularly), and
+`DBSP_TIP_PORT`/`DBSP_ENGINE_HOOK` default to the matching configuration
+(`ON`/`OFF`), so the plain default build already targets tip:
 
 ```bash
 cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
 cmake --build build -j8
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure -j1 --timeout 120
 build/test/test_planner_frontend # the big differential suite on its own
 ```
 
-### DuckDB tip port
-
-Tip builds use the current DuckDB source tree and an explicit compatibility
-mode:
-
-```bash
-cmake -S . -B build-tip \
-  -DDUCKDB_SOURCE_DIR=/path/to/duckdb \
-  -DDBSP_TIP_PORT=ON \
-  -DDBSP_ENGINE_HOOK=OFF
-cmake --build build-tip -j4
-ctest --test-dir build-tip --output-on-failure -j1 --timeout 120
-```
-
-The supported tip baseline is the CTest suite plus the planner, CDC, and
-recursive integration suites. The validated baseline is 36/36 CTest tests
-passing and 88/88 planner cases passing. Legacy tests that directly require
-the removed write-capture, optimizer plan-tee, or engine-hook APIs are
-excluded in tip mode; this is an intentional compatibility boundary, not a
-silent pass.
+The validated baseline (last checked against DuckDB main @ `fabf1d60b`,
+2026-08-05) is **39/39 CTest binaries passing** (5.48M+ assertions) and
+**89/89 planner cases passing** in `test_planner_frontend`. Legacy tests
+that directly require the removed write-capture, optimizer plan-tee, or
+engine-hook APIs are excluded by default (not built — see the
+`if(NOT DBSP_TIP_PORT)` guards in `test/CMakeLists.txt`); this is an
+intentional compatibility boundary, not a silent pass. Two correlated
+scalar-subquery cases in `test_planner_frontend` are `#ifdef
+DBSP_TIP_PORT`-gated to assert a known, tracked decline instead of success
+— see TODO.md's "join projection maps" entry.
 
 Tip mode uses scan-and-diff for UPDATE/DELETE paths whose old write-capture
 API is unavailable. Holistic aggregate values remain in memory on tip while
 table, join, and top-K spill paths remain enabled and tested.
+
+### Legacy patched-engine build (unmaintained)
+
+Only relevant if you have your own patched, pre-tip DuckDB checkout for the
+SaaS-fork engine-hook consumer
+(`patches/v1.5.4-dbsp-txn-callback.patch`) — the submodule itself no longer
+supports this path, since the patch predates the DuckDB API moves tip mode
+exists to track:
+
+```bash
+cmake -S . -B build-legacy \
+  -DDUCKDB_SOURCE_DIR=/path/to/patched/duckdb \
+  -DDBSP_TIP_PORT=OFF \
+  -DDBSP_ENGINE_HOOK=ON
+cmake --build build-legacy -j4
+ctest --test-dir build-legacy --output-on-failure
+```
 
 The tip port retains the circuit-state checkpoint format from upstream. The
 fork WAL improvement is available as an optional logical-delta journal; WAL

@@ -1,5 +1,42 @@
 # Changelog
 
+## Sync with upstream fork + rebuild against current DuckDB tip - Aug 2026
+
+- Merged 64 commits from the upstream fork (durability/autopersist,
+  per-view checkpoint validity, LEFT/RIGHT join and MIN/MAX/recursive-view
+  checkpoint state, flat/mmap restore layers, packed shared arrangements,
+  streaming CREATE mirror, signed linear UNION ALL recursion deltas) with
+  this fork's 4 DuckDB-tip-port commits, rebased on top so both lines of
+  work compose. 3 small conflicts (dbsp_context_state.hpp,
+  dbsp_parser_extension.hpp, dbsp_plan_translator.hpp) — all additive,
+  orthogonal changes on both sides.
+- Bumped the `duckdb/` submodule from a 7-week-stale pin to current
+  DuckDB main (`fabf1d60b`, 2026-08-05) and fixed the breaks that surfaced:
+  table function bind callbacks now take `vector<Identifier>&` for column
+  names (not `vector<string>&`, landed the same day upstream); DuckDB
+  dropped the distinct `BoundCastExpression` class in favor of a `__cast`
+  function expression; `FlatVector::Validity()` now returns
+  `const ValidityMask&` only; `Appender`'s constructor takes
+  `const Identifier&` for the table name.
+- **`DBSP_TIP_PORT` and `DBSP_ENGINE_HOOK` now default to `ON`/`OFF`**
+  (previously `OFF`/`ON`): with the submodule permanently tracking tip,
+  the old defaults — a pre-tip capture stack and a patched-engine hook
+  consumer — no longer compile against it. The zero-flag build (what CI
+  and `build.sh` actually run) now matches reality. `build.sh` also no
+  longer clones a hardcoded `v1.5.4` tag; it initializes the submodule,
+  and only applies the legacy engine-hook patch when `DBSP_ENGINE_HOOK=1`
+  is set against your own patched checkout.
+- Fixed 2 real test issues surfaced by the full tip rebuild: an N4
+  spilled-holistic-aggregate checkpoint test whose premise (spilling
+  under `dbsp_spill(true)`) can't hold on tip (holistic aggregate values
+  deliberately stay in-memory there), whose failure was also leaking
+  spill-mode into 3 later unrelated tests; and 2 correlated-scalar-
+  subquery tests that regressed because DuckDB's optimizer now sometimes
+  decorrelates into a JOIN carrying a projection map, which the planner
+  frontend's join visitor doesn't yet remap through (tracked in TODO.md).
+- Validated baseline: 39/39 CTest binaries passing (5.48M+ assertions),
+  89/89 planner differential cases, full soak and benchmark suite green.
+
 ## Bounded-RAM Phase 2d increment 2: packed shared arrangements - Aug 2026
 
 - SharedArrangement stores its buckets packed (same codec/pattern as the
