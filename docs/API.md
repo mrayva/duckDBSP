@@ -30,6 +30,17 @@ Creates an incrementally maintained view. Equivalent to
 `dbsp_create_materialized_view` table function (registered for the
 parser extension; not intended for direct use).
 
+### CREATE OR REPLACE MATERIALIZED VIEW
+
+```sql
+CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...;
+```
+
+Plain `CREATE` when `name` doesn't exist yet; when it does, changes its
+definition and rebuilds **only** `name` and its transitive dependents —
+equivalent to `dbsp_replace_view('name', 'SELECT ...')`. See
+`dbsp_replace_view` below for the rebuild semantics.
+
 ### REFRESH MATERIALIZED VIEW
 
 ```sql
@@ -190,6 +201,48 @@ SELECT * FROM dbsp_create_view('vip_totals',
 
 ---
 
+### dbsp_replace_view(name, sql)
+
+Change an existing materialized view's definition in place, rebuilding
+**only** that view and its transitive dependents — everything upstream
+(its sources, and any unrelated view) is left untouched, and every
+dependent keeps its own original DDL.
+
+```sql
+SELECT * FROM dbsp_replace_view('view_name', 'SELECT ... FROM ...');
+```
+
+Equivalent to `CREATE OR REPLACE MATERIALIZED VIEW view_name AS SELECT ...`
+(the DDL form routes here automatically when `view_name` already exists).
+
+**Parameters:**
+- `name` (VARCHAR): Name of an existing view
+- `sql` (VARCHAR): New SQL SELECT statement for the view
+
+**Returns:**
+- `result` (VARCHAR): Confirmation with source tables
+
+**Example:**
+```sql
+SELECT * FROM dbsp_create_view('lvl1', 'SELECT k, v * 2 AS d FROM base');
+SELECT * FROM dbsp_create_view('lvl2', 'SELECT k, d + 1 AS e FROM lvl1');
+
+-- Redefine lvl1; lvl2's own DDL is untouched, only its values change
+SELECT * FROM dbsp_replace_view('lvl1', 'SELECT k, v * 3 AS d FROM base');
+```
+
+**Notes:**
+- Fails with `DBSP-E206` if `name` doesn't exist — use `dbsp_create_view`
+  for a new view instead.
+- No transactional rollback (v1): if a dependent fails to recreate mid
+  rebuild, the remaining dependents are still attempted with their saved
+  DDL, and the `DBSP-E304` error reports every failure plus which views
+  are still queryable afterward.
+- Cost is proportional to the changed view's subtree — sources and
+  sibling views outside it never repopulate.
+
+---
+
 ### dbsp_use_planner(enable)
 
 **Deprecated no-op since Phase C5.** The planner frontend is the only
@@ -204,12 +257,16 @@ STRING_AGG/ARRAY_AGG, holistic MEDIAN/QUANTILE_CONT/QUANTILE_DISC/
 MODE/MAD), inner and outer joins (LEFT/RIGHT/FULL, equi + residual
 predicates), cross joins, IN/NOT IN/EXISTS/scalar subqueries
 (correlated included), DISTINCT, DISTINCT ON, UNION/INTERSECT/EXCEPT
-(ALL and DISTINCT), window functions (expressions auto-projected),
-non-recursive CTEs, WITH RECURSIVE (deletions included), and ORDER
-BY/LIMIT/OFFSET (constant or percentage). The few remaining gaps
-(USING KEY recursion, expression LIMIT, approximate statistics like
-approx_quantile, unordered string_agg) fail with a DBSP-E110 error
-naming the construct.
+(ALL and DISTINCT), window functions (expressions auto-projected;
+`ROWS`/`RANGE`/`GROUPS` frames including constant bounded frames like
+`ROWS BETWEEN 11 PRECEDING AND CURRENT ROW`, `LAG`/`LEAD` with a constant
+non-default offset like `LAG(v, 12)`, and `NTILE` with a constant bucket
+count like `NTILE(4)`), non-recursive CTEs, WITH RECURSIVE (deletions
+included), and ORDER BY/LIMIT/OFFSET (constant or percentage). The few
+remaining gaps (USING KEY recursion, expression LIMIT, approximate
+statistics like approx_quantile, unordered string_agg, NTH_VALUE's N —
+even as a literal constant, unlike NTILE's bucket count — see TODO.md)
+fail with a DBSP-E110 error naming the construct.
 
 ```sql
 SELECT * FROM dbsp_use_planner();       -- Always: ENABLED
@@ -274,6 +331,14 @@ SELECT * FROM dbsp_views();
 | `sql` | VARCHAR | SQL definition |
 | `rows` | BIGINT | Current row count |
 | `version` | BIGINT | Update version number |
+
+For a view still pending lazy restore (see `dbsp_lazy_restore` below),
+`rows` is read straight from the checkpoint's stashed sink blob (its
+length-prefix, no decode) rather than the view's live state — exact,
+since "pending" means no delta has touched it, but this call never
+triggers the view's actual restore. `dbsp_views()` enumerates every view,
+so realizing here to compute a row count would eagerly decode everything
+on the first call, defeating the point of lazy restore.
 
 ---
 
@@ -405,6 +470,92 @@ SELECT * FROM dbsp_changes('customer_totals');
   between the two notifies if both halves are needed.
 - Empty result when the view exists but no sync has touched it; error when
   the view does not exist.
+- Empty right after CREATE MATERIALIZED VIEW, even over a populated table:
+  the initial-population delta is dropped at create (bounded-RAM Phase 1a)
+  — only post-create commits populate the buffer.
+- Reading does NOT drain the buffer: an untouched view keeps serving the
+  same delta (its create-time initial replay, at worst) until the next sync
+  that touches it. Use `dbsp_delta_generations()` to tell fresh buffers
+  from stale ones.
+
+---
+
+### dbsp_view_state()
+
+Per-view resident circuit-state bytes, approximated by class.
+
+```sql
+SELECT * FROM dbsp_view_state();
+```
+
+**Returns:**
+- `view_name` (VARCHAR) — plus one synthetic row `__shared_arrangements`
+  for manager-owned shared join arrangements
+- `result_bytes`, `arrangement_bytes`, `window_bytes`, `recursion_bytes`,
+  `other_bytes`, `total_bytes` (BIGINT)
+
+**Semantics:**
+- Estimates calibrated for trend, not exact heap bytes; H6 payload-shared
+  rows are counted once per scan (attribution goes to the first view
+  scanned; totals are what reconcile with the process footprint).
+- On macOS compare against `footprint(1)`/phys_footprint, not `ps rss` —
+  the compressor hides most cold circuit state from RSS (measured: a DAG
+  reporting 2.5GB RSS had a 23GB physical footprint).
+- `other_bytes` includes per-node output buffers and delta buffers.
+- Tracked-table baselines are NOT included — see `dbsp_table_state()`;
+  a RAM budget must sum both functions.
+
+---
+
+### dbsp_table_state()
+
+Per-tracked-table baseline residency. Boxed baselines (~300 B/row) are the
+dominant big-model RAM class and are invisible to `dbsp_view_state()`.
+
+```sql
+SELECT * FROM dbsp_table_state();
+```
+
+**Returns:**
+- `table_name` (VARCHAR)
+- `mode` (VARCHAR) — `boxed` (full rows in a RAM Z-set), `spilled`
+  (disk record log + ~72 B/row digest index), or `deferred` (lazy-restore
+  fast path: nothing materialized until first use)
+
+Baselines auto-spill above `DBSP_SPILL_THRESHOLD_ROWS` (default 2,000,000
+rows; `0` disables) — including mid-scan during the initial baseline
+build, so big tables never pay the boxed peak. Small tables stay boxed
+for speed; `dbsp_spill(true)` still force-spills everything.
+- `distinct_rows` (BIGINT) — deferred tables report the restore-time
+  COUNT(*) upper bound
+- `resident_bytes` (BIGINT) — baseline plus pending-changes buffer,
+  calibrated estimate
+
+---
+
+### dbsp_delta_generations()
+
+Per-view provenance for the `dbsp_changes` buffer: the commit generation at
+which each view's delta buffer was last rewritten.
+
+```sql
+SELECT * FROM dbsp_delta_generations();
+```
+
+**Returns:**
+- `view_name` (VARCHAR)
+- `generation` (BIGINT): commit sequence at the buffer's last rewrite
+  (create-time initial replay or a propagation step); 0 when the buffer was
+  never written (e.g. a restored, still-pending view).
+
+**Semantics:**
+- Generations only advance when a sync rewrites the view's buffer — reads
+  (`dbsp_changes`, `dbsp_query`) never move them.
+- Change-feed pattern: snapshot `MAX(generation)` as a baseline after
+  setup; after each commit batch, harvest `dbsp_changes` only from views
+  whose generation moved past the baseline, then advance the baseline.
+  Without the filter, a consumer re-reads stale buffers of untouched views
+  on every batch.
 
 ---
 
@@ -602,6 +753,89 @@ SELECT * FROM dbsp_auto_sync(false);  -- Disable
 SELECT * FROM dbsp_auto_sync();       -- Query status
 ```
 
+### dbsp_autopersist(enable)
+
+Toggle auto-persist — **ON by default**: a database that used DBSP views
+reopens with them alive, no explicit `dbsp_save()`/`dbsp_load()` calls.
+
+- **Auto-save**: on a clean connection close (the last user connection to
+  an instance), if autopersist is on and any view exists, the extension
+  saves view definitions (`dbsp_save()`) and a circuit-state checkpoint
+  (`save_checkpoint()`) automatically.
+- **Auto-load**: the first DBSP entry point that has a `ClientContext`
+  (`dbsp_query`, `dbsp_views`, `dbsp_track`, `CREATE MATERIALIZED VIEW`,
+  `dbsp_sync`, `dbsp_changes`) loads persisted state — checkpoint fast path
+  included — if the view registry in this session is still empty. Fires at
+  most once per session and never after a view has already been created
+  here; a missing `_dbsp_views` table is not an error (there is simply
+  nothing to load).
+
+The two-call `dbsp_save()`/`dbsp_load()` contract still works exactly as
+before and stays useful for named/JSON-file forms and manual snapshots;
+auto-persist just means the default zero-arg round trip is no longer
+something a caller has to remember.
+
+Turn auto-persist off for bulk-load workflows the same way as auto-sync —
+`dbsp_autopersist(false)` before, `(true)` after — to skip the save/load
+overhead entirely.
+
+```sql
+SELECT * FROM dbsp_autopersist(true);   -- Enable (default)
+SELECT * FROM dbsp_autopersist(false);  -- Disable
+SELECT * FROM dbsp_autopersist();       -- Query status
+```
+
+### dbsp_autopersist_interval(n)
+
+Piggyback a circuit-state checkpoint every `n` commits (counted across
+`dbsp_sync`-driven propagation), so a crash between clean shutdowns loses
+at most `n` commits of operator state. **Default 0 (off)** — the
+underlying data is never at risk either way (base tables are
+DuckDB-durable, and a stale checkpoint fails its watermark check and
+falls back to a full rebuild on load).
+
+```sql
+SELECT * FROM dbsp_autopersist_interval(100);  -- checkpoint every 100 commits
+SELECT * FROM dbsp_autopersist_interval(0);    -- off
+SELECT * FROM dbsp_autopersist_interval();     -- query the current interval
+```
+
+### dbsp_lazy_restore(enable)
+
+Toggle lazy per-view checkpoint restore (D-lazy) — **ON by default**: a
+`dbsp_load()` circuit-state checkpoint fast path cold-creates every
+covered view but decodes each one's node/sink blobs on first need instead
+of eagerly, so reopen returns without paying every view's blob-decode
+cost. The first `dbsp_query()`, incoming delta, or other read of a
+still-pending view's live state decodes it transparently — the query or
+delta still returns/applies the exact same result, just with the decode
+cost deferred to when it's actually needed. A checkpointed view never
+touched between reopen and the next `dbsp_save()` is re-saved verbatim
+(no decode at all).
+
+One deliberate exception to "decodes transparently on first read": `dbsp_views()`
+reports a pending view's row count from the checkpoint's stashed metadata
+without decoding it (see `dbsp_views()` above) — it enumerates every view,
+so realizing there would eagerly decode everything on the first call.
+
+`dbsp_load()`'s report string counts views left pending separately from
+"sources deferred" (D3c table baselines) and "from checkpoint":
+
+```
+Loaded views from _dbsp_views (43 views, 43 from checkpoint, 0 sources
+deferred, 43 pending lazy restore)
+```
+
+Turn lazy restore off for bulk benchmarks or when debugging a restore
+issue and you want every view's state visibly live immediately after
+`dbsp_load()`:
+
+```sql
+SELECT * FROM dbsp_lazy_restore(true);   -- Enable (default)
+SELECT * FROM dbsp_lazy_restore(false);  -- Disable (eager, pre-D-lazy behavior)
+SELECT * FROM dbsp_lazy_restore();       -- Query status
+```
+
 ### dbsp_stats()
 
 Sync-path observability counters, for monitoring which ingestion path
@@ -626,6 +860,56 @@ across cores.
 
 ```sql
 SELECT * FROM dbsp_parallel(true);
+```
+
+### dbsp_mv_tables(enable)
+
+Disk-backed MV results (bounded-RAM Phase 1b, default off): every registered
+view mirrors its result into a `__mv_<view>` table in the same database —
+backfilled on enable and at view creation, then kept in sync with one
+internal transaction per propagation pass. `__dbsp_mv_meta(view_name,
+commit_seq)` records the watermark of each table's last write. Backing
+tables are ordinary tables: durable across reopen and readable without any
+DBSP state. Disabling stops mirroring and leaves the tables stale.
+
+```sql
+SELECT * FROM dbsp_mv_tables(true);
+```
+
+Per-commit apply is DELETE (retractions) + INSERT (additions) via a staged
+temp table; any delta weight beyond ±1 rebuilds the table from its own
+current rows + the delta.
+
+**Table-backed reads (Phase 1c)**: once a view's table is written, the sink
+stops integrating — the RAM result is dropped and the __mv_ table IS the
+result. `dbsp_query`, create-time replay of view sources, and shared-
+arrangement backfill all stream from the table; checkpoints save operator
+state only (rows are already durable). Enable is idempotent (table
+functions can be bound twice per statement — a second backfill would run
+after the results were dropped). Disabling schedules a full view rebuild so
+sinks reintegrate in RAM.
+
+### dbsp_realize(view_name)
+
+Realize one pending (lazy-restored) view's circuit state now instead of on
+first touch. Returns `realized` (whether it WAS pending) and `state_bytes`
+(the view's resident state after realization) — sum the latter to warm
+within a RAM budget and leave the tail lazy.
+
+```sql
+SELECT * FROM dbsp_realize('customer_totals');
+```
+
+### dbsp_wait_teardown()
+
+Wait (bounded, ~30s max) for detached close-time teardown threads. Call from
+a throwaway connection after closing your last real connection and before
+process exit — exiting during the detached teardown segfaults in static
+destructors. Pair with an explicit `dbsp_save()` before the final close so
+the teardown has no SQL left to run.
+
+```sql
+SELECT * FROM dbsp_wait_teardown();
 ```
 
 ### dbsp_spill(enable)

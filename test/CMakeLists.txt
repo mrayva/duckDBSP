@@ -22,14 +22,21 @@ if(NOT TARGET duckdb_static)
     add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 endif()
 
-# SaaS-fork engine hook consumer (see root CMakeLists.txt). ON requires the
-# patched submodule; OFF = stock-mode build (hook test excluded).
-# Deliberately NOT a global compile definition: the hook-active flag is
-# process-sticky, so defining it everywhere would stop the plan-tee and
-# write-capture tests from exercising the legacy capture paths. Only the
-# dedicated consumer test builds with the define (see below); every other
-# binary keeps testing the stock-mode stack.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
+# The duckdb/ submodule tracks current DuckDB main (see root CMakeLists.txt);
+# declared here too since CI configures this directory directly as its own
+# root (cmake -S test -B test/build_test), where the root option() never runs.
+option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
+
+# SaaS-fork engine hook consumer (see root CMakeLists.txt). Requires a
+# separately patched v1.5.4-era submodule — the current tip-tracking
+# submodule is unpatched, so this defaults OFF (hook test excluded; the
+# stock-mode capture stack does the work instead).
+# Deliberately NOT a global compile definition when ON: the hook-active
+# flag is process-sticky, so defining it everywhere would stop the plan-tee
+# and write-capture tests from exercising the legacy capture paths. Only
+# the dedicated consumer test builds with the define (see below); every
+# other binary keeps testing the stock-mode stack.
+option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" OFF)
 
 # Include directories
 include_directories(
@@ -118,6 +125,8 @@ add_dbsp_integration_test(planner_frontend integration/test_planner_frontend.cpp
 add_dbsp_integration_test(extension_cdc integration/test_extension_cdc.cpp)
 add_dbsp_integration_test(cascading_views integration/test_cascading_views.cpp)
 add_dbsp_integration_test(join_complex integration/test_join_complex.cpp)
+add_dbsp_integration_test(join_checkpoint integration/test_join_checkpoint.cpp)
+add_dbsp_integration_test(lazy_restore integration/test_lazy_restore.cpp)
 add_dbsp_integration_test(recursive_integration integration/test_recursive.cpp)
 add_dbsp_integration_test(recursive_deletion integration/test_recursive_deletion.cpp)
 add_dbsp_integration_test(optimization_integration integration/test_optimization_integration.cpp)
@@ -165,18 +174,22 @@ endif()
 add_test(NAME planner_eval_smoke
          COMMAND bench_planner_eval "[planner_eval],[shard_bench]")
 
-# Write-capture perf gate (run manually: ./bench_write_capture)
-add_executable(bench_write_capture
-    benchmarks/bench_write_capture.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
-target_link_libraries(bench_write_capture catch2_main duckdb_static
-                      duckdb_generated_extension_loader
-                      core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(bench_write_capture PRIVATE DBSP_TIP_PORT)
+# Write-capture perf gate (run manually: ./bench_write_capture). Asserts
+# manager.captured_delta_syncs() advances on UPDATE/DELETE/autocommit
+# INSERT — the legacy O(delta) captured-write fast path (dbsp_write_capture.
+# hpp), unavailable on tip (scan-and-diff takes over there instead, see
+# docs/TESTING.md). Not built under DBSP_TIP_PORT: its assertions can never
+# pass there by design, not because of a regression.
+if(NOT DBSP_TIP_PORT)
+    add_executable(bench_write_capture
+        benchmarks/bench_write_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
+    target_link_libraries(bench_write_capture catch2_main duckdb_static
+                          duckdb_generated_extension_loader
+                          core_functions_extension parquet_extension)
 endif()
 
 # Window-delta throughput gate (in ctest: window_bench asserts O(affected))

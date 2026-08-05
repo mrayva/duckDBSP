@@ -5,6 +5,7 @@
 
 #include <cmath>
 
+#include "dbsp_circuit.hpp" // dbsp::Node::StateKind, reused by circuit_state_kind()
 #include "dbsp_spill_store.hpp"
 
 #include "dbsp_zset.hpp"
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dbsp_native {
@@ -319,6 +321,71 @@ struct DuckDBValueHash {
 // production data with no conversion at the boundary.
 using DuckDBZSet = dbsp::ZSet<DuckDBRow, DuckDBRowHash>;
 
+// ---------------------------------------------------------------------------
+// Circuit-state accounting (bounded-RAM roadmap Phase 0): approximate
+// resident bytes per state class. Trend over precision — constants are
+// calibrated against measured RSS (~600 B/cell with boxed Values on the
+// workforce model), not derived. H6 payload-shared rows are counted once per
+// accounting PASS (the StateAccounting's seen-set spans every view scanned
+// with it), so per-view attribution of a shared payload goes to whichever
+// view is scanned first; totals are what reconcile with RSS.
+struct StateBytes {
+  size_t result = 0;      // view result z-sets
+  size_t arrangement = 0; // join indexes — local per-node; shared reported
+                          // as the synthetic __shared_arrangements row
+  size_t window = 0;      // window partition caches + rendered outputs
+  size_t recursion = 0;   // recursive-step accumulated state
+  size_t other = 0;       // aggregate groups, distinct/set-op counts,
+                          // delta buffers, node outputs
+  size_t total() const {
+    return result + arrangement + window + recursion + other;
+  }
+  void add(const StateBytes &o) {
+    result += o.result;
+    arrangement += o.arrangement;
+    window += o.window;
+    recursion += o.recursion;
+    other += o.other;
+  }
+};
+
+class StateAccounting {
+public:
+  size_t rows_seen = 0;     // every sighting
+  size_t payloads_new = 0;  // first sightings (payload counted in full)
+
+  size_t row_bytes(const DuckDBRow &row) {
+    rows_seen++;
+    const void *pid = row.columns.payload_id();
+    if (pid != nullptr && !seen_.insert(pid).second) {
+      return kRowOverhead; // shared ColumnVec payload already counted
+    }
+    payloads_new++;
+    size_t b = kRowOverhead;
+    for (const auto &v : row.columns) {
+      b += kValueBytes;
+      if (!v.IsNull() && v.type().id() == duckdb::LogicalTypeId::VARCHAR) {
+        b += duckdb::StringValue::Get(v).size();
+      }
+    }
+    return b;
+  }
+  size_t zset_bytes(const DuckDBZSet &zs) {
+    size_t b = zs.size() * kEntryOverhead;
+    for (const auto &[row, w] : zs) {
+      (void)w;
+      b += row_bytes(row);
+    }
+    return b;
+  }
+
+private:
+  static constexpr size_t kRowOverhead = 48;   // ColumnVec + shared_ptr block
+  static constexpr size_t kValueBytes = 72;    // sizeof(duckdb::Value) + slop
+  static constexpr size_t kEntryOverhead = 32; // map entry + weight
+  std::unordered_set<const void *> seen_;
+};
+
 // Column metadata for tracked tables
 struct ColumnInfo {
   std::string name;
@@ -357,19 +424,117 @@ public:
 
   bool spilled() const { return spill_ != nullptr; }
 
+  // ---- auto-spill (bounded-RAM Phase 5) ---------------------------------
+  // Boxed baselines are ~300 B/row; above a row threshold the baseline
+  // spills itself to the digest form (~72 B/row indexed) without waiting
+  // for a global dbsp_spill(true). The threshold is rows, not bytes —
+  // row count is the one thing every build path knows for free.
+  // DBSP_SPILL_THRESHOLD_ROWS overrides; 0 disables auto-spill.
+
+  static size_t auto_spill_threshold() {
+    static const size_t v = [] {
+      const char *e = std::getenv("DBSP_SPILL_THRESHOLD_ROWS");
+      return e != nullptr ? static_cast<size_t>(std::atoll(e))
+                          : static_cast<size_t>(2'000'000);
+    }();
+    return v;
+  }
+
+  // CDCManager supplies the concrete spill file path up front so the
+  // migration can happen deep inside a scan with no manager callback.
+  // Empty hint = auto-spill off for this table (standalone/unit use).
+  void set_spill_path_hint(std::string p, bool durable = false) {
+    spill_path_hint_ = std::move(p);
+    spill_durable_ = durable;
+    if (spill_) {
+      spill_->set_keep_files(durable);
+    }
+  }
+
+  // Persist the digest index sidecar for a durable spilled baseline
+  // (called from save_checkpoint with the just-computed watermark).
+  bool save_spill_index(int64_t wm_count, const std::string &wm_hash) {
+    if (spill_ == nullptr || !spill_durable_) {
+      return false;
+    }
+    return spill_->save_index(wm_count, wm_hash);
+  }
+
+  // Deferred-baseline fast path (recovery inc B): adopt the durable
+  // log+index pair saved for this table's restore-time watermark instead
+  // of rescanning the whole table. Returns false (leaving the table
+  // deferred, nothing allocated) on any mismatch.
+  bool try_adopt_durable_spill() {
+    if (!deferred_ || spill_ != nullptr || !spill_durable_ ||
+        spill_path_hint_.empty()) {
+      return false;
+    }
+    auto candidate = std::make_unique<SpilledBaseline>(spill_path_hint_);
+    candidate->set_keep_files(true);
+    if (!candidate->try_load_index(deferred_weight_, deferred_hash_)) {
+      return false; // dtor keeps the (possibly stale) files for later saves
+    }
+    spill_ = std::move(candidate);
+    pending_changes_.clear();
+    sequence_++;
+    deferred_ = false;
+    deferred_hash_.clear();
+    return true;
+  }
+
+  // Spill immediately (speed lever: a pre-counted big table spills BEFORE
+  // its initial scan — no boxed peak, no mid-scan migration, and the
+  // vectorized serialized-bytes scan path becomes available).
+  bool request_spill_now() {
+    if (spill_ != nullptr) {
+      return true;
+    }
+    if (spill_path_hint_.empty()) {
+      return false;
+    }
+    enable_spill(spill_path_hint_);
+    return true;
+  }
+
+  // Rebuild feed for rows the scan already serialized (vectorized path;
+  // spill mode only — callers gate on spilled()).
+  void add_scanned_bytes(const std::vector<uint8_t> &bytes) {
+    spill_->add_serialized(bytes, 1);
+  }
+
+  // True when every column type has a vectorized serialize fast path —
+  // must mirror chunk_types_fast (dbsp_spill_store.hpp).
+  bool schema_types_fast() const {
+    for (const auto &col : schema_.columns) {
+      switch (col.type.id()) {
+      case duckdb::LogicalTypeId::INTEGER:
+      case duckdb::LogicalTypeId::BIGINT:
+      case duckdb::LogicalTypeId::DOUBLE:
+      case duckdb::LogicalTypeId::VARCHAR:
+      case duckdb::LogicalTypeId::BOOLEAN:
+        continue;
+      default:
+        return false;
+      }
+    }
+    return !schema_.columns.empty();
+  }
+
   void enable_spill(const std::string &path) {
     if (spill_) {
       return;
     }
     spill_ = std::make_unique<SpilledBaseline>(path);
+    spill_->set_keep_files(spill_durable_);
     if (!current_state_.empty()) {
-      // Migrate the in-RAM baseline, then free it
+      // Migrate the in-RAM baseline, then free it. install_rebuild swaps
+      // the generation in without diffing — a migration has no delta by
+      // definition, and the diff path reads every payload back from disk.
       spill_->begin_rebuild();
       for (const auto &[row, w] : current_state_) {
         spill_->add(row_values(row), w);
       }
-      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
-                          [](const std::vector<duckdb::Value> &, int64_t) {});
+      spill_->install_rebuild();
       current_state_ = DuckDBZSet();
     }
   }
@@ -389,6 +554,7 @@ public:
 
   // Apply changes
   void insert(const DuckDBRow &row) {
+    maybe_auto_spill();
     if (spill_) {
       spill_->apply_row(row_values(row), 1);
     } else {
@@ -422,6 +588,7 @@ public:
   // sync: the delta is propagated by the caller, so pending_changes_ is
   // not involved)
   void apply_delta(const DuckDBZSet &delta) {
+    maybe_auto_spill();
     for (const auto &[row, w] : delta) {
       if (spill_) {
         spill_->apply_row(row_values(row), w);
@@ -446,6 +613,12 @@ public:
   }
 
   void add_scanned_row(DuckDBRow &&row) {
+    if (spill_ == nullptr && !spill_path_hint_.empty()) {
+      const size_t th = auto_spill_threshold();
+      if (th != 0 && rebuild_state_.size() >= th) {
+        spill_mid_rebuild();
+      }
+    }
     if (spill_) {
       spill_->add(row_values(row), 1);
     } else {
@@ -477,8 +650,10 @@ public:
   // table was deferred). Clears the deferred flag.
   void install_rebuild() {
     if (spill_) {
-      spill_->end_rebuild([](const std::vector<duckdb::Value> &, int64_t) {},
-                          [](const std::vector<duckdb::Value> &, int64_t) {});
+      // No diff wanted: swap the generation in directly. The end_rebuild
+      // diff path reads every added payload back from disk — hours at
+      // 144M rows, all handed to a no-op.
+      spill_->install_rebuild();
     } else {
       current_state_ = std::move(rebuild_state_);
       rebuild_state_ = DuckDBZSet();
@@ -569,7 +744,64 @@ public:
   // scan_state); kept for code paths that need Z-set semantics directly
   const DuckDBZSet &current_state() const { return current_state_; }
 
+  // ---- resident-bytes accounting (bounded-RAM Phase 5) ------------------
+  // Boxed baselines are the dominant big-model RAM class (~500 B/row
+  // measured at 18M rows) and were invisible to dbsp_view_state — anything
+  // unmetered can't be budgeted. Approximate, same calibration philosophy
+  // as StateBytes.
+
+  const char *state_mode() const {
+    if (deferred_) {
+      return "deferred";
+    }
+    return spill_ ? "spilled" : "boxed";
+  }
+
+  size_t resident_bytes(StateAccounting &acct) const {
+    size_t b = acct.zset_bytes(pending_changes_);
+    if (deferred_) {
+      return b; // nothing materialized yet
+    }
+    if (spill_) {
+      // digest index only: RowDigest(16) + Slot(24) + map node overhead.
+      // An mmap'd flat layer is page-cache, not process heap — only the
+      // resident (overlay) entries count.
+      return b + spill_->resident_index_entries() * kSpillIndexEntryBytes;
+    }
+    return b + acct.zset_bytes(current_state_);
+  }
+
 private:
+  static constexpr size_t kSpillIndexEntryBytes = 72;
+
+  // Non-rebuild growth paths (captured deltas, direct inserts): spill once
+  // the settled baseline crosses the threshold. Never fires mid-rebuild
+  // (rebuild growth is handled by add_scanned_row's own check).
+  void maybe_auto_spill() {
+    if (spill_ != nullptr || spill_path_hint_.empty()) {
+      return;
+    }
+    const size_t th = auto_spill_threshold();
+    if (th != 0 && current_state_.size() >= th) {
+      enable_spill(spill_path_hint_);
+    }
+  }
+
+  // A scan crossed the threshold with a boxed rebuild in flight: move the
+  // OLD baseline into the spill index (enable_spill migrates
+  // current_state_), open the pending generation, replay the partial scan
+  // into it, and let the rest of the scan stream to disk. finish/install
+  // then run entirely on the spill path.
+  void spill_mid_rebuild() {
+    DuckDBZSet partial = std::move(rebuild_state_);
+    rebuild_state_ = DuckDBZSet();
+    enable_spill(spill_path_hint_);
+    spill_->begin_rebuild();
+    for (const auto &[row, w] : partial) {
+      spill_->add(row_values(row), w);
+    }
+  }
+
   static std::vector<duckdb::Value> row_values(const DuckDBRow &row) {
     std::vector<duckdb::Value> vals;
     vals.reserve(row.columns.size());
@@ -592,6 +824,8 @@ private:
   DuckDBZSet rebuild_state_; // RAM-mode rebuild in progress
   DuckDBZSet pending_changes_;
   std::unique_ptr<SpilledBaseline> spill_;
+  std::string spill_path_hint_; // set by CDCManager; empty = no auto-spill
+  bool spill_durable_ = false;  // files survive process exit (per-DB dir)
   uint64_t sequence_;
   // Deferred baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan.
@@ -616,6 +850,40 @@ public:
   // Apply incremental changes
   virtual void apply_changes(const std::string &table_name,
                              const DuckDBZSet &changes) = 0;
+
+  // Apply ONE commit's deltas from multiple sources as one logical step.
+  // A view whose two join sides are both fed in the same propagation pass
+  // (sibling MVs over one base table) must see both deltas in a single
+  // circuit step — the bilinear join correction (−Δl⋈Δr under both-shared
+  // arrangements) only fires within a step. Applied one source at a time,
+  // a join of two MVs accumulates duplicate rows and never retracts stale
+  // ones. PlannedCircuitView overrides this to push every input and step
+  // once; the default preserves sequential per-source application and
+  // accumulates the per-apply deltas so dependents see the union.
+  virtual void apply_changes_batch(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>>
+          &changes) {
+    batched_ = changes.size() > 1;
+    if (!batched_) {
+      if (!changes.empty()) {
+        apply_changes(changes[0].first, *changes[0].second);
+      }
+      return;
+    }
+    batch_delta_.clear();
+    for (const auto &[src, delta] : changes) {
+      apply_changes(src, *delta);
+      for (const auto &[row, w] : get_delta()) {
+        batch_delta_.insert(row, w);
+      }
+    }
+  }
+
+  // Delta of the last apply_changes_batch: the union across sources when
+  // the default multi-source path ran, else whatever get_delta() reports.
+  virtual const DuckDBZSet &get_batch_delta() const {
+    return batched_ ? batch_delta_ : get_delta();
+  }
 
   // Get current result
   virtual const DuckDBZSet &get_result() const = 0;
@@ -642,6 +910,29 @@ public:
     }
   }
 
+  // Approximate resident bytes by state class (bounded-RAM Phase 0).
+  // Default covers the result z-set + delta buffer; stateful subclasses
+  // (windows, circuit views) add their private state. A pending
+  // (lazy-restored, never realized) view legitimately reports ~0 — its
+  // state is a stashed checkpoint blob, not resident circuit state.
+  virtual void account_state(StateBytes &out, StateAccounting &acct) const {
+    out.result += acct.zset_bytes(get_result());
+    out.other += acct.zset_bytes(get_delta());
+  }
+
+  // Bounded-RAM Phase 1c: the caller mirrored this view's result into a
+  // durable backing table and wants the RAM copy dropped (the sink stops
+  // integrating). Returns true when the view supports table-backed mode;
+  // legacy views keep their result and return false.
+  virtual bool set_table_backed() { return false; }
+
+  // Drop the buffered dbsp_changes delta (bounded-RAM Phase 1a). Called
+  // after create-time initial replay: nobody consumes the initial
+  // population through dbsp_changes (generation filtering skips it), and
+  // on big views it pins the full result a second time. Views whose delta
+  // surface is droppable override; the default keeps legacy behavior.
+  virtual void drop_delta() {}
+
   // --- Circuit-state checkpointing (D3b) -------------------------------
   // Planner-built views override these; legacy views report false and
   // fall back to rebuild-by-replay on load.
@@ -657,10 +948,60 @@ public:
     return false;
   }
 
+  // --- Per-node checkpointing when wrapped by EmbeddedViewNode (Task 2,
+  // restore-tail) --------------------------------------------------------
+  // EmbeddedViewNode (dbsp_plan_translator.hpp) embeds exactly ONE
+  // NativeMaterializedView as a single leaf dbsp::Node inside a bigger
+  // circuit (the WINDOW/SORT_LIMIT/DISTINCT_ON plan shapes) -- it is
+  // opaque, legacy hand-wired state to the circuit walk, not itself a
+  // multi-node circuit. These three mirror dbsp::Node's own
+  // state_kind()/serialize_state()/restore_state() shape exactly
+  // (StateKind, not CkptSupport -- reused directly so EmbeddedViewNode's
+  // override is a one-line delegation, no enum mapping) and are DISTINCT
+  // from checkpointable()/serialize_circuit_state()/restore_circuit_state()
+  // above, which compose MULTIPLE inner dbsp::Node objects for a
+  // circuit-backed view like PlannedCircuitView -- unrelated purpose,
+  // unrelated signature, kept separate rather than overloaded to avoid
+  // confusing the two call sites. Default UNSUPPORTED; only
+  // NativeWindowView overrides this pass -- NativeSortView/NativeLimitView/
+  // NativeDistinctOnView stay UNSUPPORTED via this base default, so an
+  // embedded view containing one of those still forces its whole outer
+  // view to rebuild-by-replay, unchanged from before this pass.
+  virtual dbsp::Node::StateKind circuit_state_kind() const {
+    return dbsp::Node::StateKind::UNSUPPORTED;
+  }
+  virtual void serialize_circuit_node_state(std::vector<uint8_t> &out) const {
+    (void)out;
+  }
+  virtual bool restore_circuit_node_state(const uint8_t *data, size_t len) {
+    (void)data;
+    (void)len;
+    return false;
+  }
+
+  // --- Lazy per-view checkpoint restore (D-lazy) -------------------------
+  // Mirrors TrackedTable::is_deferred()/mark_deferred() for views: a view
+  // cold-created (skip_init_replay) from the D3b checkpoint fast path with
+  // dbsp_lazy_restore ON has its node/sink blobs stashed, undecoded, in
+  // CDCManager::pending_restore_ instead of being injected immediately.
+  // While pending_restore_ is true the view's own circuit-node state and
+  // get_result() are the cold-create default (empty) -- CDCManager's
+  // realize_pending_view[_locked] decodes the stash and calls
+  // clear_pending_restore() on first need (a query, an incoming delta, or
+  // any other consumer of live state). Guarded by view_mutex_, the same
+  // lock that already protects everything else this class exposes.
+  bool is_pending_restore() const { return pending_restore_; }
+  void mark_pending_restore() { pending_restore_ = true; }
+  void clear_pending_restore() { pending_restore_ = false; }
+
 protected:
   std::string name_;
   std::string sql_;
   uint64_t version_;
+  // apply_changes_batch state (default multi-source path only)
+  DuckDBZSet batch_delta_;
+  bool batched_ = false;
+  bool pending_restore_ = false;
 };
 
 // Filter view: SELECT * FROM table WHERE condition

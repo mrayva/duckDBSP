@@ -42,7 +42,25 @@ public:
     }
     source_->push_borrowed(changes);
     circuit_.step();
+    trim_outputs();
     ++version_;
+  }
+
+  // Bounded-RAM Phase 1a: sink owns its delta copy; every other node's
+  // output buffer is transient and dropped after each step.
+  void trim_outputs() {
+    circuit_.for_each_node([this](dbsp::Node &n) {
+      if (&n != static_cast<const dbsp::Node *>(sink_)) {
+        n.clear_output();
+      }
+    });
+  }
+
+  void drop_delta() override { sink_->drop_delta(); }
+
+  bool set_table_backed() override {
+    sink_->set_table_backed();
+    return true;
   }
 
   const DuckDBZSet &get_result() const override {
@@ -55,6 +73,12 @@ public:
   }
 
   const DuckDBZSet &get_delta() const override { return sink_->delta(); }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // sink result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
+  }
 
   const TableSchema &result_schema() const override { return schema_; }
 
@@ -455,8 +479,18 @@ public:
                      const DuckDBZSet &changes) override {
     node_->stage(table_name, changes);
     circuit_.step();
+    // Bounded-RAM Phase 1a: this view's delta surface IS the wrapped
+    // view's own buffer (get_delta above), so the wrapped node must NOT
+    // be cleared here — only auxiliary nodes.
+    circuit_.for_each_node([this](dbsp::Node &n) {
+      if (&n != static_cast<const dbsp::Node *>(node_)) {
+        n.clear_output();
+      }
+    });
     ++version_;
   }
+
+  void drop_delta() override { node_->view().drop_delta(); }
 
   const DuckDBZSet &get_result() const override {
     return node_->view().get_result();
@@ -469,6 +503,12 @@ public:
 
   const DuckDBZSet &get_delta() const override {
     return node_->applied() ? node_->view().get_delta() : empty_delta_;
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // wrapped result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
   }
 
   const TableSchema &result_schema() const override {

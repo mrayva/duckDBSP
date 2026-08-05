@@ -9,6 +9,25 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Not supported (DBSP-E110 at view creation)
 
+- **(DBSP_TIP_PORT only, new as of the Aug 2026 tip bump)** Correlated
+  scalar subqueries whose decorrelated JOIN carries a projection map
+  (`WHERE x > (SELECT AVG(...) FROM ... WHERE correlated)` and similar —
+  see `test/integration/test_planner_frontend.cpp`'s E2 correlated-scalar-
+  subquery and self-correlated-subquery tests, both `#ifdef
+  DBSP_TIP_PORT`-gated to assert the decline). Current DuckDB's optimizer
+  now sometimes folds the projection directly into
+  `LogicalComparisonJoin::left_projection_map` /
+  `right_projection_map` instead of leaving a separate PROJECTION operator
+  above a full-width join. `visit_join` (dbsp_plan_translator.hpp) always
+  builds output columns as "left columns then right columns" in full — it
+  doesn't remap through the projection maps — so it declines rather than
+  risk a parent node reading the wrong output column. Fix: after building
+  `left_columns`/right `columns`, select/reorder through
+  `op.left_projection_map`/`op.right_projection_map` when non-empty (and
+  audit whether any downstream PlanJoinNode row-assembly code assumes the
+  unprojected full-width layout). Was passing under the tip snapshot
+  validated Jul 25 2026 — regressed with DuckDB's continued evolution
+  since.
 - WITH RECURSIVE ... USING KEY
 - Non-constant (expression) LIMIT — constant and percentage forms work
 - approx_quantile / reservoir_quantile / approx_top_k (approximate
@@ -20,6 +39,20 @@ subsystem, bespoke parser, standalone Z-set spilling).
 - string_agg/array_agg WITHOUT ORDER BY inside the aggregate (result
   order unreproducible incrementally; the ordered forms are supported —
   ties on order keys break by value, not input order)
+- NTH_VALUE's N — rejected even as a literal constant (e.g. `NTH_VALUE(v,
+  3)`), unlike window frame bounds, LAG/LEAD offsets, and (as of the
+  2026-07-31 lazy-restore-ntile fix) NTILE's bucket count, all of which
+  now accept constants. Deliberately kept gated: `NativeWindowView`'s
+  NTH_VALUE render logic (both call sites in
+  `include/dbsp_window_view.hpp`) always indexes the N-th row of the
+  whole partition, ignoring the window's frame bounds — diverges from
+  stock DuckDB's frame-relative NTH_VALUE whenever the frame is narrower
+  than the full partition (the common case, since the default frame is
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), see CHANGELOG. Fix
+  NTH_VALUE to index within `[frame_start, frame_end]` like the aggregate
+  branch beside it does, then widen the gate (`bare_constant_int` ->
+  `constant_int` at its one remaining call site in
+  `dbsp_plan_translator.hpp`).
 
 ## Performance
 

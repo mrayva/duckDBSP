@@ -61,6 +61,11 @@
 
 namespace duckdb {
 
+// In-flight detached close-time teardown threads (process-global). Process
+// exit during the detached teardown (view destruction, auto-save) segfaults
+// in static destructors — dbsp_wait_teardown() lets an embedder wait it out.
+static std::atomic<int> g_teardown_threads{0};
+
 // Helper: Ensure DBSPContextState is attached to the context
 // This is necessary because OnConnectionOpened isn't always called for the
 // initial connection when loading the extension
@@ -95,7 +100,8 @@ struct TrackBindData : public TableFunctionData {
 unique_ptr<FunctionData> TrackBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<TrackBindData>();
 
   if (input.inputs.empty()) {
@@ -105,7 +111,7 @@ unique_ptr<FunctionData> TrackBind(ClientContext &context,
   data->table_name = input.inputs[0].GetValue<string>();
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -117,6 +123,7 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   bool ok = manager.track_table(context, data.table_name);
 
   if (!ok) {
@@ -158,7 +165,8 @@ struct CreateViewBindData : public TableFunctionData {
 unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<CreateViewBindData>();
 
   if (input.inputs.size() < 2) {
@@ -185,7 +193,7 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -197,6 +205,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   string result;
 
   if (data.is_sql_mode) {
@@ -276,7 +285,8 @@ struct NotifyBindData : public TableFunctionData {
 unique_ptr<FunctionData> NotifyBind(ClientContext &context,
                                     TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<NotifyBindData>();
 
   if (input.inputs.size() < 2) {
@@ -302,7 +312,7 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -353,7 +363,8 @@ struct SyncBindData : public TableFunctionData {
 unique_ptr<FunctionData> SyncBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SyncBindData>();
 
   if (input.inputs.empty()) {
@@ -363,7 +374,7 @@ unique_ptr<FunctionData> SyncBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -375,6 +386,7 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
 
   if (data.sync_all) {
     manager.sync_all(context);
@@ -386,6 +398,7 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
     output.SetValue(
         0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
   }
+  manager.maybe_save_checkpoint(context);
   data.done = true;
 }
 
@@ -404,7 +417,8 @@ struct QueryBindData : public TableFunctionData {
 unique_ptr<FunctionData> QueryBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<QueryBindData>();
 
   if (input.inputs.empty()) {
@@ -414,6 +428,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -436,7 +451,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.push_back(col.name);
+      names.emplace_back(col.name);
     }
     data->types = return_types;
   } else if (!data->rows.empty()) {
@@ -444,12 +459,12 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.push_back("col" + std::to_string(i));
+      names.emplace_back("col" + std::to_string(i));
     }
     data->types = return_types;
   } else {
     return_types.push_back(LogicalType::VARCHAR);
-    names.push_back("result");
+    names.emplace_back("result");
   }
 
   return std::move(data);
@@ -493,7 +508,8 @@ struct ChangesBindData : public TableFunctionData {
 unique_ptr<FunctionData> ChangesBind(ClientContext &context,
                                      TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ChangesBindData>();
 
   if (input.inputs.empty()) {
@@ -503,6 +519,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
   data->view_name = input.inputs[0].GetValue<string>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   bool found = manager.scan_view_delta(
@@ -518,17 +535,17 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.push_back(col.name);
+      names.emplace_back(col.name);
     }
   } else if (!data->rows.empty()) {
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.push_back("col" + std::to_string(i));
+      names.emplace_back("col" + std::to_string(i));
     }
   }
   return_types.push_back(LogicalType::BIGINT);
-  names.push_back("weight");
+  names.emplace_back("weight");
 
   return std::move(data);
 }
@@ -553,6 +570,325 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_mv_tables - Toggle disk-backed MV result tables (__mv_<view>)
+// Usage: SELECT * FROM dbsp_mv_tables(true);
+// Enabling backfills a __mv_ table per registered view and keeps them in
+// sync per commit (one internal transaction per propagation pass, plus a
+// __dbsp_mv_meta watermark row per view). Disabling stops mirroring and
+// leaves the tables as-is (stale until re-enabled).
+// ============================================================================
+
+struct MvTablesBindData : public TableFunctionData {
+  string message;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> MvTablesBind(ClientContext &context,
+                                      TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types,
+                                      vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<MvTablesBindData>();
+  if (input.inputs.empty()) {
+    throw InvalidInputException("dbsp_mv_tables(enable)");
+  }
+  const bool enable = input.inputs[0].GetValue<bool>();
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  if (manager.set_mv_tables(context, enable)) {
+    data->message = enable ? "MV result tables ENABLED" : "MV result tables DISABLED";
+  } else {
+    throw InvalidInputException("dbsp_mv_tables failed: " +
+                                manager.last_error());
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
+                  DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<MvTablesBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value(data.message));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_realize - Realize one pending (lazy-restored) view's circuit state
+// Usage: SELECT * FROM dbsp_realize('view_name');
+// Returns realized=true when the view WAS pending and its operator state
+// was decoded now; false when it was already live (or never checkpointed).
+// Lets an embedder warm lazy state in the background instead of paying the
+// decode on the first touching edit.
+// ============================================================================
+
+struct RealizeBindData : public TableFunctionData {
+  bool was_pending = false;
+  int64_t state_bytes = 0;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> RealizeBind(ClientContext &context,
+                                     TableFunctionBindInput &input,
+                                     vector<LogicalType> &return_types,
+                                     vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<RealizeBindData>();
+  if (input.inputs.empty()) {
+    throw InvalidInputException("dbsp_realize(view_name)");
+  }
+  const string view_name = input.inputs[0].GetValue<string>();
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  data->was_pending = manager.is_view_pending(view_name);
+  if (data->was_pending) {
+    manager.realize_pending_view(view_name);
+  }
+  // Resident bytes of THIS view after (possible) realization — a warming
+  // loop sums these to stay inside a RAM budget and leave the tail lazy.
+  manager.scan_one_view_state(view_name, [&](const dbsp_native::StateBytes &b) {
+    data->state_bytes = static_cast<int64_t>(b.total());
+  });
+  return_types.push_back(LogicalType::BOOLEAN);
+  names.emplace_back("realized");
+  return_types.push_back(LogicalType::BIGINT);
+  names.emplace_back("state_bytes");
+  return std::move(data);
+}
+
+void RealizeFunc(ClientContext &context, TableFunctionInput &input,
+                 DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<RealizeBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value::BOOLEAN(data.was_pending));
+  output.SetValue(1, 0, Value::BIGINT(data.state_bytes));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_wait_teardown - Wait for detached close-time teardown threads
+// Usage (from any connection — e.g. a throwaway in-memory one AFTER closing
+// the last real connection): SELECT * FROM dbsp_wait_teardown();
+// ============================================================================
+
+struct WaitTeardownBindData : public TableFunctionData {
+  string message = "teardown drained";
+  bool done = false;
+};
+
+unique_ptr<FunctionData> WaitTeardownBind(ClientContext &context,
+                                          TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types,
+                                          vector<Identifier> &names) {
+  auto data = make_uniq<WaitTeardownBindData>();
+  for (int i = 0; i < 3000; i++) {
+    if (g_teardown_threads.load() <= 0) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void WaitTeardownFunc(ClientContext &context, TableFunctionInput &input,
+                      DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<WaitTeardownBindData>();
+  if (data.done) {
+    output.SetCardinality(0);
+    return;
+  }
+  output.SetValue(0, 0, Value(data.message));
+  output.SetCardinality(1);
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_view_state - Per-view resident circuit-state bytes by class
+// Usage: SELECT * FROM dbsp_view_state();
+// Columns: view_name, result_bytes, arrangement_bytes, window_bytes,
+// recursion_bytes, other_bytes, total_bytes. Approximate (calibrated
+// estimates, payload-shared rows counted once per scan); the synthetic row
+// "__shared_arrangements" carries manager-owned shared join arrangements.
+// ============================================================================
+
+struct ViewStateBindData : public TableFunctionData {
+  struct Row {
+    string name;
+    dbsp_native::StateBytes bytes;
+  };
+  vector<Row> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> ViewStateBind(ClientContext &context,
+                                       TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types,
+                                       vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<ViewStateBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_view_state(
+      [&](const string &name, const dbsp_native::StateBytes &b) {
+        data->rows.push_back({name, b});
+      });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("view_name");
+  for (const char *col :
+       {"result_bytes", "arrangement_bytes", "window_bytes",
+        "recursion_bytes", "other_bytes", "total_bytes"}) {
+    return_types.push_back(LogicalType::BIGINT);
+    names.emplace_back(col);
+  }
+  return std::move(data);
+}
+
+void ViewStateFunc(ClientContext &context, TableFunctionInput &input,
+                   DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<ViewStateBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &r = data.rows[data.current];
+    output.SetValue(0, count, Value(r.name));
+    output.SetValue(1, count, Value::BIGINT((int64_t)r.bytes.result));
+    output.SetValue(2, count, Value::BIGINT((int64_t)r.bytes.arrangement));
+    output.SetValue(3, count, Value::BIGINT((int64_t)r.bytes.window));
+    output.SetValue(4, count, Value::BIGINT((int64_t)r.bytes.recursion));
+    output.SetValue(5, count, Value::BIGINT((int64_t)r.bytes.other));
+    output.SetValue(6, count, Value::BIGINT((int64_t)r.bytes.total()));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
+// dbsp_table_state - Per-tracked-table baseline residency (bounded-RAM
+// Phase 5). Usage: SELECT * FROM dbsp_table_state();
+// Columns: table_name VARCHAR, mode VARCHAR (boxed|spilled|deferred),
+// distinct_rows BIGINT, resident_bytes BIGINT. Boxed baselines are the
+// dominant big-model RAM class and are NOT in dbsp_view_state — budget
+// against the SUM of both functions.
+// ============================================================================
+
+struct TableStateBindData : public TableFunctionData {
+  struct Row {
+    string name;
+    string mode;
+    int64_t rows;
+    int64_t bytes;
+  };
+  vector<Row> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> TableStateBind(ClientContext &context,
+                                        TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types,
+                                        vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<TableStateBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_table_state(
+      [&](const string &name, const string &mode, int64_t rows,
+          int64_t bytes) { data->rows.push_back({name, mode, rows, bytes}); });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("table_name");
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("mode");
+  return_types.push_back(LogicalType::BIGINT);
+  names.emplace_back("distinct_rows");
+  return_types.push_back(LogicalType::BIGINT);
+  names.emplace_back("resident_bytes");
+  return std::move(data);
+}
+
+void TableStateFunc(ClientContext &context, TableFunctionInput &input,
+                    DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<TableStateBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &r = data.rows[data.current];
+    output.SetValue(0, count, Value(r.name));
+    output.SetValue(1, count, Value(r.mode));
+    output.SetValue(2, count, Value::BIGINT(r.rows));
+    output.SetValue(3, count, Value::BIGINT(r.bytes));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
+// dbsp_delta_generations - Per-view delta-buffer generation
+// Usage: SELECT * FROM dbsp_delta_generations();
+// Columns: view_name VARCHAR, generation BIGINT. `generation` is the commit
+// sequence at which the view's dbsp_changes buffer was last rewritten. The
+// buffer is single-generation and reading does NOT drain it, so a change-feed
+// consumer must compare generations against a baseline to skip views whose
+// buffer predates the commits it cares about.
+// ============================================================================
+
+struct DeltaGenerationsBindData : public TableFunctionData {
+  vector<std::pair<string, uint64_t>> rows;
+  idx_t current = 0;
+};
+
+unique_ptr<FunctionData> DeltaGenerationsBind(ClientContext &context,
+                                              TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types,
+                                              vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<DeltaGenerationsBindData>();
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  manager.scan_delta_generations([&](const string &name, uint64_t gen) {
+    data->rows.emplace_back(name, gen);
+  });
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("view_name");
+  return_types.push_back(LogicalType::BIGINT);
+  names.emplace_back("generation");
+
+  return std::move(data);
+}
+
+void DeltaGenerationsFunc(ClientContext &context, TableFunctionInput &input,
+                          DataChunk &output) {
+  auto &data = input.bind_data->CastNoConst<DeltaGenerationsBindData>();
+
+  idx_t count = 0;
+  while (data.current < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+    const auto &row = data.rows[data.current];
+    output.SetValue(0, count, Value(row.first));
+    output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(row.second)));
+    data.current++;
+    count++;
+  }
+  output.SetCardinality(count);
+}
+
+// ============================================================================
 // dbsp_views - List all views
 // ============================================================================
 
@@ -564,22 +900,24 @@ struct ListViewsBindData : public TableFunctionData {
 unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
                                        TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ListViewsBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
   for (const auto &name : manager.list_views()) {
     data->views.push_back(manager.get_view_info(name));
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("view_name");
+  names.emplace_back("view_name");
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("sql");
+  names.emplace_back("sql");
   return_types.push_back(LogicalType::BIGINT);
-  names.push_back("rows");
+  names.emplace_back("rows");
   return_types.push_back(LogicalType::BIGINT);
-  names.push_back("version");
+  names.emplace_back("version");
 
   return std::move(data);
 }
@@ -615,16 +953,17 @@ struct ListTablesBindData : public TableFunctionData {
 unique_ptr<FunctionData> ListTablesBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ListTablesBindData>();
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->tables = manager.list_tracked_tables();
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("table_name");
+  names.emplace_back("table_name");
   return_types.push_back(LogicalType::BIGINT);
-  names.push_back("columns");
+  names.emplace_back("columns");
 
   return std::move(data);
 }
@@ -662,7 +1001,8 @@ struct StatsBindData : public TableFunctionData {
 unique_ptr<FunctionData> StatsBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->metrics = {
@@ -681,9 +1021,9 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
        NumericCast<int64_t>(manager.list_tracked_tables().size())},
   };
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("metric");
+  names.emplace_back("metric");
   return_types.push_back(LogicalType::BIGINT);
-  names.push_back("value");
+  names.emplace_back("value");
   return std::move(data);
 }
 
@@ -752,7 +1092,8 @@ struct SaveBindData : public TableFunctionData {
 unique_ptr<FunctionData> SaveBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SaveBindData>();
 
   if (input.inputs.empty()) {
@@ -791,7 +1132,7 @@ unique_ptr<FunctionData> SaveBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -856,7 +1197,8 @@ struct LoadBindData : public TableFunctionData {
 unique_ptr<FunctionData> LoadBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<LoadBindData>();
 
   if (input.inputs.empty()) {
@@ -886,7 +1228,7 @@ unique_ptr<FunctionData> LoadBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -925,10 +1267,32 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   auto views = manager.list_views();
   msg += " (" + std::to_string(views.size()) + " views";
   if (data.format != "json") {
-    msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
-           " from checkpoint, " +
-           std::to_string(manager.last_deferred_sources_count()) +
-           " sources deferred";
+    // last_ckpt_restored_count()/last_loaded_count() reflect only THIS
+    // call's work. If every row in the source table named an already-live
+    // view (this call loaded 0, but skipped > 0), the earlier load that
+    // populated them -- auto-load or a prior dbsp_load() -- is what
+    // actually consumed the checkpoint; saying "0 from checkpoint" here
+    // would misreport that as the checkpoint having been unused this
+    // session. State the skip explicitly instead of implying that.
+    if (manager.last_loaded_count() == 0 && manager.last_skipped_count() > 0) {
+      msg += ", 0 loaded this call (" +
+             std::to_string(manager.last_skipped_count()) +
+             " already loaded)";
+    } else {
+      msg += ", " + std::to_string(manager.last_ckpt_restored_count()) +
+             " from checkpoint, " +
+             std::to_string(manager.last_deferred_sources_count()) +
+             " sources deferred";
+      // D-lazy: distinct from "sources deferred" above (TrackedTable
+      // baselines, D3c) -- this is views whose checkpoint blobs this call
+      // stashed but has not decoded (dbsp_lazy_restore ON, the default).
+      // 0 either when lazy restore is off or the checkpoint had nothing to
+      // stash.
+      if (manager.last_pending_restore_count() > 0) {
+        msg += ", " + std::to_string(manager.last_pending_restore_count()) +
+               " pending lazy restore";
+      }
+    }
   }
   msg += ")";
 
@@ -952,7 +1316,8 @@ struct DepsBindData : public TableFunctionData {
 unique_ptr<FunctionData> DepsBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<DepsBindData>();
 
   if (input.inputs.empty()) {
@@ -976,9 +1341,9 @@ unique_ptr<FunctionData> DepsBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("name");
+  names.emplace_back("name");
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("relationship");
+  names.emplace_back("relationship");
 
   return std::move(data);
 }
@@ -1016,7 +1381,8 @@ struct AutoSyncBindData : public TableFunctionData {
 unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<AutoSyncBindData>();
 
   if (input.inputs.empty()) {
@@ -1026,7 +1392,7 @@ unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1064,6 +1430,206 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 }
 
 // ============================================================================
+// dbsp_autopersist - Enable/disable auto-load-on-reopen + auto-save-on-close
+// Usage: SELECT * FROM dbsp_autopersist(true);   -- Enable (default)
+//        SELECT * FROM dbsp_autopersist(false);  -- Disable
+//        SELECT * FROM dbsp_autopersist();       -- Query status
+// ============================================================================
+
+struct AutoPersistBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> AutoPersistBind(ClientContext &context,
+                                         TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types,
+                                         vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<AutoPersistBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void AutoPersistFunc(ClientContext &context, TableFunctionInput &input,
+                     DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<AutoPersistBindData>();
+  if (data.done)
+    return;
+
+  // Deliberately does NOT call maybe_autoload: dbsp_autopersist(false) is
+  // the bulk-load-style escape hatch a caller uses BEFORE anything else
+  // runs (same shape as dbsp_auto_sync), so it must not itself trigger the
+  // auto-load it may be trying to suppress.
+  auto &manager = dbsp_native::get_cdc_manager(context);
+
+  if (data.query_only) {
+    bool enabled = manager.autopersist_enabled();
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(string("Auto-persist is ") + (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_autopersist();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-persist ENABLED: views survive a clean connection "
+                "reopen"));
+    } else {
+      manager.disable_autopersist();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Auto-persist DISABLED: use dbsp_save()/dbsp_load() "
+                "manually"));
+    }
+  }
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_autopersist_interval - Piggyback a circuit-state checkpoint every N
+// commits (0 = off, default). A crash then loses at most N commits of
+// operator state; the underlying data is never at risk (DuckDB-durable).
+// Usage: SELECT * FROM dbsp_autopersist_interval(100);  -- set
+//        SELECT * FROM dbsp_autopersist_interval();     -- query
+// ============================================================================
+
+struct AutoPersistIntervalBindData : public TableFunctionData {
+  int64_t n = -1; // -1 = query only
+  bool done = false;
+};
+
+unique_ptr<FunctionData> AutoPersistIntervalBind(
+    ClientContext &context, TableFunctionBindInput &input,
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
+  auto data = make_uniq<AutoPersistIntervalBindData>();
+
+  if (!input.inputs.empty()) {
+    data->n = input.inputs[0].GetValue<int64_t>();
+    if (data->n < 0) {
+      throw InvalidInputException(
+          "dbsp_autopersist_interval(N): N must be >= 0");
+    }
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
+                             DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<AutoPersistIntervalBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  if (data.n < 0) {
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value("Auto-persist checkpoint interval: " +
+              std::to_string(manager.autopersist_interval()) +
+              " commits (0 = off)"));
+  } else {
+    manager.set_autopersist_interval(static_cast<size_t>(data.n));
+    output.SetCardinality(1);
+    output.SetValue(0, 0,
+                    Value("Auto-persist checkpoint interval set to " +
+                          std::to_string(data.n) + " commits"));
+  }
+  data.done = true;
+}
+
+// ============================================================================
+// dbsp_lazy_restore - Enable/disable lazy per-view checkpoint restore
+// (D-lazy). Default ON: a load_from_duck_table checkpoint fast path
+// cold-creates every covered view but stashes its node/sink blobs
+// undecoded instead of injecting them immediately -- each view decodes on
+// first need (a query, an incoming delta, or anything else that reads its
+// live state; see CDCManager::realize_pending_view). OFF reproduces the
+// pre-D-lazy eager behavior (every checkpointed view fully restored during
+// the load call itself), for bulk benchmarks or debugging a restore issue
+// without the pending indirection in the way.
+// Usage: SELECT * FROM dbsp_lazy_restore(true);   -- Enable (default)
+//        SELECT * FROM dbsp_lazy_restore(false);  -- Disable
+//        SELECT * FROM dbsp_lazy_restore();       -- Query status
+// ============================================================================
+
+struct LazyRestoreBindData : public TableFunctionData {
+  bool enable = false;
+  bool query_only = false;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> LazyRestoreBind(ClientContext &context,
+                                         TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types,
+                                         vector<Identifier> &names) {
+  EnsureContextState(context);
+  auto data = make_uniq<LazyRestoreBindData>();
+
+  if (input.inputs.empty()) {
+    data->query_only = true;
+  } else {
+    data->enable = input.inputs[0].GetValue<bool>();
+  }
+
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void LazyRestoreFunc(ClientContext &context, TableFunctionInput &input,
+                     DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<LazyRestoreBindData>();
+  if (data.done)
+    return;
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+
+  if (data.query_only) {
+    bool enabled = manager.lazy_restore_enabled();
+    output.SetCardinality(1);
+    output.SetValue(
+        0, 0,
+        Value(string("Lazy restore is ") + (enabled ? "ENABLED" : "DISABLED")));
+  } else {
+    if (data.enable) {
+      manager.enable_lazy_restore();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Lazy restore ENABLED: checkpointed views decode on first "
+                "need"));
+    } else {
+      manager.disable_lazy_restore();
+      output.SetCardinality(1);
+      output.SetValue(
+          0, 0,
+          Value("Lazy restore DISABLED: dbsp_load() restores every "
+                "checkpointed view eagerly"));
+    }
+  }
+  data.done = true;
+}
+
+// ============================================================================
 // dbsp_parallel - Enable/disable parallel sync + parallel view propagation
 // Usage: SELECT * FROM dbsp_parallel(true);   -- Enable
 //        SELECT * FROM dbsp_parallel(false);  -- Disable
@@ -1079,7 +1645,8 @@ struct ParallelBindData : public TableFunctionData {
 unique_ptr<FunctionData> ParallelBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<ParallelBindData>();
   if (input.inputs.empty()) {
     data->query_only = true;
@@ -1087,7 +1654,7 @@ unique_ptr<FunctionData> ParallelBind(ClientContext &context,
     data->enable = input.inputs[0].GetValue<bool>();
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1133,7 +1700,8 @@ struct SpillBindData : public TableFunctionData {
 unique_ptr<FunctionData> SpillBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<SpillBindData>();
   if (input.inputs.empty()) {
     data->query_only = true;
@@ -1141,7 +1709,7 @@ unique_ptr<FunctionData> SpillBind(ClientContext &context,
     data->enable = input.inputs[0].GetValue<bool>();
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1157,7 +1725,7 @@ void SpillFunc(ClientContext &context, TableFunctionInput &input,
     output.SetValue(0, 0,
                     Value(string("Baseline spill is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
-  } else if (!manager.set_spill(data.enable)) {
+  } else if (!manager.set_spill(context, data.enable)) {
     output.SetCardinality(1);
     output.SetValue(0, 0, Value("Spill toggle FAILED: " +
                                 manager.last_error()));
@@ -1189,7 +1757,8 @@ struct UsePlannerBindData : public TableFunctionData {
 unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
+  EnsureContextState(context);
   auto data = make_uniq<UsePlannerBindData>();
 
   if (input.inputs.empty()) {
@@ -1199,7 +1768,7 @@ unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1228,17 +1797,23 @@ void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
 struct CreateMaterializedViewData : public TableFunctionData {
   string view_name;
   string select_query;
+  bool or_replace = false;
   bool done = false;
 };
 
 unique_ptr<FunctionData> CreateMaterializedViewBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<CreateMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->select_query = input.inputs[1].GetValue<string>();
+  // Optional 3rd arg (OR REPLACE flag): the directly-registered
+  // dbsp_create_materialized_view table function only declares two
+  // parameters, so this stays absent for that call path.
+  data->or_replace =
+      input.inputs.size() > 2 ? input.inputs[2].GetValue<bool>() : false;
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1254,14 +1829,23 @@ void CreateMaterializedViewExecute(ClientContext &context,
   }
 
   auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+
+  // CREATE OR REPLACE MATERIALIZED VIEW: only takes the replace path when
+  // the view already exists (matches SQL's usual OR REPLACE semantics —
+  // plain create otherwise).
+  bool replacing = state.or_replace && manager.view_exists(state.view_name);
   bool success =
-      manager.create_view(context, state.view_name, state.select_query);
+      replacing
+          ? manager.replace_view(context, state.view_name, state.select_query)
+          : manager.create_view(context, state.view_name, state.select_query);
 
   if (!success) {
     string error = manager.last_error();
     if (error.find("DBSP-E") == string::npos) {
-      error = "Failed to create materialized view '" + state.view_name +
-              "': " + error;
+      error = (replacing ? "Failed to replace materialized view '"
+                         : "Failed to create materialized view '") +
+              state.view_name + "': " + error;
     }
     throw InvalidInputException(error);
   }
@@ -1276,7 +1860,69 @@ void CreateMaterializedViewExecute(ClientContext &context,
     sources += info.source_tables[i];
   }
 
-  string message = "Created materialized view: " + state.view_name +
+  string message = (replacing ? "Replaced materialized view: "
+                              : "Created materialized view: ") +
+                   state.view_name + " (sources: " + sources + ")";
+  output.SetValue(0, 0, Value(message));
+
+  state.done = true;
+}
+
+// ============================================================================
+// dbsp_replace_view - CREATE OR REPLACE a materialized view: rebuild only
+// the named view and its transitive dependents (Feature 2)
+// ============================================================================
+
+struct ReplaceViewData : public TableFunctionData {
+  string view_name;
+  string sql;
+  bool done = false;
+};
+
+unique_ptr<FunctionData>
+ReplaceViewBind(ClientContext &context, TableFunctionBindInput &input,
+                vector<LogicalType> &return_types, vector<Identifier> &names) {
+  auto data = make_uniq<ReplaceViewData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->sql = input.inputs[1].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.emplace_back("result");
+  return std::move(data);
+}
+
+void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
+                        DataChunk &output) {
+  EnsureContextState(context);
+  auto &state = input.bind_data->CastNoConst<ReplaceViewData>();
+
+  if (state.done) {
+    output.SetCardinality(0);
+    return;
+  }
+
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  bool success = manager.replace_view(context, state.view_name, state.sql);
+
+  if (!success) {
+    string error = manager.last_error();
+    if (error.find("DBSP-E") == string::npos) {
+      error = "Failed to replace materialized view '" + state.view_name +
+              "': " + error;
+    }
+    throw InvalidInputException(error);
+  }
+
+  output.SetCardinality(1);
+  auto info = manager.get_view_info(state.view_name);
+  string sources = "";
+  for (size_t i = 0; i < info.source_tables.size(); i++) {
+    if (i > 0)
+      sources += ", ";
+    sources += info.source_tables[i];
+  }
+
+  string message = "Replaced materialized view: " + state.view_name +
                    " (sources: " + sources + ")";
   output.SetValue(0, 0, Value(message));
 
@@ -1296,12 +1942,12 @@ struct DropMaterializedViewData : public TableFunctionData {
 unique_ptr<FunctionData>
 DropMaterializedViewBind(ClientContext &context, TableFunctionBindInput &input,
                          vector<LogicalType> &return_types,
-                         vector<string> &names) {
+                         vector<Identifier> &names) {
   auto data = make_uniq<DropMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->cascade = input.inputs[1].GetValue<bool>();
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1381,11 +2027,11 @@ struct RefreshMaterializedViewData : public TableFunctionData {
 
 unique_ptr<FunctionData> RefreshMaterializedViewBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<RefreshMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   return_types.push_back(LogicalType::VARCHAR);
-  names.push_back("result");
+  names.emplace_back("result");
   return std::move(data);
 }
 
@@ -1428,13 +2074,15 @@ MaterializedViewPlan(ParserExtensionInfo *info, ClientContext &context,
           dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(
               parse_data_p.get())) {
     TableFunction func("create_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                       {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                        LogicalType::BOOLEAN},
                        CreateMaterializedViewExecute,
                        CreateMaterializedViewBind);
 
     result.function = func;
     result.parameters.push_back(Value(create_data->view_name));
     result.parameters.push_back(Value(create_data->select_query));
+    result.parameters.push_back(Value(create_data->or_replace));
     result.return_type = StatementReturnType::QUERY_RESULT;
 
     return result;
@@ -1546,8 +2194,74 @@ public:
     dbsp_native::get_recovery_manager().mark_session_end();
     // Destroy on a detached thread: destroying views destroys their
     // Connections, whose destructors re-enter RemoveConnection and would
-    // deadlock on connections_lock if run inline here.
-    std::thread([m = std::move(manager)]() mutable { m.reset(); }).detach();
+    // deadlock on connections_lock if run inline here. Auto-persist
+    // (Feature 1) piggybacks its save on this SAME thread, before the
+    // manager is destroyed:
+    //   - No ClientContext is safely usable here: `context` belongs to the
+    //     closing session and may be destroyed the moment RemoveConnection
+    //     returns to its caller, racing this detached thread. save_to_
+    //     duck_table()/save_checkpoint() only need a ClientContext to reach
+    //     its DatabaseInstance, so a fresh duckdb::Connection built straight
+    //     from `db` (kept alive below) stands in for it instead.
+    //   - That fresh Connection's constructor calls AddConnection, which
+    //     takes connections_lock — exactly like the view-destroying
+    //     Connections above, this MUST happen off-thread: doing it inline
+    //     in OnConnectionClosed would recurse into the lock RemoveConnection
+    //     is still holding on the calling thread. A detached thread doesn't
+    //     hold that lock, so it only has to wait (briefly) rather than
+    //     deadlock.
+    //   - `db` stays alive across the save without an extra shared_ptr
+    //     capture: as long as the manager isn't reset() yet, its own views'
+    //     internal Connections keep the DatabaseInstance pinned (same
+    //     invariant the comment above already relies on) — and the save
+    //     runs before that reset() below.
+    //   - Ordering vs. a same-process reopen: DBInstanceCache busy-spins a
+    //     new duckdb.connect() to this path until the old DatabaseInstance
+    //     is fully destroyed (see test_reopen_hang.py), which can't happen
+    //     until every reference this thread holds — including our save
+    //     Connection and the manager's own — is released. That busy-spin is
+    //     what makes "close() then immediately reopen" observe the save
+    //     synchronously despite it running on a background thread.
+    //   - `dbg` (DBSP_DEBUG_TEARDOWN) is captured by value so a failed save
+    //     (return-false or thrown) logs on this thread too, not just the
+    //     view-teardown path below.
+    g_teardown_threads.fetch_add(1);
+    std::thread([m = std::move(manager), db, dbg]() mutable {
+      struct Dec {
+        ~Dec() { g_teardown_threads.fetch_sub(1); }
+      } dec;
+      // Skip when nothing changed since the last explicit/auto save: a
+      // host that called dbsp_save() before its final close gets a pure
+      // in-RAM teardown here — no SQL racing process exit (observed
+      // segfault: exit()'s static teardown vs this thread mid-INSERT).
+      if (dbg) {
+        std::cerr << "[dbsp] teardown: autopersist=" << m->autopersist_enabled()
+                  << " views=" << m->has_views()
+                  << " dirty=" << m->dirty_since_save() << "\n";
+      }
+      if (m->autopersist_enabled() && m->has_views() && m->dirty_since_save()) {
+        try {
+          duckdb::Connection save_con(*db);
+          bool saved_defs = m->save_to_duck_table(*save_con.context);
+          bool saved_ckpt = m->save_checkpoint(*save_con.context);
+          if (dbg && (!saved_defs || !saved_ckpt)) {
+            std::cerr << "[dbsp] auto-save on close failed: defs=" << saved_defs
+                      << " ckpt=" << saved_ckpt << " last_error=" << m->last_error()
+                      << "\n";
+          }
+        } catch (const std::exception &e) {
+          // Best-effort: a failed auto-save must not crash shutdown.
+          if (dbg) {
+            std::cerr << "[dbsp] auto-save on close threw: " << e.what() << "\n";
+          }
+        } catch (...) {
+          if (dbg) {
+            std::cerr << "[dbsp] auto-save on close threw an unknown exception\n";
+          }
+        }
+      }
+      m.reset();
+    }).detach();
   }
 };
 
@@ -1581,6 +2295,11 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Optional args for simple mode
   create_view_func.varargs = LogicalType::ANY;
   loader.RegisterFunction(create_view_func);
+
+  TableFunction replace_view_func("dbsp_replace_view",
+                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                  ReplaceViewExecute, ReplaceViewBind);
+  loader.RegisterFunction(replace_view_func);
 
   // Create Materialized View DDL support
   // Note: We cannot register actual SQL syntax here (ParserExtension needed for
@@ -1616,6 +2335,30 @@ static void LoadInternal(ExtensionLoader &loader) {
                              ChangesFunc, ChangesBind);
   loader.RegisterFunction(changes_func);
 
+  TableFunction delta_gen_func("dbsp_delta_generations", {},
+                               DeltaGenerationsFunc, DeltaGenerationsBind);
+  loader.RegisterFunction(delta_gen_func);
+
+  TableFunction table_state_func("dbsp_table_state", {}, TableStateFunc,
+                                 TableStateBind);
+  loader.RegisterFunction(table_state_func);
+
+  TableFunction view_state_func("dbsp_view_state", {}, ViewStateFunc,
+                                ViewStateBind);
+  loader.RegisterFunction(view_state_func);
+
+  TableFunction mv_tables_func("dbsp_mv_tables", {LogicalType::BOOLEAN},
+                               MvTablesFunc, MvTablesBind);
+  loader.RegisterFunction(mv_tables_func);
+
+  TableFunction wait_teardown_func("dbsp_wait_teardown", {},
+                                   WaitTeardownFunc, WaitTeardownBind);
+  loader.RegisterFunction(wait_teardown_func);
+
+  TableFunction realize_func("dbsp_realize", {LogicalType::VARCHAR},
+                             RealizeFunc, RealizeBind);
+  loader.RegisterFunction(realize_func);
+
   TableFunction list_views_func("dbsp_views", {}, ListViewsFunc, ListViewsBind);
   loader.RegisterFunction(list_views_func);
 
@@ -1644,6 +2387,22 @@ static void LoadInternal(ExtensionLoader &loader) {
                                AutoSyncBind);
   auto_sync_func.varargs = LogicalType::BOOLEAN;
   loader.RegisterFunction(auto_sync_func);
+
+  TableFunction autopersist_func("dbsp_autopersist", {}, AutoPersistFunc,
+                                 AutoPersistBind);
+  autopersist_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(autopersist_func);
+
+  TableFunction autopersist_interval_func("dbsp_autopersist_interval", {},
+                                          AutoPersistIntervalFunc,
+                                          AutoPersistIntervalBind);
+  autopersist_interval_func.varargs = LogicalType::BIGINT;
+  loader.RegisterFunction(autopersist_interval_func);
+
+  TableFunction lazy_restore_func("dbsp_lazy_restore", {}, LazyRestoreFunc,
+                                  LazyRestoreBind);
+  lazy_restore_func.varargs = LogicalType::BOOLEAN;
+  loader.RegisterFunction(lazy_restore_func);
 
   TableFunction use_planner_func("dbsp_use_planner", {}, UsePlannerFunc,
                                  UsePlannerBind);

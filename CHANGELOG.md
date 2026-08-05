@@ -1,5 +1,1047 @@
 # Changelog
 
+## Sync with upstream fork + rebuild against current DuckDB tip - Aug 2026
+
+- Merged 64 commits from the upstream fork (durability/autopersist,
+  per-view checkpoint validity, LEFT/RIGHT join and MIN/MAX/recursive-view
+  checkpoint state, flat/mmap restore layers, packed shared arrangements,
+  streaming CREATE mirror, signed linear UNION ALL recursion deltas) with
+  this fork's 4 DuckDB-tip-port commits, rebased on top so both lines of
+  work compose. 3 small conflicts (dbsp_context_state.hpp,
+  dbsp_parser_extension.hpp, dbsp_plan_translator.hpp) — all additive,
+  orthogonal changes on both sides.
+- Bumped the `duckdb/` submodule from a 7-week-stale pin to current
+  DuckDB main (`fabf1d60b`, 2026-08-05) and fixed the breaks that surfaced:
+  table function bind callbacks now take `vector<Identifier>&` for column
+  names (not `vector<string>&`, landed the same day upstream); DuckDB
+  dropped the distinct `BoundCastExpression` class in favor of a `__cast`
+  function expression; `FlatVector::Validity()` now returns
+  `const ValidityMask&` only; `Appender`'s constructor takes
+  `const Identifier&` for the table name.
+- **`DBSP_TIP_PORT` and `DBSP_ENGINE_HOOK` now default to `ON`/`OFF`**
+  (previously `OFF`/`ON`): with the submodule permanently tracking tip,
+  the old defaults — a pre-tip capture stack and a patched-engine hook
+  consumer — no longer compile against it. The zero-flag build (what CI
+  and `build.sh` actually run) now matches reality. `build.sh` also no
+  longer clones a hardcoded `v1.5.4` tag; it initializes the submodule,
+  and only applies the legacy engine-hook patch when `DBSP_ENGINE_HOOK=1`
+  is set against your own patched checkout.
+- Fixed 2 real test issues surfaced by the full tip rebuild: an N4
+  spilled-holistic-aggregate checkpoint test whose premise (spilling
+  under `dbsp_spill(true)`) can't hold on tip (holistic aggregate values
+  deliberately stay in-memory there), whose failure was also leaking
+  spill-mode into 3 later unrelated tests; and 2 correlated-scalar-
+  subquery tests that regressed because DuckDB's optimizer now sometimes
+  decorrelates into a JOIN carrying a projection map, which the planner
+  frontend's join visitor doesn't yet remap through (tracked in TODO.md).
+- Validated baseline: 39/39 CTest binaries passing (5.48M+ assertions),
+  89/89 planner differential cases, full soak and benchmark suite green.
+
+## Bounded-RAM Phase 2d increment 2: packed shared arrangements - Aug 2026
+
+- SharedArrangement stores its buckets packed (same codec/pattern as the
+  join-node indexes: packed_ok at registration when side types are
+  codec-clean and no MARK counters; probes decode into consumer scratch
+  incl. O4 projection; spill migrates both directions).
+- Measured (141-view wfp DAG): arrangement class 2.43GB -> 1.66GB,
+  accounted total 4.83 -> 4.07GB, footprint 10-11GB. Edits 0.2s steady.
+- Window partition caches (0.85GB) deliberately left boxed: packing them
+  would force decode inside the sort/positional fast paths for ~0.5GB —
+  poor risk/reward at current sizes. Revisit only if soak shows models
+  where window state dominates.
+
+## Bounded-RAM Phase 2d: packed join-index rows - Aug 2026
+
+- PlanJoinNode's local indexes store rows as compact self-describing byte
+  strings (dbsp_packed_row.hpp: tag+payload per value; ~450-600B boxed ->
+  tens of bytes) for INNER/LEFT-pad joins whose side types are all
+  codec-supported. Buckets decode into the probe scratch on access — the
+  same materialize-into-scratch pattern the spilled/projected shared paths
+  use — so probe/pads/match_count route through probe_side unchanged.
+  MARK and right-padding joins stay boxed (not emitted by compiled plans).
+- Serialization: packed-native blob layout behind a magic header; boxed-era
+  checkpoints decline cleanly (rebuild by replay). own_row_weight() unifies
+  the shared/packed/boxed weight lookup for pad reconciliation.
+- Measured (141-view wfp DAG): arrangement class 7.35GB -> 2.43GB,
+  accounted total 9.65 -> 4.83GB, process footprint 13-15 -> 11-12GB.
+  Cost: cold create +~34s (encode at replay; background + once per model
+  lifetime under Phase 3 reattach) and steady edits 0.17 -> ~0.2s.
+- Fixed during bring-up (LEFT JOIN differentials caught it): the packed
+  probe branch must yield to a SHARED side — intercepting before
+  side_index() probed an empty local map and pads never retracted.
+- Remaining boxed: shared arrangements (~1GB) and window caches — next.
+
+## dbsp_realize(view): background warming with RAM-budget feedback - Aug 2026
+
+- New TF: realizes ONE pending (lazy-restored) view's circuit state and
+  returns (realized BOOLEAN, state_bytes BIGINT) — the view's resident
+  bytes after realization (single-view accounting scan). An embedder pumps
+  it on a worker thread after reattach, summing state_bytes against a RAM
+  budget so warming stops and the tail stays lazy.
+- scan_one_view_state(): per-view StateBytes accounting (fresh dedupe
+  scope — overestimates shared rows, the safe direction for a budget).
+- CALLER NOTE: the TF's side effect runs in Bind — use execute()/fetch
+  paths that bind once; the relation API's double-bind reports
+  was_pending=false on its second pass (the side effect itself stays
+  correct/idempotent).
+
+## Bounded-RAM Phase 3: reattach instead of replay - Aug 2026
+
+- **Reattach**: a reopened disk-backed database ADOPTS its __mv_ tables.
+  __dbsp_mv_meta is read at LOAD start (before any view exists), marking
+  views table-backed so load-time consumers stream from tables instead of
+  the checkpoint's deliberately-empty result blobs; checkpoint-restored
+  views skip backfill; fingerprint-declined views cold-create and rewrite
+  their tables. 141-view DAG: reattach 0.45s vs 48.9s cold; first read
+  0.16s; post-reattach edits incremental (first touch realizes its cone).
+- **Serializable UNION/DISTINCT state**: PlanSetOpNode/PlanDistinctNode
+  now checkpoint (per-row counts) — they previously declined, forcing
+  every union view to cold-replay at each load (13.9s of the reattach).
+- **True-lazy checkpoint blobs**: on disk-backed databases the load reads
+  only the blob CATALOG; bytes are fetched per view at realize time.
+- **Exit-race hardening**: the detached close-time auto-save could run
+  SQL while the host process exits (segfault in static destructors). The
+  auto-save now skips when nothing changed since the last save
+  (dirty_since_save_), dbsp_save() is the explicit sync path, and
+  dbsp_wait_teardown() lets an embedder drain the teardown thread before
+  exiting. Contract: call dbsp_save() before your final close, then
+  dbsp_wait_teardown() from a throwaway connection if exiting immediately.
+- **Tests**: test_mv_tables.py grew reattach + kill-crash recovery
+  sections (8/8 stable); ctest 44/44.
+
+## Bounded-RAM Phase 2 findings: shared padding-left attempted + reverted - Aug 2026
+
+- Attempted: shared arrangements for self-padding LEFT join sides (the
+  compiled dense-driver plans put one static cross table on the LEFT of
+  every view's LEFT JOIN; a probe showed 8 such views dropping 196MB of
+  private indexes to 0 with one 51MB shared arrangement, pad-transition
+  parity clean).
+- Reverted: init is ORDER-DEPENDENT — with the arrangement backfilled at
+  registration and the left replay not skipped, a source replayed before
+  the left table double-counts matches; with the replay skipped, pads are
+  never emitted (planner_frontend LEFT/FULL differentials caught it). A
+  correct version needs an explicit init-pads pass in PlanJoinNode; the
+  eligibility gate now documents this. ctest back to 44/44.
+- Measured for the record (141-view DAG, disk-backed): private
+  arrangements 7.05GB — dominated by CHAINED-join intermediate left
+  indexes, which no sharing can address; spill toggled post-attach costs
+  13s and reaches 5.97GB (digest+cache resident). Remaining reduction
+  requires packed row representation (spec Phase 2d).
+
+## Bounded-RAM Phase 1c: table-backed reads, results out of RAM - Aug 2026
+
+- With `dbsp_mv_tables(true)`, sinks stop integrating: the __mv_ table IS
+  the view result. `dbsp_query`/scan, create-replay of view sources, and
+  shared-arrangement backfill stream from the table; checkpoint save skips
+  result rows for table-backed views (durable in the table already); the
+  weight-multiplicity fallback rebuilds from the table's own rows + delta
+  (no RAM result needed). Disable schedules a view rebuild (reintegrate).
+- **Fixed en route**: `dbsp_mv_tables` ran its side effect in Bind, and the
+  relation API binds twice per statement — the second enable re-backfilled
+  AFTER the results were dropped, wiping every table to 0 rows. Enable is
+  now idempotent.
+- Measured (141-view DAG): result class 2.3GB -> 0; reads of a 167k-row
+  view from the table in 0.04s; edits 0.17-0.78s; parity suites green.
+  Remaining RAM: join arrangements 7.35GB (Phase 2), window caches 0.85GB.
+
+## Bounded-RAM Phase 1b: disk-backed MV result tables + lost-update fix - Aug 2026
+
+- **dbsp_mv_tables(enable)**: every view mirrors its result into a
+  `__mv_<view>` table in the same database file, backfilled at enable/create
+  and delta-maintained per propagation pass (one internal transaction; ±1
+  weights via staged DELETE+INSERT, anything else full-rewrite);
+  `__dbsp_mv_meta` watermarks each write. Measured on the 141-view DAG:
+  backfill 4.2s, 168MB on disk, edits 0.04-0.44s, 80/80 views identical to
+  their tables after an edit run. Internal writes run under
+  InternalQueryGuard — commit hooks never re-enter the manager.
+- **Fixed (pre-existing, exposed by the new test): first write after a
+  TF-triggered autoload silently LOST.** Table-function binds called
+  maybe_autoload without EnsureContextState, so a connection whose first
+  DBSP call was a TF (python clients) had no QueryBegin hook: the next
+  UPDATE skipped pre-write deferred-baseline materialization, the commit
+  path saw a watermark mismatch, declared a false out-of-band change, and
+  dropped the update (views stale until manual rebuild). Every TF bind now
+  ensures context state. Repro: reopen -> dbsp_views() -> UPDATE.
+- **Tests**: test/python/test_mv_tables.py (parity across agg/join/window/
+  recursive/chained/duplicate-row shapes, reopen durability, disable);
+  ctest 44/44.
+
+## Bounded-RAM Phase 1a: transient node outputs dropped post-step - Aug 2026
+
+- **Why**: every circuit node's `output_` z-set kept its LAST step's rows for
+  the view's lifetime — after create, that is the full initial population per
+  node: 11.4GB of a 23GB production-shaped DAG footprint.
+- **What**: `SinkNode` now OWNS its delta (copy = H6 refcount bumps, not
+  Value copies) instead of borrowing the upstream buffer; every other node
+  gets `clear_output()`, called by the owning view after each step
+  (`trim_outputs`). Create-time initial-population deltas are dropped
+  (`drop_delta`) once the generation stamp is taken — nobody consumes them
+  (generation filtering skips create buffers), and they pinned the full
+  result twice. `dbsp_changes` after CREATE on a populated table is now
+  EMPTY (semantics change; post-create edits unaffected).
+- **Measured**: 141-view DAG footprint 23GB -> 15GB; "other" class
+  11.4GB -> 0.6GB; steady edits unchanged (0.03-0.05s).
+- **Also fixed** (pre-existing flake the gate caught): `created_at` doubles
+  as checkpoint LOAD order but was wall-clock milliseconds — back-to-back
+  creates tied and the unstable load sort could order a dependent before
+  its source (intermittent "2 from checkpoint" cold-create fallback). Now
+  strictly monotonic; load sorts stable. lazy_restore 8/8, ctest 44/44.
+
+## dbsp_view_state(): per-view circuit-state accounting - Aug 2026
+
+- **Why**: bounded-RAM roadmap Phase 0 — you cannot diet or budget state you
+  cannot see. Measurement on a 141-view production-shaped DAG: 23GB true
+  physical footprint (ps RSS showed 2.5GB — macOS compression hid 90%),
+  ~19.5GB accounted by class: 11.4GB node output/delta buffers, 5.8GB join
+  arrangements (incl shared), 2.3GB result z-sets, 0.8GB window caches.
+- **What**: `account_state(StateBytes&, StateAccounting&)` virtuals on
+  NativeMaterializedView + dbsp::Node (join/aggregate/distinct/set-op/
+  recursive/embedded/window/circuit views); `CDCManager::scan_view_state`;
+  `dbsp_view_state()` table function with per-class bytes and a
+  `__shared_arrangements` synthetic row. H6 payload-shared rows counted once
+  per scan. `DBSP_ACCT_DEBUG=1` prints sighting/payload counters.
+- **Tests**: `test/python/test_view_state.py` (class attribution +
+  monotonic growth); ctest 44/44.
+
+## dbsp_delta_generations(): per-view delta-buffer provenance - Aug 2026
+
+- **Why**: `dbsp_changes` is a single-generation buffer that reading does not
+  drain — an untouched view serves its last delta (create-time initial
+  replay, at worst) forever. A change-feed consumer polling every view after
+  each commit re-harvested those stale full-view buffers on every edit
+  (measured downstream: a 1-cell edit yielded ~229k spurious "changed" cells
+  across 55 line items, and stale `old=NULL` pairs would corrupt undo).
+- **Fix**: `CDCManager` stamps `commit_seq_` into `view_delta_generation_`
+  whenever a view's delta buffer is rewritten (create-time initial replay,
+  `propagate_changes` step); new `dbsp_delta_generations()` table function
+  exposes `(view_name, generation)`. Consumers baseline on
+  `MAX(generation)` and harvest only views whose generation advanced.
+- **Tests**: `test/python/test_delta_generations.py` pins the contract
+  (touched-only advance, reads never advance, drop cleanup); ctest 44/44.
+
+## Perf: CREATE MATERIALIZED VIEW classified READ — per-create full scan-diff removed - Aug 2026
+
+- **Symptom** (residual after the shadow-table fix): per-view create cost still
+  grew with total view count (1.9→6.0ms/view from 500→2,000 views).
+- **Root cause**: `CREATE MATERIALIZED VIEW` is dbsp syntax the core parser
+  cannot parse, so `classify()` hit "unparseable: assume the worst" →
+  WRITE_UNKNOWN → the commit hook ran `sync_all` — a full scan-diff of EVERY
+  tracked table on every view creation: O(views × rows) DAG builds.
+- **Fix**: a leading-keyword carve-out classifies `CREATE MATERIALIZED VIEW`
+  as READ — view creation only reads tracked tables to populate the new view.
+- **Measured**: per-view create now FLAT (1.06/1.02/1.15 ms at 500/1,000/2,000
+  views); a 2,000-view DAG builds in 2.3s (~112s before the two fixes).
+- **Tests**: ctest 44/44; NumPad gated suites (incl. incremental edit sync and
+  MV-authority deltas) green.
+
+## Perf: view creation shadows only referenced MVs — O(N^2) DAG registration fixed - Aug 2026
+
+- **Symptom**: creating or loading a large view DAG was quadratic in total
+  view count — per-view create cost grew linearly (3.5ms/view at 40 views to
+  28ms/view at 1,000), and peak RSS ran ~5MB per view even for tiny views.
+- **Root cause**: `CDCManager::create_view` handed `PlanTranslator::translate`
+  the schemas of ALL existing MVs; each translate shadowed every one as a
+  `CREATE TEMP TABLE` so views-on-views bind. View #k paid k-1 real catalog
+  creates (DependencyManager dominated — ~83% of create time in a 1,000-view
+  profile), and the shadow tables were also the per-view memory.
+- **Fix**: shadow only views the SQL can reference (case-insensitive substring
+  match on the SQL text — a false positive creates one extra temp table; a
+  referenced identifier always appears verbatim).
+- **Measured** (compiled-DAG bench, depth-4 chains): 500 views create
+  6.5s → 0.97s, load 6.9s → 0.54s, RSS 1.7GB → 134MB; 1,000 views create
+  28s → 2.9s, load 29.4s → 1.2s, RSS ~5GB → 203MB; 2,000 views create 12s
+  (pre-fix projection ~112s). A smaller residual per-view growth remains
+  (~10x lower constant) — separate item.
+- **Tests**: full ctest 44/44; downstream NumPad gated suites (compiled wfp
+  DAG all-MV parity + incremental edit sync) green.
+
+## Fix: NTILE bucket-boundary math + ungate constant bucket counts (Task 2) - Jul 2026
+
+- **Bug**: `NativeWindowView`'s NTILE (`include/dbsp_window_view.hpp`, two
+  render call sites — the fast-path `render_row()` and the full-partition
+  re-render loop inside `apply_changes()`) computed
+  `bucket = floor(row_idx * n / p) + 1` for `p` partition rows and `n`
+  requested buckets. This formula coincides with stock DuckDB's answer
+  when `n <= p`, but diverges whenever there are more buckets than rows
+  (`n > p`): it skips bucket numbers instead of assigning rows
+  sequentially to buckets `1..p` the way stock does (found during the
+  2026-07-31 constant-frame fix's differential check; confirmed
+  pre-existing and unrelated to that fix, so left gated rather than
+  shipped broken — see TODO.md's prior entry).
+- **Root cause**: the proportional-floor formula is a well-known
+  balanced-partition identity, but it silently assumes `n <= p`; for
+  `n > p` it needs the same "clamp bucket count to row count" step stock
+  DuckDB takes (`WindowNtileExecutor::EvaluateInternal`,
+  `duckdb/src/function/window/window_rownumber_function.cpp:171-175`) —
+  `if (n_param > n_total) n_param = n_total;` — before splitting rows into
+  `n_large = p - n*floor(p/n)` "large" buckets of `floor(p/n)+1` rows and
+  the rest at `floor(p/n)` rows.
+- **Fix**: both NTILE call sites now clamp `num_buckets` to the partition
+  size, then apply the same `n_size`/`n_large`/`i_small` split as stock's
+  `WindowNtileExecutor` (verified by reading that function, not by
+  running it — see the code comment for the derivation and Global
+  Constraint on no builds/tests for this task).
+- **Ungate**: `dbsp_plan_translator.hpp`'s `visit_window` now extracts
+  NTILE's bucket-count argument with `constant_int` (the `BOUND_CAST`-
+  unwrapping extractor already used for window frame bounds and LAG/LEAD
+  offsets) instead of the strict `bare_constant_int`, so
+  `NTILE(4) OVER (...)` with a literal bucket count is accepted instead of
+  failing `DBSP-E110: NTILE with non-constant bucket count`.
+- **NTH_VALUE verdict — stays gated**: differentially reading NTH_VALUE's
+  render logic (both call sites, same file) found it always evaluates
+  `rows[n-1]` / `partition_rows[n-1]` — the N-th row of the whole
+  *partition* — never consulting the window's frame bounds
+  (`win.start`/`win.end`) at all. Stock DuckDB's NTH_VALUE is
+  frame-relative ("value evaluated at the row that is the n'th row of the
+  window frame", `window_value_function.cpp`): with the default frame
+  (`RANGE UNBOUNDED PRECEDING AND CURRENT ROW`), stock returns NULL for
+  rows before the frame has grown to N rows, and generally answers
+  relative to `[frame_start, frame_end]`, not `[0, partition_end]`. This
+  is a distinct, pre-existing bug from the NTILE one — ungating NTH_VALUE
+  now would ship a silently wrong result for every frame narrower than
+  the full partition (i.e. most uses). Left gated (`bare_constant_int`
+  unchanged); TODO.md's gap entry updated to describe this specifically
+  rather than bundling it with NTILE.
+- **Test**: `test/integration/test_advanced_window.cpp` — two new
+  differential tests (materialized view vs. stock DuckDB, exact values):
+  one covering `p % n == 0`, `p % n != 0`, `n > p` (empty buckets), and a
+  single-row partition all in one partitioned query; one walking a single
+  partition's row count through `n > p` → `p == n` → `n > p` (different
+  remainder) via INSERT then DELETE, exercising the full-partition
+  re-render path (NTILE has no fast-path rule in `affected_indices()`, so
+  every edit — structural or not — re-renders the whole partition). The
+  old combined "NTILE and NTH_VALUE stay gated" scope-boundary test is
+  now NTH_VALUE-only; its NTILE half is superseded by the differential
+  tests above. Pre-fix (bucket math wrong, gate still narrow), the new
+  differential tests' `dbsp_create_view` calls fail at creation with
+  `DBSP-E110: NTILE with non-constant bucket count` (gate not yet
+  widened) — they only exercise the fixed math once both changes land
+  together, which is why this is one commit. **Untested-by-build**:
+  verification deferred to the batched cycle (Task 3); this is a static,
+  read-the-source fix with no compiler or test run in this task per the
+  binding build protocol.
+
+## Feature: lazy per-view checkpoint restore (D-lazy, Task 1) - Jul 2026
+
+- **Motivation**: a warm reopen paid the blob-decode cost of every
+  checkpointed view up front, even for views the session might not touch
+  for minutes — e.g. 43 views' worth of `restore_circuit_state`/sink
+  decode before `dbsp_load()` could even return.
+- `load_from_duck_table`'s D3b checkpoint fast path no longer decodes a
+  cold-created view's node/sink blobs immediately. It stashes the
+  already-read (but undecoded) bytes in a new `CDCManager::pending_restore_`
+  map (`name -> {nodes, sink}`) and marks the view pending
+  (`NativeMaterializedView::mark_pending_restore()`), gated by a new
+  `dbsp_lazy_restore(BOOLEAN)` setting, **default ON**. `dbsp_lazy_restore(false)`
+  reproduces the exact pre-D-lazy eager behavior (every checkpointed view
+  fully restored during the load call itself) for bulk benchmarks or
+  debugging a restore issue without the pending indirection in the way.
+- `CDCManager::realize_pending_view[_locked]` decodes a pending view's
+  stash on first need (mirrors D3c's `TrackedTable::is_deferred()` +
+  `materialize_deferred_locked` for table baselines — same
+  lazy-materialize-on-first-need shape, same locking discipline: no new
+  lock level, `pending_restore_` guarded by the existing `view_mutex_`
+  tier that already owns view content). Wired into every surface that
+  reads a view's live state:
+  - `scan_view`/`query_view` (the `dbsp_query`/`dbsp_changes`... read
+    path) — self-locking `realize_pending_view()`, a cheap shared-lock
+    peek before ever taking `view_mutex_` exclusively.
+  - `propagate_changes` — a sequential pre-pass realizes, before any
+    `step_view` runs, every view in the delta's topological dependent set
+    (`topo`) **and every view that any of those transitively depends on**
+    (walked via the existing `dep_graph_.get_dependencies` reverse edges —
+    every SQL-declared source `create_view` already records there,
+    arrangement-shared or not), not `topo` alone. **Correction (same-day,
+    reviewer-reproduced Critical):** the first cut of this pre-pass
+    realized only `topo` — source_name's *dependents* — on the mistaken
+    assumption that this also covers "every pending ancestor of it". It
+    does not: a join view whose shared/arrangement-probed side is a
+    *sibling* dependency of the edited table (e.g. `v2 = side1 LEFT JOIN
+    v1`, editing `side1`) has `topo = {v2, v3}` — `v1` is never reached by
+    walking dependents forward from `side1`, however pending it still is.
+    `probe_side` has no `needs_backfill` guard, so an unrealized `v1`'s
+    still-empty arrangement silently produced a NULL-padded join result
+    instead of a real match — a wrong delta that then propagated further
+    downstream in the same pass via `apply_to_arrangements`. Fixed by
+    walking topo's dependency closure too (a small worklist over
+    `get_dependencies`, deliberately the "boringly-safe" superset — it
+    also realizes a still-pending view source that *isn't* actually
+    arrangement-shared, harmlessly, rather than requiring a precise
+    `arrangement_requests()`-only walk). Mirrors the D3c table-side
+    precedent (`materialize_for_delta` sweeps every tracked table before
+    any delta propagates), scoped here to topo's closure rather than
+    every view process-wide, since unlike tables, views already have a
+    dependency graph to scope the sweep with — an unrelated view stays
+    lazily unrealized. Done sequentially, before the per-level loop that
+    may spawn threads under `dbsp_parallel(true)` — `pending_restore_` is
+    one map shared by every view, not a per-view lock, so realizing
+    everything up front keeps the existing "each view's own disjoint
+    state" assumption behind the lock-free parallel `step_view` section
+    true.
+  - `create_view`'s warm-replay loop reads a source **view**'s
+    `get_result()` directly, so it realizes that source first,
+    unconditionally.
+  - `register_arrangements`'s view-sourced arrangement backfill only
+    realizes the source view for a **warm** (non-`cold`) registration —
+    mirroring exactly the table-side rule immediately above it
+    (`materialize_deferred_locked` for a still-deferred table when
+    `!cold`): a warm create's *other*, non-shared-skip sources replay
+    through this same join synchronously right after registration
+    (`create_view`'s warm-replay loop, same `view_mutex_` hold), and would
+    probe a still-empty arrangement mid-replay if the source weren't real
+    yet. A **cold** (checkpoint-loop) registration, by contrast, defers:
+    the arrangement is created empty and flagged `needs_backfill`, wired
+    into the join node, and left alone — no read of the source view
+    happens at registration time, and nothing probes it either, since the
+    checkpoint fast path runs no warm-replay at all
+    (`skip_init_replay` empties `resolved_sources`). The one guaranteed
+    fill point for a deferred one is `realize_pending_view_locked` itself:
+    once a pending view decodes (from any of the call sites above), it
+    now also backfills every `needs_backfill` arrangement registered over
+    it (`backfill_deferred_arrangements_locked`, generalized from its
+    previous table-only shape to also read a view's `get_result()`).
+    Every join-node probe of such an arrangement is downstream of that
+    point — `propagate_changes`'s pre-pass realizes a delta's entire
+    transitive dependent set (which necessarily includes the arrangement's
+    source view, by dependency-graph construction) before its per-level
+    `step_view` loop runs; a directly-queried view's own checkpoint-decoded
+    result never reads the arrangement at all. (Originally shipped
+    realizing the source view unconditionally here, cold or warm — on a
+    fully chained DAG, where every view feeds another, the cold case
+    transitively decoded the entire DAG during the checkpoint-load loop
+    itself, defeating laziness. Fixed same-day, still Task 1, by gating
+    the eager realize on `!cold` instead of dropping it outright — the
+    warm case still needs it for the reason above.)
+  - `save_checkpoint` re-saves a still-pending view's stash **verbatim**:
+    no decode, no re-encode, byte-identical to what `checkpoint_valid`
+    read. Valid because "pending" is definitionally "zero deltas applied
+    since the stash" (guaranteed by gating every `apply_changes_batch` on
+    a prior realize) — a `DBSP_DEBUG_SYNC`-gated check logs loudly if a
+    pending view's live result is ever non-empty at save time instead of
+    silently trusting the invariant.
+  - `drop_view`/`drop_view_cascade` discard (not realize) a dropped
+    view's pending stash — cheaper than decoding state that's about to be
+    thrown away, and `dbsp_replace_view` gets this for free (it drops via
+    the cascade, then recreates via `create_view`, which is already
+    realize-aware for any view-sourced dependents it touches).
+  - `scan_view_delta` (`dbsp_changes`) and `get_view` (test/debug raw
+    accessor, no production caller) deliberately do **not** realize —
+    audited and found safe: a pending view's last delta is legitimately
+    empty (realize only ever calls `set_result()`, never touches the
+    delta field), and `get_view()` has no call site that exercises the
+    checkpoint fast path today (documented as a known gap for future
+    test authors).
+- A corrupt/mismatched stash (should not happen — the same bytes just
+  round-tripped through `checkpoint_valid`'s read) cannot be handled with
+  the eager path's per-view `drop_view`+`create_view` replay: every
+  `realize_pending_view_locked` call site already holds `view_mutex_`
+  exclusively, and both of those re-acquire it. It escalates instead to
+  the existing D3c `rebuild_pending_` global rebuild-all-views escape
+  hatch (checked at every `QueryBegin`) — same "rare correctness escape
+  hatch" the codebase already accepts for a deferred-baseline watermark
+  mismatch, reused rather than duplicated.
+- `dbsp_load()`'s report string gains a distinct `"N pending lazy
+  restore"` clause alongside the existing checkpoint/deferred-sources
+  counts.
+- New test-observable counter `g_lazy_view_decodes` (g_* convention, see
+  `g_recompute_invocations`) counts actual stash decodes process-wide, for
+  asserting "only this view's chain decoded" without parsing
+  `DBSP_TIMING` stderr output; `realize_pending_view_locked` also emits
+  the same `"blob_decode"` `DBSP_TIMING` phase the eager path already did.
+- **No checkpoint format change**: the stashed bytes are the exact bytes
+  `checkpoint_valid` read and, for a still-pending view, the exact bytes
+  `save_checkpoint` writes back — v5 layout, unchanged.
+- **Tests**: `test/integration/test_lazy_restore.cpp` — first-touch
+  decodes exactly one view's chain (`g_lazy_view_decodes` delta) leaving
+  siblings pending; a delta on a pending view's source realizes it before
+  applying, differential vs a continuously-live twin; save-after-partial-
+  realization round-trips (one view re-encoded, the other re-saved
+  verbatim, both correct after a second reload); `dbsp_lazy_restore(false)`
+  reproduces the eager behavior exactly (0 pending, the lazy decode
+  counter never moves). A fifth case added with the register_arrangements
+  fix above: a chained view-on-view DAG (`base -> v1 -> v2 -> v3`, `v2` a
+  `LEFT JOIN` with `v1` as its shared/probe-target side, `v3` the same
+  shape one level down over `v2`) asserts `pending_restore_count() == 3`
+  immediately after reopen, before any query — the assertion the original
+  (defective) unconditional-realize behavior would have failed below 3 —
+  then a delta on `v1`'s own source (`items`) realizes the whole chain in
+  one pre-pass (asserts the decode count moves by exactly 3), then two
+  further deltas each probe one link's backfilled arrangement from the
+  join's other (local) side against the live twins. A sixth case is the
+  reviewer's Critical repro made permanent: the fifth case's first delta
+  always lands on `items` (`v1`'s own source, already in that delta's
+  topological dependent set), so it never exercises the sibling-branch
+  gap above — this case's first delta after reopen instead lands directly
+  on `side1` (`v2`'s *local*, non-shared join side) while `v1` is still
+  fully pending; asserts `v2`'s new row carries `v1`'s real value, not a
+  silent NULL pad, matching the reviewer's exact reproduced shape.
+
+## Feature: window-view checkpoint state (restore-tail, Task 2) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `NativeWindowView` embedded
+  behind `EmbeddedViewNode` (the WINDOW plan shape). `EmbeddedViewNode`
+  previously had no `state_kind()` override at all, so every embedded view
+  — window, sort/limit, distinct-on — fell back to a full rebuild-by-replay
+  on load regardless of shape. `EmbeddedViewNode::state_kind()` (and
+  `serialize_state`/`restore_state`) now delegate to three new
+  `NativeMaterializedView` virtuals (`circuit_state_kind()`/
+  `serialize_circuit_node_state()`/`restore_circuit_node_state()` —
+  intentionally distinct names/signatures from the existing
+  `checkpointable()`/`serialize_circuit_state()`/`restore_circuit_state()`,
+  which compose *multiple* inner `dbsp::Node`s for a circuit-backed view
+  like `PlannedCircuitView`; an embedded view is a single opaque leaf to
+  that composition, not a nested circuit). Default `UNSUPPORTED`; only
+  `NativeWindowView` overrides this pass — `NativeSortView`/
+  `NativeLimitView`/`NativeDistinctOnView` still decline via the base
+  default, so a sort/limit/distinct-on embedded view still forces its
+  whole outer view to rebuild-by-replay, unchanged from before this pass.
+- `NativeWindowView` has no spill/overflow storage (checked: no `spill_`
+  member, no `SpilledBucketIndex`/spill-store usage anywhere in the file)
+  — unlike joins/aggregates it never needs a runtime decline, so
+  `circuit_state_kind()` unconditionally reports `SERIALIZABLE`.
+- `serialize_circuit_node_state`/`restore_circuit_node_state` carry
+  exactly what `apply_changes`' incremental fast path (the
+  size-unchanged overwrite-in-place branch) and its structural
+  full-render path each read to resume: `partitions_` (each partition's
+  ORDER-BY-sorted source rows — both paths key membership, order, and
+  overwrite-vs-structural classification off this) and
+  `partition_outputs_` (the rendered-output cache, index-aligned with
+  each partition's sorted rows — the fast path's
+  size-unchanged gate and its retract-before-overwrite both read this
+  directly; the full path's opening retraction loop reads it too).
+  `result_` (`get_result()`) is *not* independently serialized: nothing
+  reads it back inside this class (`apply_changes` only ever writes to
+  it, always in lockstep with `partition_outputs_`), and nothing external
+  calls `get_result()`/`set_result()` on an embedded view directly (unlike
+  a top-level view's own sink, whose integrated total *is* restored at
+  the outer `NativeMaterializedView::get_result()`/`set_result()` level —
+  see `dbsp::SinkNode::state_kind()`'s doc comment for that precedent).
+  Restore reconstructs it for free from the just-restored
+  `partition_outputs_` instead (provably always the multiset union of
+  every partition's current cache, by induction over `apply_changes`)
+  rather than leaving it silently empty or paying bytes for fully
+  redundant data.
+- **No checkpoint format version bump**: unlike Task 1's addition, this
+  does not change the byte layout of any blob a checkpoint could
+  *already* contain — `EmbeddedViewNode` never wrote a node blob before
+  (it was `UNSUPPORTED`), so an existing v5 checkpoint simply has no entry
+  keyed by a window-embedded node's id. `restore_circuit_state`'s
+  per-node loop already treats a missing key as a decline for that node
+  (`blobs.find(n.id()) == blobs.end()` → that view's checkpoint fast path
+  declines), gracefully falling back to rebuild-by-replay for *that view
+  only* — no need to invalidate the whole checkpoint via a version bump.
+  `kDbspCkptFormatVersion` stays 5.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (a window embedded view checkpointable; a sort embedded view
+  and a limit embedded view, same `EmbeddedViewNode` wrapper, still not),
+  and a twin round-trip case (save, drop, reload, then a post-restore
+  PURE VALUE UPDATE mid-partition — the incremental fast path, which also
+  drives one cell's bounded frame fully NULL, hand-verified directly
+  against the restored twin as the recent all-NULL SUM fix (66b3806) must
+  survive the round-trip — followed by a post-restore size-changing
+  INSERT, the structural full-render path, both asserted against a
+  continuously-live twin).
+- **Untested-by-build**: this task ran under a no-build constraint (plan:
+  `docs/superpowers/plans/2026-07-31-restore-tail.md`) — verification is
+  deferred to that plan's Task 3 batched build/ctest cycle.
+
+## Feature: recursive-view checkpoint state (restore-tail, Task 1) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `WITH RECURSIVE` fixed-point
+  state: `PlanRecursiveNode::state_kind()` reports `SERIALIZABLE` for a
+  UNION ALL recursive view whose nested step circuit is itself wholly
+  checkpointable (`PlannedCircuitView::checkpointable()` — the same gate
+  every other view is already held to), so it restores from a checkpoint
+  instead of a full rebuild-by-replay on load. UNION (set-semantics)
+  recursion's DRed support bookkeeping is not captured this pass and stays
+  `UNSUPPORTED`, as does a UNION ALL step containing any other unsupported
+  node (a spilled join, etc.) — `state_kind()` is independent of
+  `linear_step_`: the fallback `recompute()` path (a `max_iterations_` trip,
+  an exception during signed admission, or any deletion on a nonlinear
+  union_all step) rebuilds entirely from the restored totals and
+  `step_view_->reset()`, so a restored node resumes correctly whether or
+  not the step is linear.
+- `serialize_state`/`restore_state` gained `accumulated_` (the integrated
+  fixed-point result `recompute()` diffs against), `anchor_total_` and
+  `base_totals_` (the running per-source totals `recompute()` reseeds its
+  whole rebuild from), and the nested `step_view_` circuit's own per-node
+  state (equi-key indexes / group state) via its existing
+  `serialize_circuit_state`/`restore_circuit_state`, embedded as a
+  length-prefixed sub-blob keyed by inner node id.
+- **Checkpoint format version bump (4 → 5)**: the recursive-node blob is
+  new (the node was `UNSUPPORTED` before, so `save_checkpoint` never wrote
+  one), so `kDbspCkptFormatVersion` advanced. `checkpoint_valid` treats a
+  v4 (or earlier) checkpoint as absent rather than misparse it against the
+  new `restore_state`, same one-time rebuild-by-replay cost as prior bumps.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (linear UNION ALL checkpointable; UNION recursion and a step
+  forced into spill-mode storage still not), a twin round-trip case (save,
+  drop, reload, then an insert-only extension and mid-chain UPDATE/DELETE
+  retractions resuming the signed path from restored state, asserted
+  against a continuously-live twin), and a post-restore
+  `DBSP_REC_MAX_ITER`-capped fallback case proving `recompute()` rebuilds
+  correctly from the just-restored totals when a deep retraction trips the
+  iteration cap after restore.
+- **Untested-by-build**: this task ran under a no-build constraint (plan:
+  `docs/superpowers/plans/2026-07-31-restore-tail.md`) — verification is
+  deferred to that plan's Task 3 batched build/ctest cycle.
+
+## Fix: window SUM/AVG over an all-NULL frame returns NULL - Jul 2026
+
+- `NativeWindowView`'s SUM and AVG emitted `0.0` when every value in the
+  frame was NULL; stock DuckDB (and SQL semantics) return NULL — an
+  all-NULL frame is not a frame that summed to zero. Both render paths
+  (fast-path renderer and full re-render) fixed; COUNT correctly stays 0
+  and MIN/MAX already returned NULL. Surfaced by the NumPad wfp
+  measurement the same day constant bounded frames became acceptable —
+  the bug predates that change but was unreachable through SQL until it.
+- Differential tests vs stock DuckDB across SUM/AVG/COUNT/MIN/MAX,
+  bounded and unbounded frames, including edits that make a frame
+  all-NULL and back.
+
+## Perf: checkpoint restore hash pre-seed (cold/restore attack, Task 3) - Jul 2026
+
+- **Corrected premise**: the plan for this task assumed checkpoint blobs
+  (`_dbsp_ckpt` sink/node rows) still used a slow, separate row codec and
+  needed to be switched over to the spill path's typed fast-path codec
+  (`serialize_row`/`deserialize_row`, "spill codec 12x", `ba26922`). Audit
+  found this already true and had been since before that codec existed:
+  `BlobWriter::row`/`BlobReader::row` (`dbsp_checkpoint.hpp`) have called
+  those exact functions since D3b's first commit (`8c77abd`, predating the
+  spill codec's typed-fast-path rewrite by 11 days), so checkpoint decode
+  inherited the speedup automatically, for free, with no code change ever
+  needed there. There is (and was) exactly one row codec, shared, no
+  per-site duplication.
+- **Real bottleneck, found by profiling instead of assuming**: a timing
+  probe reproducing the design doc's "851ms/58k rows" figure (a 58k-group
+  checkpointable `SUM` aggregate over `INTEGER`/`BIGINT`/`VARCHAR`/
+  `BOOLEAN` columns — the value shapes NumPad's wfp workload actually
+  uses) measured `blob_decode` at 1309.5ms (~22.6us/row) on this build,
+  confirming the cost is real but NOT in the byte-level codec (which,
+  at ~260ns/row for a 5-column fast-path row per the 12x/3.8x numbers
+  already published, would only account for ~15ms of that). The actual
+  cost: every row decoded from a checkpoint blob becomes a hash-map key
+  (aggregate `states_`, join `Index`/`RowWeights`) or a `DuckDBZSet` entry
+  on its first use, and `ColumnVec::hash()`'s lazy path calls
+  `duckdb::Value::Hash()` per column — which builds a throwaway 1-element
+  `Vector` and runs the full `VectorOperations::Hash` dispatch machinery
+  for a single value. `dbsp_engine_hook.hpp` already documents this exact
+  cost elsewhere as "~2/3 of ingestion time" for the same reason.
+- **Fix**: `BlobReader::hashed_row()` (`dbsp_checkpoint.hpp`) decodes a row
+  via the existing (unchanged) codec and pre-seeds its hash cache with
+  `hash_row_fast`, which calls `duckdb::Hash<T>` directly for the fast-path
+  types (`INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`) — the exact
+  primitive `VectorOperations::Hash` itself dispatches to per element for a
+  flat vector of that physical type (confirmed against
+  `vector_operations/vector_hash.cpp`; `duckdb::Hash(string_t)` is
+  documented+asserted in duckdb's own source to equal
+  `duckdb::Hash(ptr, size)` for every string, inlined or not), without
+  building the temporary `Vector`. NULLs use `ColumnVec::kNullHash`
+  directly (matching `ColumnVec::hash()`'s own null convention, not
+  duckdb's); fallback-typed values still pay `Value::Hash()`, same
+  tradeoff the byte codec already makes for its own fallback tag. Wired at
+  every checkpoint row-decode call site that becomes a hash-map/Z-set key:
+  the CDC sink loop (`dbsp_cdc.hpp`), `PlanAggregateNode::restore_state`'s
+  group keys, and `PlanJoinNode::restore_state`'s index keys and
+  row-weight keys (`dbsp_plan_translator.hpp`) — one shared helper, no
+  per-site duplication.
+- **No format version bump**: the checkpoint blob's on-disk bytes are
+  unchanged (same codec, same layout) — this is a read-side in-memory
+  cache optimization only, so `kDbspCkptFormatVersion` stays at 4 and no
+  existing checkpoint is invalidated.
+- **Measured**: the same 58k-row probe drops from 1309.5ms to ~25.4ms
+  (mean of 6 runs: 23.6/24.0/25.4/24.2/26.9/28.4ms) — **~51.5x**, well
+  past the ≥3x target.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a unit-level
+  case proving `hashed_row()`'s pre-seeded hash matches what the lazy
+  per-Value path computes for the same content, across every codec value
+  shape (`INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN`, typed `NULL`s of
+  each, and `DECIMAL` as the fallback type, both non-`NULL` and `NULL`);
+  and an integration case checkpointing a view whose `GROUP BY` spans all
+  of those types, restoring it, then inserting a row whose key exactly
+  matches an already-restored group — the scenario that would silently
+  duplicate a group instead of bumping its count if the pre-seeded hash
+  ever diverged from what a freshly-built equal row would hash to. Both
+  cases were verified to fail under a deliberately wrong hash before being
+  restored to the real implementation (sabotage-and-revert check, not just
+  written-and-passed).
+
+## Feature: MIN/MAX aggregate checkpoint state (cold/restore attack, Task 2) - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers plain (non-`DISTINCT`) `MIN`/
+  `MAX` aggregates, not just the count/sum/avg family:
+  `PlanAggregateNode::state_kind()` reports `SERIALIZABLE` for them, so
+  MIN/MAX-bearing views restore from a checkpoint instead of rebuild-by-
+  replay on load. `DISTINCT` (any function) and holistic/ordered aggregates
+  (`FIRST`, `STRING_AGG`, `ARRAY_AGG`, `MEDIAN`, `QUANTILE_CONT`/`DISC`,
+  `MODE`, `MAD`) stay `UNSUPPORTED`. A group whose values have spilled to
+  disk (N4, >65536 values under `dbsp_spill(true)`) also declines the whole
+  node — the spilled log isn't captured this pass, mirroring the join
+  node's exclusion of spilled equi-key indexes.
+- `serialize_state`/`restore_state` gained the per-group `values` multiset
+  (duplicates preserved, written as a single row per group/agg) — exactly
+  the retraction state `apply()`/`agg_value()` already read for MIN/MAX, so
+  a post-restore delete of the current extreme retreats to the next
+  remaining value the same way live maintenance would, including a group
+  whose extreme retreats more than once in a row.
+- **Checkpoint format version bump (3 → 4)**: the aggregate blob layout
+  changed (new field per group/agg), so `kDbspCkptFormatVersion` advanced.
+  `checkpoint_valid` treats a v3 (or earlier) checkpoint as absent rather
+  than misparse it against the new `restore_state` — one-time
+  rebuild-by-replay on the first post-upgrade `dbsp_load()`, then
+  re-checkpoints in the new format on the next save.
+- **Tests**: `test/integration/test_join_checkpoint.cpp` — a `state_kind`
+  gate case (`MIN`/`MAX` checkpointable; `DISTINCT`/`MEDIAN`/spilled still
+  not) plus twin round-trip cases for `MAX` and `MIN`: a checkpointed view
+  is dropped and reloaded, then post-restore deltas force a group's extreme
+  to advance (new value beats it) and to retreat twice in a row (the
+  current extreme deleted twice), asserted against a continuously-live
+  twin via exact `(row, weight)` snapshot equality.
+
+## Fix: truthful `dbsp_load()` report on an already-populated registry - Jul 2026
+
+- **Bug**: calling `dbsp_load()` when the registry was already populated
+  (e.g. right after the auto-load that fires on the first DBSP entry point
+  of a session) reported `"(N views, 0 from checkpoint, ...)"` — read as
+  "the checkpoint was never used", when in fact an earlier load (auto-load
+  or a prior explicit `dbsp_load()`) had already consumed it. Cost real
+  debugging time chasing a checkpoint-fast-path regression that didn't
+  exist.
+- **Root cause**: `load_from_duck_table` (`include/dbsp_cdc.hpp`) already
+  skips per-row work for any view name already live in this session's
+  registry (`views_.count(name)` → `continue`), but unconditionally
+  overwrote `last_loaded_count_`/`last_ckpt_restored_count_` with this
+  call's (zero) counts at the end — discarding the true history from
+  whichever earlier call actually did the restoring. `dbsp_load()`'s
+  message (`src/dbsp_extension.cpp`) then read those zeroed counters at
+  face value.
+- **Fix**: `load_from_duck_table` now also tracks `last_skipped_count_`
+  (rows skipped because already live). When a call loads 0 new views but
+  skips ≥1 already-live ones, `dbsp_load()`'s message says so plainly
+  (`"0 loaded this call (N already loaded)"`) instead of the ambiguous
+  `"0 from checkpoint"` framing. A call that legitimately restores nothing
+  (nothing was ever persisted) is unaffected — same message as before.
+  Reload-over-an-already-populated-registry is intentionally still
+  supported (a second `dbsp_load()` can still pick up newly-saved views not
+  yet live in this session) — only the report was misleading, not the
+  behavior.
+- **Test**: `test/python/test_autopersist.py` — after auto-load populates
+  the registry on reopen, an explicit `dbsp_load()` must not contain
+  `"0 from checkpoint"` and must say `"already loaded"`. Confirmed failing
+  (old message: `"(1 views, 0 from checkpoint, 1 sources deferred)"`) before
+  the fix, passing after. Existing checkpoint-restore tests
+  (`test_checkpoint_restore.py`, `test_join_checkpoint.cpp`) that assert
+  `"0 from checkpoint"`/`"1 from checkpoint"` on fresh (never-yet-loaded)
+  registries are unaffected — they hit `skipped == 0`, the unchanged branch.
+
+## Feature: accept constant window frames and LAG/LEAD offsets in the planner frontend - Jul 2026
+
+- **Bug**: `CREATE MATERIALIZED VIEW ... AVG(v) OVER (... ROWS BETWEEN 11
+  PRECEDING AND CURRENT ROW)` and `LAG(v, 12) OVER (...)` were rejected as
+  `DBSP-E110: non-constant frame start` / `non-constant offset`, even
+  though `LAG(v)` (implicit offset 1) worked fine.
+- **Root cause**: `constant_int` (`include/dbsp_plan_translator.hpp`)
+  required a bare `BOUND_CONSTANT` expression class. The binder actually
+  wraps frame-bound and LAG/LEAD-offset literals in a `BOUND_CAST` shell
+  (confirmed via probe: `11 PRECEDING` arrives as `CAST(11 AS BIGINT)`,
+  `LAG(v, 12)`'s offset as `CAST(12 AS BIGINT)`) — `constant_int` saw
+  `BOUND_CAST`, not `BOUND_CONSTANT`, and rejected both. The downstream
+  window machinery (`NativeWindowView`'s `start_offset`/`end_offset`,
+  `render_row`, `affected_indices`) already fully supported bounded ROWS
+  frames; only the frontend gate misfired.
+- **Fix**: `constant_int` now unwraps a chain of `BOUND_CAST` nodes before
+  checking for `BOUND_CONSTANT` underneath. Used for window frame bounds
+  (`start_expr`/`end_expr`) and LAG/LEAD offsets — the shapes verified
+  against the render/incremental machinery for this fix. NTILE's bucket
+  count and NTH_VALUE's `N` deliberately keep the old strict bare-constant
+  check (`bare_constant_int`, unchanged behavior, still gated): the same
+  `BOUND_CAST` shell reaches them, but a differential check found NTILE's
+  bucket-boundary math already diverges from stock DuckDB for uneven
+  partition sizes (pre-existing, out of scope here) — widening the gate
+  there would have silently shipped a broken feature instead of a loud
+  "unsupported" error.
+- **Test**: `test/integration/test_advanced_window.cpp` — differential
+  checks (materialized view vs. stock DuckDB, exact values) for the
+  bounded-AVG-frame and `LAG(v,12)` cases, each run before and after (a) a
+  mid-window value UPDATE and (b) a partition-growing INSERT that pushes
+  earlier values outside later rows' bounded frames (the fast re-emit path
+  and the full structural-rebuild path, respectively) — plus a regression
+  guard that `LAG(v)`'s default offset still works, and a scope-boundary
+  test asserting NTILE/NTH_VALUE remain gated. Confirmed both new cases
+  failing with `DBSP-E110` on the pre-fix code, passing after.
+
+## Fix: silent-correctness bug — WHERE+aggregate join subquery side returned empty - Jul 2026
+
+- **Bug**: a materialized view whose `JOIN` had a subquery side containing
+  both a `WHERE` filter and a `GROUP BY` aggregate (e.g. `... JOIN (SELECT
+  k, MAX(v) m FROM t WHERE v IS NOT NULL GROUP BY k) x ON ...`) silently
+  returned an **empty** result from initial materialization — no error, no
+  fallback — while stock DuckDB returned the correct rows.
+- **Root cause**: `plan_ir::fuse_map_cols` (`include/dbsp_plan_translator.hpp`)
+  elides a `MAP_COLS` (column-selection) node beneath its parent and remaps
+  the parent's own bound-ref expressions through the eliminated node's
+  column mapping. This is sound for `MAP_EXPR`/`FILTER_MAP`, whose `exprs`
+  fully and independently define their output columns. It was *also*
+  applied to a bare `FILTER_EXPR`, which is a pure passthrough — its output
+  row layout **is** its input's layout, not something its own predicate
+  list redefines. Eliding the `MAP_COLS` beneath a bare `FILTER_EXPR`
+  correctly remapped the filter's own predicate, but silently changed the
+  column order/width the filter now hands to its *parent*. When that
+  parent was an `AGGREGATE` sitting directly above a `WHERE ... GROUP BY`
+  filter (only reachable when the filter's own parent isn't a `MAP_EXPR` —
+  otherwise `fuse_filter_map` already fuses it into a self-defining
+  `FILTER_MAP` first), the aggregate's group-by key and aggregate-argument
+  indices were left pointing at the pre-elision column positions —
+  silently grouping/aggregating the wrong columns. In the repro this
+  produced a `MAX` keyed and valued on swapped columns, so the outer join's
+  equi-keys never matched and the view came back empty.
+- **Fix**: `fuse_map_cols` no longer fires on bare `FILTER_EXPR` — only on
+  `MAP_EXPR`/`FILTER_MAP`, whose output is self-defined and therefore safe
+  against a reordering child being elided. A `WHERE ... GROUP BY` filter
+  keeps its `MAP_COLS` node (one extra node, matching the
+  `g_plan_ir_optimize=false` behavior, which was already correct); the
+  fusion still fires for the common `SELECT ... WHERE ...` case where the
+  filter is directly under a projection.
+- **Test**: `planner C4: WHERE+aggregate join subquery side stays exact`
+  (`test/integration/test_planner_frontend.cpp`) — initial materialization
+  against hand-computed truth, plus an incremental follow-up (insert a new
+  per-group max, then update it away) verified against DuckDB's own answer.
+  Confirmed failing (0 rows vs. 2) on the pre-fix code, passing after.
+
+## Feature: signed incremental deltas for linear UNION ALL recursion - Jul 2026
+
+- **Motivation**: profiling the NumPad wfp roll-forward edit path
+  (`DBSP_TIMING`) attributed ~590ms of the ~597ms per-commit sync to ONE
+  recursive view (`v_closingheadcount`, 58,500 rows × 36 iterations): every
+  retraction-bearing delta (every `UPDATE`) routed `PlanRecursiveNode::
+  step()` to a full `recompute()`. The UNION/DRed alternative measures
+  *worse* here (884ms) — rederive image-passes the full relation per
+  fixpoint depth.
+- **Insight**: a **linear** recursive step (the recursive relation
+  referenced exactly once in the step) is linear in that relation —
+  `step(R + δ) = step(R) + step(δ)` — so its fixpoint's output delta for an
+  input delta δ is `Σᵢ stepⁱ(δ)`: the existing insert-only incremental path,
+  run with **signed** weights. No deletion special-case is needed;
+  retractions propagate through the same iteration as insertions.
+- **Change**: `PlanRecursiveNode` gains `linear_step_`, detected at build
+  time (the `REC_CTE` build site walks the step's `PlanOpSpec` subtree
+  counting sentinel-table `SOURCE` refs — exactly one → linear-eligible).
+  `step()` now skips the deletion special-case entirely when
+  `union_all_ && linear_step_`: the incremental seed/`admit`/`iterate` path
+  is generalized to signed weights (no more `w > 0` filter), `admit`'s
+  UNION ALL branch does plain multiset arithmetic on `accumulated_`
+  (`ZSet::insert` already erases a row whose running weight nets to zero —
+  verified, not assumed), and a `max_iterations_` trip **or an exception**
+  during admission/iteration on the signed path discards the attempt
+  (restoring `accumulated_`/`output_` from a pre-admission snapshot) and
+  falls back to `recompute()` — logged under `DBSP_DEBUG_SYNC` — rather
+  than emit a partial delta.
+- **Linearity veto (defense-in-depth)**: the planner already accepts
+  `DISTINCT`/`GROUP BY`/`ORDER BY … LIMIT`/`WINDOW` inside a recursive
+  step, and those shapes are pre-existing-wrong on every path (out of
+  scope here — not newly broken by this change). But `AGGREGATE`,
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, `SORT_LIMIT`, and non-`UNION ALL`
+  `SET_OP` anywhere in the step subtree now veto `linear_step_` even when
+  the sentinel is referenced exactly once: these operators are not
+  weight-linear (`step(R + δ) ≠ step(R) + step(δ)` — they collapse or
+  reorder rows), so without the veto the new signed path would have
+  wrongly claimed linearity for them. `admit`'s set-semantics (non-`UNION
+  ALL`) branch is also now explicitly guarded on `w > 0` (previously
+  implicit, relying on `has_deletion` never routing negatives there — now
+  `iterate()` passes signed weights through unconditionally for the
+  `union_all_` linear path, so the guard is explicit rather than
+  incidental).
+- **Unchanged by design**: nonlinear UNION ALL (recursive relation
+  referenced ≥2 times — weighted deletion through a self-join doesn't
+  distribute) and UNION (set-semantics, still DRed) keep their existing
+  full/DRed paths bit-for-bit; insert-only behavior on every shape is
+  unchanged. `recompute()` is retained as the differential-test oracle for
+  all three paths.
+- **Test hooks**: `dbsp_native::g_recompute_invocations`, an inline atomic
+  counter incremented in `recompute()` (same directly-test-accessible
+  convention as `g_plan_ir_optimize`/`g_intraop_shards`, no new SQL
+  surface), lets integration tests assert an `UPDATE`/`DELETE` on a linear
+  UNION ALL recursive view does not fall back to full recompute.
+  `DBSP_REC_MAX_ITER` (env var, read once at `PlanRecursiveNode`
+  construction) lets tests force a small iteration cap to exercise the
+  `max_iterations_` fallback deterministically.
+- Regression coverage: `test/integration/test_recursive_deletion.cpp`
+  gained a wfp-shaped (per-partition running-total chain) value test, a
+  routing-assertion test (`g_recompute_invocations` before/after delta), a
+  100-round randomized UPDATE/DELETE/re-seed differential against the same
+  oracle-comparison harness the existing DRed tests use, and a
+  `DBSP_REC_MAX_ITER`-forced fallback test asserting both that recompute()
+  fires AND that its recovered result is correct.
+- Design: `docs/superpowers/specs/2026-07-31-linear-recursion-deltas-design.md`.
+
+## Fix: checkpoint declines a stale view-definition restore - Jul 2026
+
+- **Gap**: checkpoint restore only guarded against source-table drift (the
+  row-count/hash watermark) and blob-layout drift (the format version),
+  not against the view's own *definition* changing. `dbsp_replace_view` /
+  `CREATE OR REPLACE MATERIALIZED VIEW` (or a same-name drop+recreate)
+  followed by an unclean close (crash, autopersist off, a failed
+  auto-save) could leave a `_dbsp_views` row with the *new* SQL sitting
+  next to `_dbsp_ckpt` node/sink blobs still holding the *old* view's
+  operator state and sink result. The next load would cold-create the
+  view from the new SQL and silently inject the old blobs on top —
+  serving stale data forever, since incoming deltas never retract a wrong
+  sink row they never produced.
+- **Fix**: `save_checkpoint` now writes an additional `kind='sql'` row per
+  checkpointed view, holding that view's exact SQL at save time. On load,
+  `checkpoint_valid` returns this per-view fingerprint; `load_from_duck_
+  table` compares it against the SQL it is about to use to cold-create the
+  view and only takes the checkpoint fast path when they match. A
+  mismatch declines the fast path for *that view alone* — it rebuilds by
+  replay from current table data — while every other view's checkpoint
+  restore is unaffected. Crash recovery (`src/dbsp_recovery.cpp`
+  `load_views`) shares `load_from_duck_table` and gets the same guard for
+  free.
+- **Belt-and-braces**: `replace_view` now also best-effort deletes the
+  `_dbsp_ckpt` rows for the entire subtree it just dropped (the replaced
+  view plus its transitive dependents), closing the staleness window
+  earlier rather than waiting on the next full `save_checkpoint()` (which
+  already rewrites `_dbsp_ckpt` from scratch) — the fingerprint check
+  above is the correctness backstop either way.
+- **Checkpoint format version bump (v2 → v3)**: the blob set changed
+  shape (new `sql` rows), so a v2 checkpoint — which has none — is treated
+  as wholesale absent and rebuilt by replay once, same one-time cost as
+  the v1 → v2 bump.
+- Dead code removed: `CDCManager::auto_sync_all` had zero callers (a
+  leftover from an earlier checkpoint-interval design); the actual
+  checkpoint-interval deferral runs through the `TransactionCommit` hook's
+  `CheckpointGuard` and `dbsp_sync`, corrected in the note below.
+- Regression coverage: `test/integration/test_join_checkpoint.cpp` gained
+  a stale-fingerprint test (view SQL changed underneath an unrefreshed
+  checkpoint must rebuild from the new SQL, not serve the old blob) and a
+  RIGHT-join save/restore round-trip test mirroring the existing LEFT one.
+
+## Feature: LEFT/RIGHT outer-join checkpoint state - Jul 2026
+
+- Circuit-state checkpointing (D3b) now covers `LEFT` and `RIGHT` outer
+  joins, not just `INNER`: `PlanJoinNode::state_kind()` reports
+  `SERIALIZABLE` for non-spilled, non-mark LEFT/RIGHT joins, so pad-carrying
+  join views restore from a checkpoint instead of rebuild-by-replay on
+  load. `FULL` (`OUTER`) and `MARK` joins, and any spilled join side, stay
+  `UNSUPPORTED` this pass.
+- `serialize_state`/`restore_state` gained `left_pad_`/`right_pad_` (the
+  currently-emitted NULL-pad weight per row) alongside the existing
+  equi-key indexes and per-row weight totals — exactly what
+  `reconcile_pads` reads to compute the correct pad diff on the first
+  post-restore delta. `right_total_`/`right_null_` are MARK-only
+  bookkeeping and stay unserialized (MARK joins are still UNSUPPORTED).
+- **Checkpoint format version bump**: the blob layout changed, so a new
+  `_dbsp_ckpt_version` table now travels with every checkpoint.
+  `checkpoint_valid` treats a missing or mismatched version as no
+  checkpoint at all (rebuild-by-replay) rather than risk misparsing an
+  older blob. Practical effect: **the first `dbsp_load()` against a
+  database checkpointed by a pre-upgrade build pays one rebuild-by-replay,
+  then re-checkpoints in the new format on the next save** — no data loss,
+  no crash, just a one-time cost.
+
+## Feature: dbsp_replace_view + CREATE OR REPLACE MATERIALIZED VIEW - subtree-only repopulation - Jul 2026
+
+- New `dbsp_replace_view(name, sql)` table function and
+  `CREATE OR REPLACE MATERIALIZED VIEW name AS <query>` DDL (routes to
+  plain create when `name` doesn't exist yet, to replace when it does):
+  change one view's definition and rebuild only it and its transitive
+  dependents — upstream sources and every other view are left untouched,
+  and each dependent's own DDL is preserved verbatim (only the named view
+  gets the new SQL).
+- Algorithm: verify the view exists (else `DBSP-E206`); snapshot
+  `(name, sql)` for every transitive dependent via the dependency graph's
+  `topological_order()` (already filters to the dependent set and orders
+  it so a dependent's in-set dependencies precede it); drop the whole
+  subtree through the existing `drop_view_cascade` path; recreate the
+  named view with the new SQL, then recreate each dependent with its
+  saved SQL in that order. Recreation replays each view from its sources'
+  current materialized state, so cost is proportional to the subtree, not
+  the whole model.
+- Failure semantics (v1, no transactional rollback): if a create fails
+  mid-sequence, the remaining dependents are still attempted with their
+  saved old DDL, and the error (`DBSP-E304`) lists every failure plus
+  which views are still queryable afterward — the registry itself is
+  never left in a half-registered/inconsistent state.
+- `drop_view_cascade` is called without a `ClientContext` here (matching
+  every other cascade-drop call site in the file): passing one would call
+  `context->Query()` to delete `_dbsp_views` rows while already running
+  inside a table function on that same context — a reentrant, deadlocking
+  call. Skipping it is harmless: `create_view`'s own `INSERT OR REPLACE`
+  (gated on `dbsp_autopersist`, same as a plain `CREATE`) restores the
+  `_dbsp_views` row for every view recreated below.
+
+## Feature: dbsp_autopersist - views survive a clean reopen - Jul 2026
+
+- New `dbsp_autopersist(enable)` setting, **ON by default**: a database
+  that used DBSP views now reopens with them alive, with no explicit
+  `dbsp_save()`/`dbsp_load()` calls. Auto-save runs on a clean connection
+  close (the existing crash-marker release hook — the last user connection
+  to an instance closing) when autopersist is on and any view exists;
+  auto-load runs at the first DBSP entry point with a `ClientContext` in a
+  fresh session (`dbsp_query`, `dbsp_views`, `dbsp_track`,
+  `CREATE MATERIALIZED VIEW`, `dbsp_sync`, `dbsp_changes`) if the view
+  registry is still empty — the existing checkpoint-fast-path `dbsp_load()`
+  machinery underneath is unchanged. Fires at most once per session and
+  never after a view has already been created here (`CDCManager::
+  maybe_autoload`/`autoload_attempted_`). `dbsp_autopersist_interval(n)`
+  (default 0 = off) additionally piggybacks a circuit-state checkpoint
+  every `n` commits, so a crash between clean shutdowns loses at most `n`
+  commits of operator state — the data itself is never at risk (base
+  tables are DuckDB-durable; a stale checkpoint fails its watermark check
+  and rebuilds).
+- Auto-save could not run inline in the `OnConnectionClosed` hook: it's
+  called from inside `ConnectionManager::RemoveConnection`, which holds
+  `connections_lock`, and `save_to_duck_table`/`save_checkpoint` each build
+  a fresh `duckdb::Connection` to do their work — whose constructor calls
+  `AddConnection`, re-locking the same non-recursive mutex on the same
+  thread. It now runs on the same detached thread that already tears down
+  the manager (destroying views does the same thing for the same reason),
+  ordered before that teardown; the manager's own views keep the
+  `DatabaseInstance` alive for the save without an extra reference, and a
+  same-process reopen already busy-spins until that instance is fully
+  destroyed (`DBInstanceCache`), which serializes the reopen after the
+  save completes. The checkpoint-interval counter is incremented inside
+  `propagate_changes` (lock-free), but the actual `save_checkpoint()` call
+  is deferred to a point after the caller's `struct_mutex_` is released
+  (the `TransactionCommit` hook's `CheckpointGuard` destructor, and
+  `dbsp_sync`) for the identical reason — `propagate_changes` runs under
+  callers' shared lock on `struct_mutex_`, and `save_checkpoint` takes its
+  own shared lock on it. (`CDCManager::auto_sync_all`, an earlier
+  candidate for this deferral point, was dead code — no caller ever
+  reached it — and has been removed; the two call sites above are the only
+  live ones.)
+- `autoload_attempted_` is an atomic (compare-exchanged in
+  `maybe_autoload`), not a plain bool: two connections to the same
+  `DatabaseInstance` can race their first DBSP call. A failed auto-load
+  logs `last_error()` under `DBSP_DEBUG_SYNC` (the existing debug var this
+  file already used for other best-effort CDC diagnostics); a failed or
+  thrown auto-save on close logs under `DBSP_DEBUG_TEARDOWN` (the existing
+  crash-marker/teardown debug var, now also captured into the detached
+  save thread).
+- Regression test: test/python/test_autopersist.py.
+
+## Fix: same-pass multi-source deltas apply as one circuit step - Jul 2026
+
+- A view fed by two sources updated in the SAME propagation pass (join of
+  two sibling MVs over one base table) received its deltas as two separate
+  circuit steps. Each step ran against post-delta shared arrangements, so
+  PlanJoinNode's both-shared bilinear correction (emit −Δl⋈Δr) never
+  fired: the join overcounted Δl⋈Δr on every commit — duplicate,
+  conflicting rows per key accumulated unboundedly (quadratic growth) and
+  stale rows were never retracted. Base-table multi-writes were unaffected
+  (separate propagation passes are sequentially correct); the bug was
+  MV-cascade-only.
+- Fix: `NativeMaterializedView::apply_changes_batch` — the CDC cascade
+  now hands a view ALL of its pending source deltas at once;
+  `PlannedCircuitView` pushes every input and steps the circuit once, so
+  the in-step correction fires. Default implementation preserves
+  sequential per-source behavior (with delta-union) for legacy views.
+  `propagate_changes`'s per-view apply loop and multi-source union arena
+  are replaced by the batched call.
+- Found by NumPad's full-SQL/DBSP spike (view-vs-oracle parity + row-count
+  sentinels); regression-tested in test_cascading_views.cpp ("Join of two
+  sibling MVs stays exact across repeated updates").
+
 ## Perf/coverage: spill codec 12x + bounded percentage limits - Jul 2026
 
 - Spill row codec: duckdb's BinarySerializer cost ~650ns/row with a

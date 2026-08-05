@@ -15,6 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace dbsp_native {
+struct StateBytes;
+class StateAccounting;
+} // namespace dbsp_native
+
 namespace dbsp {
 
 // Forward declarations
@@ -42,6 +47,23 @@ public:
 
     // Check if this node has output ready
     virtual bool has_output() const = 0;
+
+    // Approximate resident state bytes by class (bounded-RAM Phase 0).
+    // Stateless nodes keep the empty default; stateful plan nodes
+    // (join/aggregate/distinct/set-op/recursive/embedded) override.
+    virtual void account_state(dbsp_native::StateBytes& out,
+                               dbsp_native::StateAccounting& acct) const {
+        (void)out;
+        (void)acct;
+    }
+
+    // Drop the node's transient OUTPUT buffer (bounded-RAM Phase 1a).
+    // Called by the owning view after a step completes and the sink has
+    // taken its own copy of the delta — before this existed, every node's
+    // last output (the full initial population, at worst) stayed resident
+    // for the view's lifetime. State (indexes, integrals, accumulators)
+    // must NOT be dropped here.
+    virtual void clear_output() {}
 
     // --- Checkpointing (Phase D3b) ---------------------------------------
     // How this node participates in circuit-state checkpoints. STATELESS
@@ -144,6 +166,12 @@ public:
 
     bool has_output() const override { return has_output_; }
 
+    void clear_output() override {
+        current_output_.clear();
+        external_output_ = nullptr;
+        has_output_ = false;
+    }
+
     const ZSetType& output() const {
         return external_output_ ? *external_output_ : current_output_;
     }
@@ -174,31 +202,47 @@ public:
 
     void step() override {
         // Accumulate the input delta into our integrated state. The delta
-        // is borrowed, not copied: upstream node outputs stay alive until
-        // that node's next step(), which cannot happen before ours.
+        // is COPIED (H6 payload sharing makes it refcount bumps, not Value
+        // copies) so upstream node outputs can be cleared post-step
+        // (bounded-RAM Phase 1a) while dbsp_changes keeps serving it.
         const ZSetType& delta = input_fn_();
         if (!delta.empty()) {
-            delta_ref_ = &delta;
-            integrated_ += delta;
+            delta_own_ = delta;
+            if (integrate_) {
+                integrated_ += delta;
+            }
             has_output_ = true;
         } else {
-            delta_ref_ = nullptr;
+            delta_own_.clear();
             has_output_ = false;
         }
     }
 
+    // Bounded-RAM Phase 1c: the view's __mv_ backing table is the result
+    // now — stop integrating and drop the RAM copy. One-way until the
+    // view is rebuilt (set_materialized turns integration back on).
+    void set_table_backed() {
+        integrate_ = false;
+        integrated_.clear();
+    }
+
     void reset() override {
         integrated_.clear();
-        delta_ref_ = nullptr;
+        delta_own_.clear();
         has_output_ = false;
     }
 
     bool has_output() const override { return has_output_; }
 
-    // Get the latest delta (borrowed from the upstream node)
-    const ZSetType& delta() const {
-        static const ZSetType kEmpty;
-        return delta_ref_ ? *delta_ref_ : kEmpty;
+    // Get the latest delta (owned by the sink until its next step)
+    const ZSetType& delta() const { return delta_own_; }
+
+    // Drop the buffered delta (create-time initial replay: nobody consumes
+    // the initial population through dbsp_changes — generation filtering
+    // skips it — and on big views it pins the full result twice).
+    void drop_delta() {
+        delta_own_.clear();
+        has_output_ = false;
     }
 
     // Get the integrated (materialized) result
@@ -207,14 +251,16 @@ public:
     // Overwrite the integrated state (used by tests/legacy restore paths)
     void set_materialized(const ZSetType& state) {
         integrated_ = state;
-        delta_ref_ = nullptr;
+        integrate_ = true; // a restored result means RAM is authoritative
+        delta_own_.clear();
         has_output_ = false;
     }
 
 private:
     InputFn input_fn_;
     ZSetType integrated_;
-    const ZSetType* delta_ref_ = nullptr;
+    ZSetType delta_own_;
+    bool integrate_ = true;
     bool has_output_ = false;
 };
 
@@ -246,6 +292,11 @@ public:
     }
 
     bool has_output() const override { return has_output_; }
+
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
 
     const OutputZSet& output() const { return output_; }
 
@@ -281,6 +332,11 @@ public:
     }
 
     bool has_output() const override { return has_output_; }
+
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
 
     const ZSetType& output() const { return output_; }
 
@@ -328,6 +384,11 @@ public:
 
     bool has_output() const override { return has_output_; }
 
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
+
     const ZSetResult& output() const { return output_; }
 
 private:
@@ -362,6 +423,11 @@ public:
     }
 
     bool has_output() const override { return has_output_; }
+
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
 
     const ZSetType& output() const { return output_; }
 
@@ -414,6 +480,11 @@ public:
 
     bool has_output() const override { return has_output_; }
 
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
+
     const OutputZSet& output() const { return output_; }
 
 private:
@@ -447,6 +518,11 @@ public:
     }
 
     bool has_output() const override { return has_output_; }
+
+    void clear_output() override {
+        output_.clear();
+        has_output_ = false;
+    }
 
     const ZSetType& output() const { return output_; }
 

@@ -1,5 +1,6 @@
 # Build output
 build/
+build-tip/
 build_test/
 build_asan/
 build_tsan/

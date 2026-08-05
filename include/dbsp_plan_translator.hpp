@@ -59,6 +59,8 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_checkpoint.hpp"
 #include "dbsp_qualified_name.hpp"
+#include "dbsp_flat_packed.hpp"
+#include "dbsp_packed_row.hpp"
 #include "dbsp_window_view.hpp"
 
 #include "duckdb.hpp"
@@ -70,6 +72,7 @@
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_subquery_expression.hpp"
 #include "core_functions/aggregate/quantile_helpers.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -90,6 +93,8 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 
 #include <atomic>
+#include <cstdlib>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <cmath>
@@ -679,16 +684,29 @@ remap_bound_refs(const duckdb::Expression &expr,
   return ok ? std::move(clone) : nullptr;
 }
 
-// FILTER_MAP/FILTER_EXPR/MAP_EXPR over MAP_COLS(x): remap the consumer's
-// bound refs through the column selection and drop the MAP_COLS node.
-// MAP_COLS re-materializes every input row (per-Value copies + a lazily
-// hashed output Z-set insert) — measured as the DOMINANT cost of simple
+// FILTER_MAP/MAP_EXPR over MAP_COLS(x): remap the consumer's bound refs
+// through the column selection and drop the MAP_COLS node. MAP_COLS
+// re-materializes every input row (per-Value copies + a lazily hashed
+// output Z-set insert) — measured as the DOMINANT cost of simple
 // filter/projection views (~72ms of a 90ms 100k-row sync), so eliding it
 // matters more than batching it.
+//
+// Deliberately EXCLUDES bare FILTER_EXPR: unlike MAP_EXPR/FILTER_MAP,
+// whose `exprs` fully define their own output columns, FILTER_EXPR is a
+// pure passthrough — its output row layout IS its input's layout, not
+// something remap_bound_refs fixes up. Eliding MAP_COLS beneath a bare
+// FILTER_EXPR would correctly remap the filter's own predicate but
+// silently change the column order/width it hands to its PARENT (whoever
+// that is — e.g. an AGGREGATE reading group keys / agg args by position
+// right above a `WHERE ... GROUP BY` filter), corrupting any ancestor
+// still indexed against the old MAP_COLS-selected layout. A bare
+// FILTER_EXPR only remains after fuse_filter_map when its own parent is
+// NOT a MAP_EXPR (that pairing already fused into a self-defining
+// FILTER_MAP above), so there is no self-defining consumer to safely
+// absorb the reorder into.
 inline void fuse_map_cols(std::unique_ptr<PlanOpSpec> &spec,
                           PlanKeepAlive &keep_alive) {
   if (spec->kind != PlanOpSpec::Kind::FILTER_MAP &&
-      spec->kind != PlanOpSpec::Kind::FILTER_EXPR &&
       spec->kind != PlanOpSpec::Kind::MAP_EXPR) {
     return;
   }
@@ -919,6 +937,19 @@ public:
   bool has_output() const override { return has_output_; }
 
   const DuckDBZSet &output() const { return output_; }
+
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[key, gs] : states_) {
+      (void)gs;
+      out.other += acct.row_bytes(key) + 96; // GroupState flat estimate
+    }
+    out.other += acct.zset_bytes(output_);
+  }
 
 private:
   struct AggState {
@@ -1365,18 +1396,35 @@ private:
   bool global_emitted_ = false;
 
 public:
-  // Checkpointing (D3b): the count/sum/avg family keeps only scalars per
-  // group — serializable. Anything value-collecting (MIN/MAX multisets,
-  // DISTINCT weights, ordered aggregates, MODE/MEDIAN/quantiles) stays
-  // UNSUPPORTED in v1 and forces rebuild-by-replay.
+  // Checkpointing (D3b; extended Task 2, cold/restore attack): the
+  // count/sum/avg family keeps only scalars per group — serializable.
+  // Plain (non-DISTINCT) MIN/MAX also serialize: the `values` multiset is
+  // exactly the retraction state agg_value()/apply() read (see MIN/MAX in
+  // both), so round-tripping it is enough to resume correctly, including a
+  // deleted extreme retreating to the next-highest/lowest remaining value.
+  // DISTINCT (any fn — dvals weight-tracking untouched here) and holistic/
+  // ordered aggregates (FIRST, STRING_AGG, ARRAY_AGG, MEDIAN, QUANTILE_*,
+  // MODE, MAD) stay UNSUPPORTED. A group whose values have spilled to disk
+  // (N4, values.size() > 65536 under spill mode) also declines the whole
+  // node — the spilled log isn't captured here, mirroring the join node's
+  // exclusion of spilled equi-key indexes (7512fd4).
   StateKind state_kind() const override {
     for (const auto &a : aggs_) {
       const bool scalar_fn = a.fn == PlanAggSpec::Fn::COUNT_STAR ||
                              a.fn == PlanAggSpec::Fn::COUNT ||
                              a.fn == PlanAggSpec::Fn::SUM ||
                              a.fn == PlanAggSpec::Fn::AVG;
-      if (!scalar_fn || a.distinct) {
+      const bool value_collecting_fn = a.fn == PlanAggSpec::Fn::MIN ||
+                                       a.fn == PlanAggSpec::Fn::MAX;
+      if ((!scalar_fn && !value_collecting_fn) || a.distinct) {
         return StateKind::UNSUPPORTED;
+      }
+    }
+    for (const auto &[key, group] : states_) {
+      for (const auto &a : group.aggs) {
+        if (a.spilled_values) {
+          return StateKind::UNSUPPORTED;
+        }
       }
     }
     return StateKind::SERIALIZABLE;
@@ -1397,6 +1445,11 @@ public:
         w.f64(a.dsum);
         w.i64(a.hsum.upper);
         w.u64(a.hsum.lower);
+        // MIN/MAX retraction state: the full values multiset, duplicates
+        // preserved, as one row so a deleted extreme retreats correctly
+        // post-restore (empty for scalar-only aggs — cheap no-op row).
+        std::vector<duckdb::Value> vals(a.values.begin(), a.values.end());
+        w.row(vals);
       }
     }
     out = w.take();
@@ -1412,8 +1465,7 @@ public:
       states_.clear();
       const uint64_t n_groups = r.u64();
       for (uint64_t g = 0; g < n_groups; g++) {
-        DuckDBRow key;
-        key.columns.assign(r.row());
+        DuckDBRow key = r.hashed_row();
         GroupState group;
         group.row_weight = r.i64();
         const uint64_t n_aggs = r.u64();
@@ -1425,6 +1477,8 @@ public:
           a.dsum = r.f64();
           a.hsum.upper = r.i64();
           a.hsum.lower = r.u64();
+          auto vals = r.row();
+          a.values.insert(vals.begin(), vals.end());
         }
         states_.emplace(std::move(key), std::move(group));
       }
@@ -1467,6 +1521,162 @@ struct SharedArrangement {
   RowWeights weights;
   int64_t total = 0;
   int64_t nulls = 0;
+
+  // Phase 2d inc2: packed storage (dbsp_packed_row.hpp). Set at
+  // registration when the side types are codec-clean and the arrangement
+  // tracks no counters (MARK) — probes decode buckets into the consumer's
+  // scratch, exactly like the spilled/projected paths.
+  bool packed_ok = false;
+  std::unordered_map<std::string, std::vector<std::pair<std::string, int64_t>>>
+      packed;
+  // Recovery inc 3: adopted durable layer (immutable, key-sorted; loaded
+  // from the fingerprint sidecar when the source table's watermark
+  // matched at register time). `packed` above becomes the delta overlay;
+  // weights sum across layers at probe.
+  flatpacked::FlatPackedIndex flat;
+
+  bool probe_packed(const DuckDBRow &key, RowWeights &out,
+                    const std::vector<duckdb::idx_t> *proj) const {
+    out.clear();
+    std::string kb;
+    if (!packed::encode_row(kb, key)) {
+      return false;
+    }
+    auto it = packed.find(kb);
+    const flatpacked::DirEnt *fe = flat.find(kb);
+    const bool have_overlay = it != packed.end() && !it->second.empty();
+    if (!have_overlay && fe == nullptr) {
+      return false;
+    }
+    auto emit = [&](const std::string &bytes, int64_t w) {
+      DuckDBRow row;
+      packed::decode_row(bytes, row);
+      if (proj) {
+        DuckDBRow projected;
+        std::vector<duckdb::Value> vals;
+        vals.reserve(proj->size());
+        for (auto idx : *proj) {
+          vals.push_back(idx < row.columns.size() ? row.columns[idx]
+                                                  : duckdb::Value());
+        }
+        projected.columns.assign(std::move(vals));
+        out[std::move(projected)] += w; // collapse under projection
+      } else {
+        out[std::move(row)] += w;
+      }
+    };
+    if (fe != nullptr && !have_overlay) {
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        emit(std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                        be.row_off),
+                         be.row_len),
+             be.weight);
+      }
+    } else if (fe == nullptr) {
+      for (const auto &[bytes, w] : it->second) {
+        emit(bytes, w);
+      }
+    } else {
+      // merge by row bytes: flat weight + overlay delta
+      std::unordered_map<std::string, int64_t> merged;
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        merged.emplace(
+            std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                       be.row_off),
+                        be.row_len),
+            be.weight);
+      }
+      for (const auto &[bytes, w] : it->second) {
+        merged[bytes] += w;
+      }
+      for (const auto &[bytes, w] : merged) {
+        if (w != 0) {
+          emit(bytes, w);
+        }
+      }
+    }
+    // projection collapse can cancel to zero-weight rows; drop them
+    for (auto mit = out.begin(); mit != out.end();) {
+      if (mit->second == 0) {
+        mit = out.erase(mit);
+      } else {
+        ++mit;
+      }
+    }
+    return !out.empty();
+  }
+
+  // Fold flat + overlay into one FlatPackedIndex (sidecar save).
+  void fold_packed(flatpacked::FlatPackedIndex &out) const {
+    out.clear();
+    auto add_bucket = [&](const std::string &kb,
+                          const std::vector<std::pair<std::string, int64_t>>
+                              &rows) {
+      if (rows.empty()) {
+        return;
+      }
+      flatpacked::DirEnt de;
+      de.key_off = out.append_bytes(kb);
+      de.key_len = static_cast<uint32_t>(kb.size());
+      de.bucket_off = out.buckets.size();
+      de.bucket_n = static_cast<uint32_t>(rows.size());
+      for (const auto &[rb, w] : rows) {
+        flatpacked::BucketEnt be;
+        be.row_off = out.append_bytes(rb);
+        be.row_len = static_cast<uint32_t>(rb.size());
+        be.weight = w;
+        out.buckets.push_back(be);
+      }
+      out.dir.push_back(de);
+    };
+    std::vector<std::pair<std::string, int64_t>> scratch;
+    for (uint64_t i = 0; i < flat.dir.size(); i++) {
+      const auto &de = flat.dir[i];
+      const std::string kb(
+          reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+          de.key_len);
+      auto ov = packed.find(kb);
+      scratch.clear();
+      if (ov == packed.end()) {
+        for (uint32_t b = 0; b < de.bucket_n; b++) {
+          const auto &be = flat.buckets[de.bucket_off + b];
+          scratch.emplace_back(
+              std::string(reinterpret_cast<const char *>(flat.arena.data() +
+                                                         be.row_off),
+                          be.row_len),
+              be.weight);
+        }
+      } else {
+        std::unordered_map<std::string, int64_t> m;
+        for (uint32_t b = 0; b < de.bucket_n; b++) {
+          const auto &be = flat.buckets[de.bucket_off + b];
+          m.emplace(std::string(reinterpret_cast<const char *>(
+                                    flat.arena.data() + be.row_off),
+                                be.row_len),
+                    be.weight);
+        }
+        for (const auto &[rb, dw] : ov->second) {
+          m[rb] += dw;
+        }
+        for (const auto &[rb, w] : m) {
+          if (w != 0) {
+            scratch.emplace_back(rb, w);
+          }
+        }
+      }
+      add_bucket(kb, scratch);
+    }
+    for (const auto &[kb, rows] : packed) {
+      if (flat.find(kb) != nullptr) {
+        continue; // already merged above
+      }
+      scratch.assign(rows.begin(), rows.end());
+      add_bucket(kb, scratch);
+    }
+    out.finish_build();
+  }
 
   // D3c lazy restore: arrangement was registered over a deferred-baseline
   // table and holds no rows yet. CDCManager backfills it (and clears the
@@ -1548,6 +1758,24 @@ struct SharedArrangement {
       return;
     }
     spilled = std::make_unique<SpilledBucketIndex>(path);
+    for (const auto &[kb, bucket] : packed) {
+      SpilledBucketIndex::Bucket delta;
+      delta.reserve(bucket.size());
+      DuckDBRow key;
+      packed::decode_row(kb, key);
+      for (const auto &[rb, w] : bucket) {
+        DuckDBRow row;
+        packed::decode_row(rb, row);
+        std::vector<duckdb::Value> vals;
+        vals.reserve(row.columns.size());
+        for (size_t i = 0; i < row.columns.size(); i++) {
+          vals.push_back(row.columns[i]);
+        }
+        delta.emplace_back(std::move(vals), w);
+      }
+      spilled->update(digest_of_row(key), delta);
+    }
+    packed.clear();
     for (const auto &[key, bucket] : index) {
       SpilledBucketIndex::Bucket delta;
       delta.reserve(bucket.size());
@@ -1574,9 +1802,17 @@ struct SharedArrangement {
         std::vector<duckdb::Value> copy = vals;
         row.columns.assign(std::move(copy));
         DuckDBRow key;
-        if (eval_key(row, key)) {
-          index[key][row] += w;
+        if (!eval_key(row, key)) {
+          continue;
         }
+        if (packed_ok) {
+          std::string kb, rb;
+          if (packed::encode_row(kb, key) && packed::encode_row(rb, row)) {
+            packed[std::move(kb)].emplace_back(std::move(rb), w);
+            continue;
+          }
+        }
+        index[key][row] += w;
       }
     });
     spilled.reset();
@@ -1692,6 +1928,30 @@ struct SharedArrangement {
         spill_batch[digest_of_row(keys[i])].emplace_back(std::move(vals), w);
         continue;
       }
+      if (packed_ok) {
+        std::string kb, rb;
+        if (!packed::encode_row(kb, keys[i]) ||
+            !packed::encode_row(rb, row)) {
+          throw std::runtime_error("packed arrangement: unencodable row");
+        }
+        auto &bucket = packed[std::move(kb)];
+        bool merged = false;
+        for (size_t b = 0; b < bucket.size(); b++) {
+          if (bucket[b].first == rb) {
+            bucket[b].second += w;
+            if (bucket[b].second == 0) {
+              bucket[b] = std::move(bucket.back());
+              bucket.pop_back();
+            }
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) {
+          bucket.emplace_back(std::move(rb), w);
+        }
+        continue;
+      }
       auto &bucket = index[keys[i]];
       int64_t &weight = bucket[row];
       weight += w;
@@ -1779,6 +2039,9 @@ public:
     marks_ = join_type_ == duckdb::JoinType::MARK;
     semi_ = join_type_ == duckdb::JoinType::SEMI;
     anti_ = join_type_ == duckdb::JoinType::ANTI;
+    // Phase 2d: packed storage for the local indexes (see member block).
+    packed_ok_ = !marks_ && !pads_right_ && packed::types_ok(left_types_) &&
+                 packed::types_ok(right_types_);
     // N3: under spill mode, local indexes of pure probe-target sides go
     // to disk bucket logs (self-padding / mark-preserved sides keep RAM —
     // their pad/weight reconciliation walks full-row structures). Files
@@ -1892,14 +2155,15 @@ public:
     const int shards_cfg = g_intraop_shards.load(std::memory_order_relaxed);
     const bool shardable = shards_cfg > 1 && residuals_.empty() &&
                            !marks_ && !pads_left_ && !pads_right_ &&
+                           !packed_ok_ &&
                            kl.rows.size() + kr.rows.size() >= 4096;
 
     if (shardable) {
       run_sharded_probe(kl, /*probe_left_side=*/false, shards_cfg);
     } else if ((shared_right_ &&
-                (shared_right_->is_spilled() ||
+                (shared_right_->is_spilled() || shared_right_->packed_ok ||
                  !shared_proj_right_.empty())) ||
-               (!shared_right_ && local_spill_right_)) {
+               (!shared_right_ && (local_spill_right_ || packed_ok_))) {
       for (size_t i = 0; i < kl.rows.size(); i++) {
         if (!kl.valid[i]) {
           continue;
@@ -1934,9 +2198,9 @@ public:
     if (shardable) {
       run_sharded_probe(kr, /*probe_left_side=*/true, shards_cfg);
     } else if ((shared_left_ &&
-                (shared_left_->is_spilled() ||
+                (shared_left_->is_spilled() || shared_left_->packed_ok ||
                  !shared_proj_left_.empty())) ||
-               (!shared_left_ && local_spill_left_)) {
+               (!shared_left_ && (local_spill_left_ || packed_ok_))) {
       for (size_t i = 0; i < kr.rows.size(); i++) {
         if (!kr.valid[i]) {
           continue;
@@ -2021,6 +2285,14 @@ public:
   void reset() override {
     left_index_.clear();
     right_index_.clear();
+    packed_left_.clear();
+    packed_right_.clear();
+    packed_wleft_.clear();
+    packed_wright_.clear();
+    flat_left_.clear();
+    flat_right_.clear();
+    flat_wleft_.clear();
+    flat_wright_.clear();
     if (local_spill_left_) {
       local_spill_left_->discard();
     }
@@ -2042,6 +2314,50 @@ public:
   bool has_output() const override { return has_output_; }
 
   const DuckDBZSet &output() const { return output_; }
+
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    auto index_bytes = [&](const Index &idx) {
+      size_t b = 0;
+      for (const auto &[key, rows] : idx) {
+        b += acct.row_bytes(key) + 32;
+        for (const auto &[row, w] : rows) {
+          (void)w;
+          b += acct.row_bytes(row) + 32;
+        }
+      }
+      return b;
+    };
+    out.arrangement += index_bytes(left_index_) + index_bytes(right_index_);
+    for (const auto *pidx : {&packed_left_, &packed_right_}) {
+      for (const auto &[kb, bucket] : *pidx) {
+        out.arrangement += kb.capacity() + 48;
+        for (const auto &[rb, weight] : bucket) {
+          (void)weight;
+          out.arrangement += rb.capacity() + 24;
+        }
+      }
+    }
+    for (const auto *pw : {&packed_wleft_, &packed_wright_}) {
+      for (const auto &[rb, weight] : *pw) {
+        (void)weight;
+        out.arrangement += rb.capacity() + 48;
+      }
+    }
+    out.arrangement += flat_left_.resident_bytes() +
+                       flat_right_.resident_bytes() +
+                       flat_wleft_.resident_bytes() +
+                       flat_wright_.resident_bytes();
+    for (const auto &[row, entry] : mark_state_) {
+      (void)entry;
+      out.arrangement += acct.row_bytes(row) + 48;
+    }
+    out.other += acct.zset_bytes(output_);
+  }
 
   void set_shared_arrangement(bool left,
                               std::shared_ptr<const SharedArrangement> arr,
@@ -2079,6 +2395,12 @@ private:
                  ? &scratch
                  : nullptr;
     }
+    if (sh && sh->packed_ok) {
+      RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
+      return sh->probe_packed(key, scratch, proj.empty() ? nullptr : &proj)
+                 ? &scratch
+                 : nullptr;
+    }
     if (sh && !proj.empty()) {
       // O4: arrangement holds full rows; project to this consumer's shape
       RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
@@ -2092,6 +2414,13 @@ private:
             left ? probe_scratch_left_ : probe_scratch_right_;
         return probe_local_spill(*spill, key, scratch) ? &scratch : nullptr;
       }
+    }
+    if (!sh && packed_ok_) {
+      // Local packed index — a SHARED side must fall through to
+      // side_index() (the arrangement), which the branch above this one
+      // only handles for spilled/projected arrangements.
+      RowWeights &scratch = left ? probe_scratch_left_ : probe_scratch_right_;
+      return probe_packed(left, key, scratch) ? &scratch : nullptr;
     }
     const Index &idx = side_index(left);
     auto it = idx.find(key);
@@ -2395,6 +2724,10 @@ private:
   }
 
   void integrate(const DeltaKeys &dk, bool left) {
+    if (packed_ok_ && !(left ? local_spill_left_ : local_spill_right_)) {
+      integrate_packed(dk, left);
+      return;
+    }
     Index &index = left ? left_index_ : right_index_;
     const bool track_weights =
         left ? (pads_left_ || marks_ || semi_ || anti_) : pads_right_;
@@ -2499,7 +2832,6 @@ private:
       affected.emplace(row, 0);
     }
     if (!other_delta.empty()) {
-      const Index &own_index = side_index(left);
       std::unordered_map<DuckDBRow, char, DuckDBRowHash> seen_keys;
       for (const auto &[orow, ow] : other_delta) {
         DuckDBRow key;
@@ -2509,24 +2841,21 @@ private:
         if (!seen_keys.emplace(key, 0).second) {
           continue;
         }
-        auto it = own_index.find(key);
-        if (it == own_index.end()) {
+        // probe_side covers all storage modes (shared / spilled / packed /
+        // boxed); the scratch is copied into `affected` immediately.
+        const RowWeights *bucket = probe_side(left, key);
+        if (!bucket) {
           continue;
         }
-        for (const auto &[row, w] : it->second) {
+        for (const auto &[row, w] : *bucket) {
           affected.emplace(row, 0);
         }
       }
     }
 
-    const RowWeights &weights =
-        (left && shared_left_)    ? shared_left_->weights
-        : (!left && shared_right_) ? shared_right_->weights
-        : (left ? left_weights_ : right_weights_);
     RowWeights &pads = left ? left_pad_ : right_pad_;
     for (const auto &[row, unused] : affected) {
-      auto wit = weights.find(row);
-      const int64_t total = wit == weights.end() ? 0 : wit->second;
+      const int64_t total = own_row_weight(row, left);
       const int64_t desired =
           (total > 0 && match_count(row, left) == 0) ? total : 0;
       auto pit = pads.find(row);
@@ -2645,20 +2974,219 @@ private:
   std::vector<KeyPair> keys_;
   std::vector<Residual> residuals_;
 public:
-  // Checkpointing (D3b): INNER joins keep only equi-key indexes (private
-  // ones for non-shared sides; shared arrangements are checkpointed by the
-  // CDC layer). Outer/mark joins carry pad/mark bookkeeping and spilled
-  // indexes live on disk — both UNSUPPORTED in v1 (rebuild-by-replay).
+  // Checkpointing (D3b, extended Task 3): INNER/LEFT/RIGHT joins serialize
+  // their equi-key indexes (private ones for non-shared sides; shared
+  // arrangements are checkpointed by the CDC layer) plus, for LEFT/RIGHT,
+  // the pad bookkeeping reconcile_pads needs to resume correctly (see
+  // serialize_state). FULL (OUTER) and MARK joins carry bookkeeping this
+  // pass does not cover, and spilled indexes live on disk — both stay
+  // UNSUPPORTED (rebuild-by-replay).
   StateKind state_kind() const override {
-    if (join_type_ != duckdb::JoinType::INNER || marks_ || pads_left_ ||
-        pads_right_ || local_spill_left_ || local_spill_right_) {
+    if (marks_ || local_spill_left_ || local_spill_right_) {
       return StateKind::UNSUPPORTED;
     }
-    return StateKind::SERIALIZABLE;
+    if (join_type_ == duckdb::JoinType::INNER ||
+        join_type_ == duckdb::JoinType::LEFT ||
+        join_type_ == duckdb::JoinType::RIGHT) {
+      return StateKind::SERIALIZABLE;
+    }
+    return StateKind::UNSUPPORTED; // FULL (OUTER) — both sides pad, unbuilt
   }
+
+  // reconcile_pads (see above) reads exactly four pieces of per-node state
+  // to decide each row's desired pad weight and diff it against what was
+  // last emitted: the padded side's own-row weight totals (left_weights_ /
+  // right_weights_, already serialized for INNER), the other side's
+  // equi-key index to recompute match_count (left_index_ / right_index_,
+  // already serialized), and — new in Task 3 — the currently-emitted pad
+  // weight per row (left_pad_ / right_pad_) so a post-restore delta emits
+  // the correct diff instead of re-emitting a pad that was already output
+  // pre-checkpoint. right_total_/right_null_ are MARK-only bookkeeping
+  // (only ever written when marks_, which stays UNSUPPORTED) and are
+  // therefore NOT read by reconcile_pads — correctly omitted here.
+  static constexpr uint64_t kPackedStateMagic = 0xDB5B2DFACC0FFEE1ULL;
 
   void serialize_state(std::vector<uint8_t> &out) const override {
     BlobWriter w;
+    if (packed_ok_) {
+      // Packed-native layout (magic-tagged; an old boxed blob starts with a
+      // small map size and can never collide). Pads stay boxed rows.
+      w.u64(kPackedStateMagic);
+      // Fold flat (restored) + overlay (post-restore deltas) into one
+      // stream. With no flat layer this is exactly the old map dump; with
+      // a clean overlay it is a straight flat re-emit.
+      auto write_pindex = [&w](const PackedIndex &idx,
+                               const flatpacked::FlatPackedIndex &flat) {
+        if (flat.empty()) {
+          w.u64(idx.size());
+          for (const auto &[kb, bucket] : idx) {
+            w.bytes(reinterpret_cast<const uint8_t *>(kb.data()), kb.size());
+            w.u64(bucket.size());
+            for (const auto &[rb, weight] : bucket) {
+              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                      rb.size());
+              w.i64(weight);
+            }
+          }
+          return;
+        }
+        // Merged key set: every flat key + overlay-only keys. Buckets
+        // merge by row bytes with weights summed; zero-weight rows and
+        // empty buckets are dropped.
+        std::vector<std::pair<std::string, PackedBucket>> merged_extra;
+        std::vector<const std::pair<const std::string, PackedBucket> *>
+            overlay_only;
+        for (const auto &kv : idx) {
+          if (flat.find(kv.first) == nullptr) {
+            overlay_only.push_back(&kv);
+          }
+        }
+        // First pass counts live keys.
+        uint64_t live = 0;
+        std::vector<PackedBucket> flat_merged(flat.dir.size());
+        for (size_t i = 0; i < flat.dir.size(); i++) {
+          const auto &de = flat.dir[i];
+          const std::string kb(
+              reinterpret_cast<const char *>(flat.arena.data() + de.key_off),
+              de.key_len);
+          PackedBucket &bucket = flat_merged[i];
+          auto ov = idx.find(kb);
+          if (ov == idx.end()) {
+            bucket.reserve(de.bucket_n);
+            for (uint32_t b = 0; b < de.bucket_n; b++) {
+              const auto &be = flat.buckets[de.bucket_off + b];
+              bucket.emplace_back(
+                  std::string(reinterpret_cast<const char *>(
+                                  flat.arena.data() + be.row_off),
+                              be.row_len),
+                  be.weight);
+            }
+          } else {
+            std::unordered_map<std::string, int64_t> m;
+            for (uint32_t b = 0; b < de.bucket_n; b++) {
+              const auto &be = flat.buckets[de.bucket_off + b];
+              m.emplace(std::string(reinterpret_cast<const char *>(
+                                        flat.arena.data() + be.row_off),
+                                    be.row_len),
+                        be.weight);
+            }
+            for (const auto &[rb, dw] : ov->second) {
+              m[rb] += dw;
+            }
+            for (auto &[rb, wt] : m) {
+              if (wt != 0) {
+                bucket.emplace_back(rb, wt);
+              }
+            }
+          }
+          if (!bucket.empty()) {
+            live++;
+          }
+        }
+        for (const auto *kv : overlay_only) {
+          if (!kv->second.empty()) {
+            live++;
+          }
+        }
+        w.u64(live);
+        for (size_t i = 0; i < flat.dir.size(); i++) {
+          if (flat_merged[i].empty()) {
+            continue;
+          }
+          const auto &de = flat.dir[i];
+          w.bytes(flat.arena.data() + de.key_off, de.key_len);
+          w.u64(flat_merged[i].size());
+          for (const auto &[rb, weight] : flat_merged[i]) {
+            w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
+            w.i64(weight);
+          }
+        }
+        for (const auto *kv : overlay_only) {
+          if (kv->second.empty()) {
+            continue;
+          }
+          w.bytes(reinterpret_cast<const uint8_t *>(kv->first.data()),
+                  kv->first.size());
+          w.u64(kv->second.size());
+          for (const auto &[rb, weight] : kv->second) {
+            w.bytes(reinterpret_cast<const uint8_t *>(rb.data()), rb.size());
+            w.i64(weight);
+          }
+        }
+        (void)merged_extra;
+      };
+      auto write_pweights =
+          [&w](const std::unordered_map<std::string, int64_t> &wm,
+               const flatpacked::FlatPackedWeights &flat) {
+            if (flat.empty()) {
+              w.u64(wm.size());
+              for (const auto &[rb, weight] : wm) {
+                w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                        rb.size());
+                w.i64(weight);
+              }
+              return;
+            }
+            uint64_t live = 0;
+            for (const auto &we : flat.dir) {
+              const std::string rb(
+                  reinterpret_cast<const char *>(flat.arena.data() +
+                                                 we.row_off),
+                  we.row_len);
+              auto ov = wm.find(rb);
+              const int64_t total =
+                  we.weight + (ov == wm.end() ? 0 : ov->second);
+              if (total != 0) {
+                live++;
+              }
+            }
+            for (const auto &[rb, dw] : wm) {
+              if (flat.find(rb) == 0 && dw != 0) {
+                // overlay-only row (flat.find returns 0 for absent —
+                // a flat row with true weight 0 cannot exist)
+                live++;
+              }
+            }
+            w.u64(live);
+            for (const auto &we : flat.dir) {
+              const std::string rb(
+                  reinterpret_cast<const char *>(flat.arena.data() +
+                                                 we.row_off),
+                  we.row_len);
+              auto ov = wm.find(rb);
+              const int64_t total =
+                  we.weight + (ov == wm.end() ? 0 : ov->second);
+              if (total == 0) {
+                continue;
+              }
+              w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                      rb.size());
+              w.i64(total);
+            }
+            for (const auto &[rb, dw] : wm) {
+              if (flat.find(rb) == 0 && dw != 0) {
+                w.bytes(reinterpret_cast<const uint8_t *>(rb.data()),
+                        rb.size());
+                w.i64(dw);
+              }
+            }
+          };
+      auto write_boxed = [&w](const RowWeights &rw) {
+        w.u64(rw.size());
+        for (const auto &[row, weight] : rw) {
+          w.row(row.columns);
+          w.i64(weight);
+        }
+      };
+      write_pindex(packed_left_, flat_left_);
+      write_pindex(packed_right_, flat_right_);
+      write_pweights(packed_wleft_, flat_wleft_);
+      write_pweights(packed_wright_, flat_wright_);
+      write_boxed(left_pad_);
+      write_boxed(right_pad_);
+      out = w.take();
+      return;
+    }
     auto write_weights = [&w](const RowWeights &rw) {
       w.u64(rw.size());
       for (const auto &[row, weight] : rw) {
@@ -2677,18 +3205,88 @@ public:
     write_index(right_index_);
     write_weights(left_weights_);
     write_weights(right_weights_);
+    write_weights(left_pad_);
+    write_weights(right_pad_);
     out = w.take();
   }
 
   bool restore_state(const uint8_t *data, size_t len) override {
     try {
       BlobReader r(data, len);
+      if (packed_ok_) {
+        if (r.u64() != kPackedStateMagic) {
+          return false; // boxed-era blob: rebuild by replay
+        }
+        // Tier 2: decode into the contiguous flat layer (append + one
+        // sort), NOT the hash maps — the 36M-insert map build was ~all of
+        // the first-edit-after-reopen cost. The maps stay empty and serve
+        // as the mutation overlay from here on.
+        auto read_flat_index = [&r](PackedIndex &overlay,
+                                    flatpacked::FlatPackedIndex &flat) {
+          overlay.clear();
+          flat.clear();
+          const uint64_t n = r.u64();
+          flat.dir.reserve(n);
+          for (uint64_t i = 0; i < n; i++) {
+            std::string kb = r.byte_string();
+            flatpacked::DirEnt de;
+            de.key_off = flat.append_bytes(kb);
+            de.key_len = static_cast<uint32_t>(kb.size());
+            de.bucket_off = flat.buckets.size();
+            const uint64_t m = r.u64();
+            de.bucket_n = static_cast<uint32_t>(m);
+            for (uint64_t j = 0; j < m; j++) {
+              std::string rb = r.byte_string();
+              flatpacked::BucketEnt be;
+              be.row_off = flat.append_bytes(rb);
+              be.row_len = static_cast<uint32_t>(rb.size());
+              be.weight = r.i64();
+              flat.buckets.push_back(be);
+            }
+            flat.dir.push_back(de);
+          }
+          flat.finish_build();
+        };
+        auto read_flat_weights = [&r](std::unordered_map<std::string, int64_t>
+                                          &overlay,
+                                      flatpacked::FlatPackedWeights &flat) {
+          overlay.clear();
+          flat.clear();
+          const uint64_t n = r.u64();
+          flat.dir.reserve(n);
+          for (uint64_t i = 0; i < n; i++) {
+            std::string rb = r.byte_string();
+            flatpacked::WeightEnt we;
+            we.row_off = flat.arena.size();
+            flat.arena.insert(flat.arena.end(), rb.begin(), rb.end());
+            we.row_len = static_cast<uint32_t>(rb.size());
+            we.weight = r.i64();
+            flat.dir.push_back(we);
+          }
+          flat.finish_build();
+        };
+        auto read_boxed = [&r](RowWeights &rw) {
+          rw.clear();
+          const uint64_t n = r.u64();
+          for (uint64_t i = 0; i < n; i++) {
+            DuckDBRow row = r.hashed_row();
+            const int64_t weight = r.i64();
+            rw.emplace(std::move(row), weight);
+          }
+        };
+        read_flat_index(packed_left_, flat_left_);
+        read_flat_index(packed_right_, flat_right_);
+        read_flat_weights(packed_wleft_, flat_wleft_);
+        read_flat_weights(packed_wright_, flat_wright_);
+        read_boxed(left_pad_);
+        read_boxed(right_pad_);
+        return r.done();
+      }
       auto read_weights = [&r](RowWeights &rw) {
         rw.clear();
         const uint64_t n = r.u64();
         for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow row;
-          row.columns.assign(r.row());
+          DuckDBRow row = r.hashed_row();
           const int64_t weight = r.i64();
           rw.emplace(std::move(row), weight);
         }
@@ -2697,8 +3295,7 @@ public:
         idx.clear();
         const uint64_t n = r.u64();
         for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow key;
-          key.columns.assign(r.row());
+          DuckDBRow key = r.hashed_row();
           RowWeights bucket;
           read_weights(bucket);
           idx.emplace(std::move(key), std::move(bucket));
@@ -2708,6 +3305,8 @@ public:
       read_index(right_index_);
       read_weights(left_weights_);
       read_weights(right_weights_);
+      read_weights(left_pad_);
+      read_weights(right_pad_);
       return r.done();
     } catch (...) {
       return false;
@@ -2715,6 +3314,183 @@ public:
   }
 
 private:
+  // ---- Phase 2d: packed join-index storage --------------------------------
+  // Boxed DuckDBRow index entries cost ~450-600B resident; packed byte rows
+  // cost tens. Active (packed_ok_) for INNER/LEFT-pad joins whose side
+  // types are all codec-supported; buckets decode into the probe scratch on
+  // access — the same materialize-into-scratch pattern the spilled and
+  // projected shared paths already use. MARK and right-padding joins stay
+  // boxed (their reconcile paths read row objects pervasively and are not
+  // emitted by the compiled plans this exists for).
+  using PackedBucket = std::vector<std::pair<std::string, int64_t>>;
+  using PackedIndex = std::unordered_map<std::string, PackedBucket>;
+  PackedIndex packed_left_, packed_right_;
+  std::unordered_map<std::string, int64_t> packed_wleft_, packed_wright_;
+  bool packed_ok_ = false;
+  // Tier-2 restore layer: checkpoint blobs decode into these contiguous,
+  // key-sorted structures (append + one sort — no 36M-insert hash-map
+  // build). Immutable; the packed_* maps above act as a DELTA overlay on
+  // top (weights sum across layers). serialize_state folds both layers
+  // back into one blob stream.
+  flatpacked::FlatPackedIndex flat_left_, flat_right_;
+  flatpacked::FlatPackedWeights flat_wleft_, flat_wright_;
+
+  flatpacked::FlatPackedIndex &flat_index(bool left) {
+    return left ? flat_left_ : flat_right_;
+  }
+  flatpacked::FlatPackedWeights &flat_weights(bool left) {
+    return left ? flat_wleft_ : flat_wright_;
+  }
+
+  PackedIndex &packed_index(bool left) {
+    return left ? packed_left_ : packed_right_;
+  }
+
+  std::unordered_map<std::string, int64_t> &packed_weights(bool left) {
+    return left ? packed_wleft_ : packed_wright_;
+  }
+
+  void integrate_packed(const DeltaKeys &dk, bool left) {
+    const bool track_weights = left && pads_left_; // marks/right-pads boxed
+    auto &wmap = packed_weights(left);
+    auto &idx = packed_index(left);
+    std::string kb, rb;
+    for (size_t i = 0; i < dk.rows.size(); i++) {
+      const DuckDBRow &row = *dk.rows[i];
+      const int64_t w = dk.weights[i];
+      if (!packed::encode_row(rb, row)) {
+        throw std::runtime_error("packed join index: unencodable row");
+      }
+      if (track_weights) {
+        int64_t &total = wmap[rb];
+        total += w;
+        if (total == 0) {
+          wmap.erase(rb);
+        }
+      }
+      if (!dk.valid[i]) {
+        continue;
+      }
+      if (!packed::encode_row(kb, dk.keys[i])) {
+        throw std::runtime_error("packed join index: unencodable key");
+      }
+      if (std::getenv("DBSP_PACKED_DEBUG") != nullptr) {
+        fprintf(stderr, "[packed] integrate side=%s klen=%zu k0=%02x%02x%02x w=%lld\n",
+                left ? "L" : "R", kb.size(), (unsigned char)kb[0],
+                (unsigned char)kb[4], kb.size() > 5 ? (unsigned char)kb[5] : 0,
+                (long long)w);
+      }
+      auto &bucket = idx[kb];
+      bool merged = false;
+      for (size_t b = 0; b < bucket.size(); b++) {
+        if (bucket[b].first == rb) {
+          bucket[b].second += w;
+          if (bucket[b].second == 0) {
+            bucket[b] = std::move(bucket.back());
+            bucket.pop_back();
+          }
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        bucket.emplace_back(rb, w);
+      }
+      if (bucket.empty()) {
+        idx.erase(kb);
+      }
+    }
+  }
+
+  bool probe_packed(bool left, const DuckDBRow &key, RowWeights &out) {
+    out.clear();
+    std::string kb;
+    if (!packed::encode_row(kb, key)) {
+      return false;
+    }
+    const auto &idx = left ? packed_left_ : packed_right_;
+    const auto &flat = left ? flat_left_ : flat_right_;
+    auto it = idx.find(kb);
+    const flatpacked::DirEnt *fe = flat.find(kb);
+    if (it == idx.end() && fe == nullptr) {
+      return false;
+    }
+    // Merge layers by row bytes: flat weight + overlay delta. The common
+    // cases are flat-only (post-restore reads) and overlay-only (models
+    // built this session), both of which skip the merge map.
+    if (fe != nullptr && it == idx.end()) {
+      for (uint32_t b = 0; b < fe->bucket_n; b++) {
+        const auto &be = flat.buckets[fe->bucket_off + b];
+        DuckDBRow row;
+        std::string bytes(
+            reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+            be.row_len);
+        packed::decode_row(bytes, row);
+        out.emplace(std::move(row), be.weight);
+      }
+      return !out.empty();
+    }
+    if (fe == nullptr) {
+      if (it->second.empty()) {
+        return false;
+      }
+      for (const auto &[bytes, w] : it->second) {
+        DuckDBRow row;
+        packed::decode_row(bytes, row);
+        out.emplace(std::move(row), w);
+      }
+      return true;
+    }
+    std::unordered_map<std::string, int64_t> merged;
+    for (uint32_t b = 0; b < fe->bucket_n; b++) {
+      const auto &be = flat.buckets[fe->bucket_off + b];
+      merged.emplace(
+          std::string(
+              reinterpret_cast<const char *>(flat.arena.data() + be.row_off),
+              be.row_len),
+          be.weight);
+    }
+    for (const auto &[bytes, w] : it->second) {
+      merged[bytes] += w;
+    }
+    for (const auto &[bytes, w] : merged) {
+      if (w == 0) {
+        continue;
+      }
+      DuckDBRow row;
+      packed::decode_row(bytes, row);
+      out.emplace(std::move(row), w);
+    }
+    return !out.empty();
+  }
+
+  // The padded side's own-row weight total for one row, across the three
+  // storage modes (shared arrangement / packed / boxed).
+  int64_t own_row_weight(const DuckDBRow &row, bool left) {
+    if (left && shared_left_) {
+      auto it = shared_left_->weights.find(row);
+      return it == shared_left_->weights.end() ? 0 : it->second;
+    }
+    if (!left && shared_right_) {
+      auto it = shared_right_->weights.find(row);
+      return it == shared_right_->weights.end() ? 0 : it->second;
+    }
+    if (packed_ok_) {
+      std::string rb;
+      if (!packed::encode_row(rb, row)) {
+        return 0;
+      }
+      const auto &wmap = left ? packed_wleft_ : packed_wright_;
+      auto it = wmap.find(rb);
+      const int64_t overlay = it == wmap.end() ? 0 : it->second;
+      const auto &fw = left ? flat_wleft_ : flat_wright_;
+      return overlay + fw.find(rb);
+    }
+    const RowWeights &weights = left ? left_weights_ : right_weights_;
+    auto it = weights.find(row);
+    return it == weights.end() ? 0 : it->second;
+  }
+
   duckdb::JoinType join_type_;
   // Buffered inner-join emits for the vectorized output-hash preseed
   std::shared_ptr<PlanKeepAlive> keep_alive_join_;
@@ -2788,6 +3564,49 @@ public:
   bool has_output() const override { return has_output_; }
 
   const DuckDBZSet &output() const { return output_; }
+
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  // Bounded-RAM Phase 3 (reattach): DISTINCT state is one weight per row —
+  // trivially serializable. Without this, every view containing DISTINCT
+  // declined checkpointing and cold-replayed at every load.
+  StateKind state_kind() const override { return StateKind::SERIALIZABLE; }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(counts_.size());
+    for (const auto &[row, c] : counts_) {
+      w.row(row.columns);
+      w.i64(c);
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      counts_.clear();
+      const uint64_t n = r.u64();
+      for (uint64_t i = 0; i < n; i++) {
+        DuckDBRow row = r.hashed_row();
+        counts_[std::move(row)] = r.i64();
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[row, c] : counts_) {
+      (void)c;
+      out.other += acct.row_bytes(row) + 40;
+    }
+    out.other += acct.zset_bytes(output_);
+  }
 
 private:
   InputFn input_fn_;
@@ -2864,6 +3683,57 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  // Bounded-RAM Phase 3 (reattach): set-op state is per-row input counts —
+  // serializable. Without this, every UNION view (all compiled u_li_
+  // rollup unions) declined checkpointing and cold-replayed at every load,
+  // cascading realizes through the whole DAG at reattach.
+  StateKind state_kind() const override { return StateKind::SERIALIZABLE; }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    w.u64(counts_.size());
+    for (const auto &[row, ws] : counts_) {
+      w.row(row.columns);
+      w.u64(ws.size());
+      for (const int64_t c : ws) {
+        w.i64(c);
+      }
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      counts_.clear();
+      const uint64_t n = r.u64();
+      for (uint64_t i = 0; i < n; i++) {
+        DuckDBRow row = r.hashed_row();
+        const uint64_t k = r.u64();
+        std::vector<int64_t> ws(k);
+        for (uint64_t j = 0; j < k; j++) {
+          ws[j] = r.i64();
+        }
+        counts_[std::move(row)] = std::move(ws);
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    for (const auto &[row, ws] : counts_) {
+      out.other += acct.row_bytes(row) + 40 + ws.capacity() * sizeof(int64_t);
+    }
+    out.other += acct.zset_bytes(output_);
+  }
+
 private:
   int64_t multiplicity(const std::vector<int64_t> &counts) const {
     auto at = [&](size_t i) {
@@ -2931,6 +3801,38 @@ public:
   bool has_output() const override { return !view_->get_delta().empty(); }
 
   const DuckDBZSet &output() const { return view_->get_delta(); }
+
+  // Inside a bigger circuit this node's output is transient — the outer
+  // sink owns the view-level delta. (CircuitWrappedView, whose delta
+  // surface IS the wrapped buffer, excludes its node from the trim pass.)
+  void clear_output() override { view_->drop_delta(); }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    // The wrapped legacy view (WINDOW/SORT_LIMIT/DISTINCT_ON) is an
+    // intermediate operator here — bucket ALL its state as window-class.
+    StateBytes tmp;
+    view_->account_state(tmp, acct);
+    out.window += tmp.total();
+  }
+
+  // Checkpointing (Task 2, restore-tail): delegate straight to the wrapped
+  // view's own per-node hooks (NativeMaterializedView::circuit_state_kind/
+  // serialize_circuit_node_state/restore_circuit_node_state -- see their
+  // doc comment in dbsp_duckdb_types.hpp for why these are separate from
+  // checkpointable()/serialize_circuit_state()/restore_circuit_state()).
+  // This node is a single leaf to the OUTER circuit's checkpoint walk
+  // (SingleSourceCircuitView::checkpointable() etc. iterate circuit_'s
+  // dbsp::Node objects and call exactly these three methods on each), so
+  // whatever the wrapped view reports IS this node's own state_kind.
+  StateKind state_kind() const override { return view_->circuit_state_kind(); }
+
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    view_->serialize_circuit_node_state(out);
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    return view_->restore_circuit_node_state(data, len);
+  }
 
 private:
   InputFn input_fn_;
@@ -3079,6 +3981,11 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
 private:
   InputFn input_fn_;
   size_t num_filters_;
@@ -3174,6 +4081,11 @@ public:
   bool has_output() const override { return has_output_; }
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
 private:
   InputFn input_fn_;
   std::vector<duckdb::idx_t> idxs_;
@@ -3191,16 +4103,39 @@ private:
 // the step on the frontier until it stops producing new rows (UNION dedup
 // state persists across calls, so later deltas cannot double-count).
 //
-// Deltas containing a deletion take the DRed (Delete-Rederive) path for
-// UNION (set-semantics) recursion: an incremental overdelete fixpoint
-// over-approximates the retraction, then a rederive fixpoint re-admits rows
-// that still have alternative support (cycles included). Overdelete is
-// O(affected subgraph); rederive costs one image pass over the surviving
-// relation plus a bounded rederive fixpoint (deeper multi-hop re-admission)
-// — still cheaper than the full recompute it replaces. UNION ALL
-// (multiplicity) recursion keeps recompute(): weighted deletion in a cycle
-// is ill-defined. recompute() is retained for that path and as the
-// differential-test oracle.
+// A LINEAR UNION ALL step (the recursive relation referenced exactly once
+// in the step subtree, `linear_step_`) is linear in that relation:
+// step(R + δ) = step(R) + step(δ). Retraction-bearing deltas therefore ride
+// the SAME incremental fixpoint as insertions, just with signed weights —
+// no deletion special-case needed (design: docs/superpowers/specs/
+// 2026-07-31-linear-recursion-deltas-design.md). `admit`'s union_all_
+// branch already does plain multiset arithmetic on `accumulated_` (insert
+// signed weight; a row whose weight nets to zero is erased by ZSet::insert
+// itself); `iterate` pushes signed frontiers through step_view_ unchanged
+// (join/filter/project are all weight-linear). A max_iterations_ trip
+// aborts the signed attempt and falls back to recompute() from the
+// snapshot taken before admission — never a partial delta (logged under
+// DBSP_DEBUG_SYNC).
+//
+// All other deletion-bearing shapes are unchanged: NONLINEAR UNION ALL
+// (recursive relation referenced ≥2 times) keeps recompute() — weighted
+// deletion through a self-join doesn't distribute. UNION (set-semantics)
+// recursion takes the DRed (Delete-Rederive) path: an incremental
+// overdelete fixpoint over-approximates the retraction, then a rederive
+// fixpoint re-admits rows that still have alternative support (cycles
+// included). Overdelete is O(affected subgraph); rederive costs one image
+// pass over the surviving relation plus a bounded rederive fixpoint
+// (deeper multi-hop re-admission) — still cheaper than the full recompute
+// it replaces. recompute() is retained for the nonlinear path and as the
+// differential-test oracle for all shapes.
+//
+// Test-only observability hook (Task 1, linear-recursion-deltas): counts
+// PlanRecursiveNode::recompute() invocations process-wide, following the
+// existing g_plan_ir_optimize/g_intraop_shards convention of a directly
+// test-accessible inline atomic rather than adding new SQL surface. Tests
+// read a before/after delta around the mutation under test.
+inline std::atomic<size_t> g_recompute_invocations{0};
+
 class PlanRecursiveNode : public dbsp::Node {
 public:
   using InputFn = std::function<const DuckDBZSet &()>;
@@ -3209,11 +4144,23 @@ public:
                     std::unique_ptr<NativeMaterializedView> step_view,
                     std::string sentinel, bool union_all,
                     std::vector<std::pair<std::string, InputFn>> base_inputs,
-                    size_t max_iterations = 1000)
+                    size_t max_iterations = 1000, bool linear_step = false)
       : dbsp::Node(id, "plan_recursive"), anchor_(std::move(anchor)),
         step_view_(std::move(step_view)), sentinel_(std::move(sentinel)),
         union_all_(union_all), base_inputs_(std::move(base_inputs)),
-        max_iterations_(max_iterations) {}
+        max_iterations_(max_iterations), linear_step_(linear_step) {
+    // Test-only override: DBSP_REC_MAX_ITER lets integration tests force a
+    // small iteration cap so the max_iterations_ fallback (signed path ->
+    // recompute()) can be exercised deterministically without needing a
+    // naturally-deep chain. Read once at construction, not per-step.
+    if (const char *env = std::getenv("DBSP_REC_MAX_ITER")) {
+      char *end = nullptr;
+      unsigned long v = std::strtoul(env, &end, 10);
+      if (end != env && v > 0) {
+        max_iterations_ = v;
+      }
+    }
+  }
 
   void step() override {
     output_.clear();
@@ -3239,9 +4186,13 @@ public:
       base_deltas.emplace_back(table, &d);
     }
 
-    if (has_deletion) {
+    // Linear UNION ALL steps skip the deletion special-case entirely: the
+    // incremental path below is generalized to signed weights and handles
+    // insertions and retractions uniformly (see class-header design note).
+    const bool signed_path = union_all_ && linear_step_;
+    if (has_deletion && !signed_path) {
       if (union_all_) {
-        recompute(); // multiplicity semantics: full recompute (see design)
+        recompute(); // nonlinear multiplicity semantics: full recompute
       } else {
         dred(anchor_delta, base_deltas);
       }
@@ -3249,7 +4200,9 @@ public:
       return;
     }
 
-    // Incremental insert-only path
+    // Incremental path: insert-only (any shape) or signed retractions for
+    // a linear UNION ALL step. Weights carry sign as-is; `admit`'s
+    // union_all_ branch does plain multiset arithmetic on `accumulated_`.
     DuckDBZSet seed = anchor_delta;
     for (const auto &[table, d] : base_deltas) {
       step_view_->apply_changes(table, *d);
@@ -3257,6 +4210,46 @@ public:
         seed.insert(row, w);
       }
     }
+
+    if (has_deletion) {
+      // Signed retraction path (union_all_ && linear_step_, guaranteed by
+      // the guard above). Snapshot first: a max_iterations_ trip OR any
+      // exception during admission/iteration must recover to the pre-delta
+      // state and fall back to recompute() — never emit a partial delta
+      // (Rule 12) — the same shape as dred()'s recovery guard. Never taken
+      // on the pre-existing insert-only path below, so ordinary edits pay
+      // no extra copy.
+      DuckDBZSet accumulated_snapshot = accumulated_;
+      DuckDBZSet output_snapshot = output_;
+      bool converged = false;
+      bool threw = false;
+      try {
+        DuckDBZSet frontier;
+        for (const auto &[row, w] : seed) {
+          if (w != 0) {
+            admit(row, w, frontier, output_);
+          }
+        }
+        converged = iterate(frontier, output_);
+      } catch (...) {
+        threw = true;
+      }
+      if (threw || !converged) {
+        accumulated_ = std::move(accumulated_snapshot);
+        output_ = std::move(output_snapshot);
+        recompute();
+        if (std::getenv("DBSP_DEBUG_SYNC")) {
+          std::cerr << "[dbsp] recursive: linear signed path "
+                    << (threw ? "threw" : "hit max_iterations_")
+                    << ", falling back to recompute()\n";
+        }
+      }
+      has_output_ = !output_.empty();
+      return;
+    }
+
+    // Pre-existing insert-only path (any shape, including nonlinear/UNION
+    // recursion when this delta happens to carry no deletion): unchanged.
     DuckDBZSet frontier;
     for (const auto &[row, w] : seed) {
       if (w > 0) {
@@ -3280,10 +4273,152 @@ public:
 
   const DuckDBZSet &output() const { return output_; }
 
+  void clear_output() override {
+    output_.clear();
+    has_output_ = false;
+  }
+
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    out.recursion += acct.zset_bytes(accumulated_);
+    out.other += acct.zset_bytes(output_);
+    StateBytes tmp;
+    step_view_->account_state(tmp, acct); // step circuit's own state
+    out.recursion += tmp.total();
+  }
+
+  // Checkpointing (Task 1, restore-tail): SERIALIZABLE iff union_all_ —
+  // UNION (set-semantics) recursion's DRed support_/dred bookkeeping is not
+  // captured this pass, so it stays UNSUPPORTED, the same decline
+  // discipline as every other unbuilt shape — AND the nested step circuit
+  // is itself wholly checkpointable (PlannedCircuitView::checkpointable(),
+  // the same gate save_checkpoint() already applies to every top-level
+  // view; a step containing e.g. a spilled join or any other UNSUPPORTED
+  // node declines here too). This is independent of linear_step_: the
+  // fallback recompute() path (taken for a max_iterations_ trip, any
+  // exception during signed admission, or any deletion on a NONLINEAR
+  // union_all step) rebuilds entirely from anchor_total_/base_totals_ +
+  // step_view_->reset(), so a restored node resumes correctly there
+  // whether or not the step is linear — only the SIGNED retraction path
+  // additionally needs linear_step_, and that gate is unchanged, evaluated
+  // at runtime per commit inside step().
+  StateKind state_kind() const override {
+    if (!union_all_) {
+      return StateKind::UNSUPPORTED;
+    }
+    return step_view_->checkpointable() ? StateKind::SERIALIZABLE
+                                        : StateKind::UNSUPPORTED;
+  }
+
+  // serialize_state/restore_state carry exactly what step()/recompute()
+  // read to resume:
+  //   - accumulated_: the integrated fixed-point result. Its content is
+  //     identical to this node's own materialized output (== the outer
+  //     view's get_result() at save time, restored separately at the view
+  //     level), so recompute()'s diff-against-old-accumulated is correct on
+  //     the first post-restore call, and admit()'s union_all_ branch keeps
+  //     accumulating into the SAME running total future commits expect.
+  //   - anchor_total_ / base_totals_: the running integrated totals
+  //     recompute() reseeds its whole-fixpoint rebuild from, and that every
+  //     future step() (either path) keeps accumulating into regardless of
+  //     shape — needed so a recompute() several commits after restore still
+  //     integrates the FULL history, not just what changed post-restore.
+  //   - step_view_'s own per-node state (equi-key indexes / group state —
+  //     whatever its apply_changes' incremental maintenance needs to
+  //     resume), via its EXISTING serialize_circuit_state/
+  //     restore_circuit_state, embedded here as a length-prefixed sub-blob
+  //     keyed by inner node id. state_kind() only reports SERIALIZABLE when
+  //     step_view_->checkpointable(), so serialize_circuit_state cannot
+  //     decline when this runs.
+  // Excluded, and why: output_/has_output_ (checkpoints are taken
+  // quiescent — no pending delta to resume, same convention SourceNode and
+  // every other checkpointed node already follow); anchor_/step_view_'s
+  // object identity/sentinel_/union_all_/base_inputs_/max_iterations_/
+  // linear_step_ (view-definition-derived construction-time configuration,
+  // not data — rebuilt fresh by the normal cold-construction path that
+  // always runs BEFORE restore_state() is ever called, per
+  // restore_view_state's contract, and separately guarded by the
+  // checkpoint's SQL fingerprint against a changed definition);
+  // g_recompute_invocations (a process-wide test-only counter, not node
+  // state at all).
+  void serialize_state(std::vector<uint8_t> &out) const override {
+    BlobWriter w;
+    auto write_zset = [&w](const DuckDBZSet &z) {
+      w.u64(z.size());
+      for (const auto &[row, weight] : z) {
+        w.row(row.columns);
+        w.i64(weight);
+      }
+    };
+    write_zset(accumulated_);
+    write_zset(anchor_total_);
+    w.u64(base_totals_.size());
+    for (const auto &[table, total] : base_totals_) {
+      w.row(std::vector<duckdb::Value>{duckdb::Value(table)});
+      write_zset(total);
+    }
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> inner;
+    step_view_->serialize_circuit_state(inner);
+    w.u64(inner.size());
+    for (const auto &[node_id, blob] : inner) {
+      w.u64(node_id);
+      w.row(std::vector<duckdb::Value>{
+          duckdb::Value::BLOB(blob.data(), blob.size())});
+    }
+    out = w.take();
+  }
+
+  bool restore_state(const uint8_t *data, size_t len) override {
+    try {
+      BlobReader r(data, len);
+      auto read_zset = [&r](DuckDBZSet &z) {
+        z.clear();
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row = r.hashed_row();
+          const int64_t weight = r.i64();
+          z.insert(row, weight);
+        }
+      };
+      read_zset(accumulated_);
+      read_zset(anchor_total_);
+      base_totals_.clear();
+      const uint64_t n_tables = r.u64();
+      for (uint64_t i = 0; i < n_tables; i++) {
+        auto key = r.row();
+        if (key.size() != 1) {
+          return false;
+        }
+        const std::string table = duckdb::StringValue::Get(key[0]);
+        DuckDBZSet total;
+        read_zset(total);
+        base_totals_.emplace(table, std::move(total));
+      }
+      std::unordered_map<uint64_t, std::vector<uint8_t>> inner_blobs;
+      const uint64_t n_inner = r.u64();
+      for (uint64_t i = 0; i < n_inner; i++) {
+        const uint64_t node_id = r.u64();
+        auto blob_val = r.row();
+        if (blob_val.size() != 1) {
+          return false;
+        }
+        const auto &bytes = duckdb::StringValue::Get(blob_val[0]);
+        inner_blobs.emplace(node_id,
+                            std::vector<uint8_t>(bytes.begin(), bytes.end()));
+      }
+      if (!step_view_->restore_circuit_state(inner_blobs)) {
+        return false;
+      }
+      return r.done();
+    } catch (...) {
+      return false;
+    }
+  }
+
 private:
   // Re-run the whole fixed point from integrated inputs; output_ becomes
   // the diff against the previous accumulated state
   void recompute() {
+    g_recompute_invocations.fetch_add(1, std::memory_order_relaxed);
     DuckDBZSet old_accumulated = std::move(accumulated_);
     accumulated_ = DuckDBZSet();
     step_view_->reset();
@@ -3450,27 +4585,51 @@ private:
     }
   }
 
-  void iterate(DuckDBZSet &frontier, DuckDBZSet &out) {
+  // Push `frontier` through step_view_ to a fixed point, admitting each
+  // round's output into `out`. Weights carry sign as-is: the only caller
+  // that ever passes a negative-weight frontier is step()'s linear signed
+  // path (recompute()'s seed is always non-negative — see recompute() —
+  // and dred() runs its own inline loops, never this one), so loosening
+  // the old `w > 0` filter to `w != 0` is a no-op for every pre-existing
+  // caller and is what makes retractions propagate here. Returns whether
+  // the frontier converged (emptied) before max_iterations_; false means
+  // the caller must discard this attempt's admissions and recover.
+  bool iterate(DuckDBZSet &frontier, DuckDBZSet &out) {
     size_t iter = 0;
     while (!frontier.empty() && iter++ < max_iterations_) {
       step_view_->apply_changes(sentinel_, frontier);
       DuckDBZSet next;
       for (const auto &[row, w] : step_view_->get_delta()) {
-        if (w > 0) {
+        if (w != 0) {
           admit(row, w, next, out);
         }
       }
       frontier = std::move(next);
     }
+    return frontier.empty();
   }
 
+  // Plain multiset weight arithmetic for union_all_: accumulated_/out/
+  // frontier all take the signed weight as-is. ZSet::insert erases an
+  // entry whose running weight nets to zero, so a row retracted to zero
+  // and later re-derived within the same iterate() call correctly nets
+  // out to "no change" in `out` — the same net-weight definition
+  // recompute()'s diff uses (see recompute()). Set semantics (else branch)
+  // is explicitly guarded on w > 0 below — see that branch's comment.
   void admit(const DuckDBRow &row, int64_t w, DuckDBZSet &frontier,
              DuckDBZSet &out) {
     if (union_all_) {
       accumulated_.insert(row, w);
       out.insert(row, w);
       frontier.insert(row, w);
-    } else if (accumulated_.get(row) == 0) {
+    } else if (w > 0 && accumulated_.get(row) == 0) {
+      // Set semantics never admit on a negative w (a retraction reaching
+      // here would otherwise be misread as "absent, so admit it"). This
+      // branch is never fed negatives today — has_deletion routes
+      // non-union_all recursion to dred(), which does not call admit() —
+      // but iterate() now passes signed weights through unconditionally
+      // for the union_all_ linear path, so guard explicitly rather than
+      // rely on that invariant holding forever.
       accumulated_.insert(row, 1);
       out.insert(row, 1);
       frontier.insert(row, 1);
@@ -3483,6 +4642,7 @@ private:
   bool union_all_;
   std::vector<std::pair<std::string, InputFn>> base_inputs_;
   size_t max_iterations_;
+  bool linear_step_;
   DuckDBZSet accumulated_;
   DuckDBZSet anchor_total_;                            // ∫ anchor deltas
   std::unordered_map<std::string, DuckDBZSet> base_totals_; // ∫ per table
@@ -3521,7 +4681,47 @@ public:
       it->second->push_borrowed(changes);
     }
     circuit_.step();
+    trim_outputs();
     ++version_;
+  }
+
+  // One commit, one step: push EVERY updated source's delta before
+  // stepping, so a join fed by two same-pass sources (sibling MVs over one
+  // base table) sees both sides in a single bilinear step — that is where
+  // PlanJoinNode's both-shared −Δl⋈Δr correction fires. Sequential
+  // per-source applies would overcount Δl⋈Δr and strand stale rows.
+  void apply_changes_batch(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>> &changes)
+      override {
+    batched_ = false; // sink delta covers the whole step
+    for (const auto &[src, delta] : changes) {
+      auto it = sources_.find(src);
+      if (it != sources_.end()) {
+        it->second->push_borrowed(*delta);
+      }
+    }
+    circuit_.step();
+    trim_outputs();
+    ++version_;
+  }
+
+  // Bounded-RAM Phase 1a: the sink owns its delta copy, so every other
+  // node's output buffer is transient — drop them after each step. The
+  // last step's outputs (initial population at worst) used to stay
+  // resident for the view's lifetime: 11.4GB of a 23GB wfp footprint.
+  void trim_outputs() {
+    circuit_.for_each_node([this](dbsp::Node &n) {
+      if (&n != static_cast<const dbsp::Node *>(sink_)) {
+        n.clear_output();
+      }
+    });
+  }
+
+  void drop_delta() override { sink_->drop_delta(); }
+
+  bool set_table_backed() override {
+    sink_->set_table_backed();
+    return true;
   }
 
   const DuckDBZSet &get_result() const override {
@@ -3535,6 +4735,12 @@ public:
 
   const DuckDBZSet &get_delta() const override { return sink_->delta(); }
 
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    NativeMaterializedView::account_state(out, acct); // sink result + delta
+    circuit_.for_each_node(
+        [&](const dbsp::Node &n) { n.account_state(out, acct); });
+  }
+
   const TableSchema &result_schema() const override { return schema_; }
 
   std::vector<std::string> source_tables() const override {
@@ -3546,8 +4752,9 @@ public:
 
   // --- Circuit-state checkpointing (D3b) -------------------------------
   // Same contract as SingleSourceCircuitView: a view is checkpointable iff
-  // no node is UNSUPPORTED (value-collecting aggregates, outer/mark joins,
-  // spilled state). D3b shipped the node-level serialize/restore hooks on
+  // no node is UNSUPPORTED (value-collecting aggregates, FULL/MARK joins,
+  // spilled state — INNER/LEFT/RIGHT joins serialize, see PlanJoinNode::
+  // state_kind()). D3b shipped the node-level serialize/restore hooks on
   // PlanAggNode/PlanJoinNode but never overrode these on PlannedCircuitView,
   // so planner-built views (every join/aggregate view since C5) silently
   // fell back to rebuild-by-replay and dbsp_save() wrote no circuit rows.
@@ -3659,6 +4866,57 @@ private:
     }
   }
 
+  // Linearity scan over a recursive step's PlanOpSpec subtree. Deliberately
+  // separate from count_sources()/source_refs_ (that walk covers the WHOLE
+  // plan, used for arrangement sharing) and from step_view->source_tables()
+  // (deduped — one entry per distinct table regardless of ref count):
+  // neither gives a ref count scoped to one step subtree.
+  struct StepLinearity {
+    size_t sentinel_refs = 0;
+    bool has_weight_nonlinear_op = false;
+  };
+
+  // Counts SOURCE nodes whose table equals `sentinel` (how many times the
+  // step references its own working relation) AND flags any operator whose
+  // per-row output isn't a linear (weight-preserving-per-row) function of
+  // its input — AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/SORT_LIMIT all
+  // collapse or reorder rows in ways that do NOT distribute over
+  // step(R+δ) = step(R) + step(δ), even when the sentinel is referenced
+  // exactly once. SET_OP is the same class UNLESS it is itself UNION_ALL
+  // (a plain per-branch sum, see PlanSetOpNode::multiplicity's UNION_ALL
+  // case): UNION/INTERSECT[_ALL]/EXCEPT[_ALL] compute min/clamped-
+  // indicator/max(a-b,0) of the per-branch counts, which is nonlinear.
+  // The planner currently accepts these shapes inside a recursive step and
+  // they are already wrong on every existing path (pre-existing, out of
+  // scope here) — this scan only prevents the new signed-delta path from
+  // ALSO claiming linearity for them.
+  static void scan_step_linearity(const PlanOpSpec &spec,
+                                  const std::string &sentinel,
+                                  StepLinearity &info) {
+    if (spec.kind == PlanOpSpec::Kind::SOURCE && spec.table == sentinel) {
+      info.sentinel_refs++;
+    }
+    switch (spec.kind) {
+    case PlanOpSpec::Kind::AGGREGATE:
+    case PlanOpSpec::Kind::DISTINCT:
+    case PlanOpSpec::Kind::DISTINCT_ON:
+    case PlanOpSpec::Kind::WINDOW:
+    case PlanOpSpec::Kind::SORT_LIMIT:
+      info.has_weight_nonlinear_op = true;
+      break;
+    case PlanOpSpec::Kind::SET_OP:
+      if (spec.set_op != PlanOpSpec::SetOp::UNION_ALL) {
+        info.has_weight_nonlinear_op = true;
+      }
+      break;
+    default:
+      break;
+    }
+    for (const auto &child : spec.children) {
+      scan_step_linearity(*child, sentinel, info);
+    }
+  }
+
   // v1 eligibility: side is a bare SOURCE referenced exactly once in the
   // whole plan (so init replay can skip that table wholesale) and no more
   // than one side per join shares (keeps init = plain local-side replay).
@@ -3692,6 +4950,15 @@ private:
       }
       return nullptr;
     };
+    // Bounded-RAM Phase 2 NOTE (attempted, reverted): letting a
+    // self-padding LEFT side share looked cheap — reconcile_pads and
+    // side_index already read shared_left_ — but init is ORDER-DEPENDENT:
+    // with the arrangement backfilled at registration and the left replay
+    // not skipped, a source replayed before the left table double-counts
+    // matches (L_full⋈Δr now, Δl⋈R again later), and with the replay
+    // skipped the pads are never emitted. A correct version needs an
+    // explicit init-pads pass in the join node (emit pads for unmatched
+    // shared-left rows after init) — tracked in the bounded-RAM spec.
     auto eligible = [&](size_t child) {
       const PlanOpSpec *src = scan_of(*spec.children[child]);
       return src && source_refs_[src->table] == 1 &&
@@ -4022,6 +5289,14 @@ private:
       OutputFn anchor = build(*spec.children[0], keep_alive);
       std::string sentinel =
           "__rec_cte_" + std::to_string(spec.cte_index) + "__";
+      // Linearity: the recursive relation referenced exactly once in the
+      // STEP subtree only (children[1]; the anchor doesn't recurse), AND no
+      // weight-nonlinear operator (AGGREGATE/DISTINCT/DISTINCT_ON/WINDOW/
+      // SORT_LIMIT/non-UNION-ALL SET_OP) anywhere in that subtree.
+      StepLinearity step_linearity;
+      scan_step_linearity(*spec.children[1], sentinel, step_linearity);
+      bool linear_step = step_linearity.sentinel_refs == 1 &&
+                         !step_linearity.has_weight_nonlinear_op;
       TableSchema step_schema;
       step_schema.table_name = name_ + "_rec_step";
       auto step_view = std::make_unique<PlannedCircuitView>(
@@ -4044,7 +5319,8 @@ private:
       bool union_all = spec.set_op == PlanOpSpec::SetOp::UNION_ALL;
       auto *node = circuit_.add_node(std::make_unique<PlanRecursiveNode>(
           circuit_.next_node_id(), std::move(anchor), std::move(step_view),
-          sentinel, union_all, std::move(base_inputs)));
+          sentinel, union_all, std::move(base_inputs),
+          /*max_iterations=*/1000, linear_step));
       return [node]() -> const DuckDBZSet & { return node->output(); };
     }
     case PlanOpSpec::Kind::SORT_LIMIT: {
@@ -5131,8 +6407,11 @@ private:
           expr.Cast<duckdb::BoundReferenceExpression>().Index());
     }
 
-    // Extract a constant int64; false if not a non-NULL constant
-    static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
+    // Extract a constant int64 from a bare BOUND_CONSTANT; false otherwise.
+    // No BOUND_CAST unwrapping -- see constant_int() below for why that
+    // matters.
+    static bool bare_constant_int(const duckdb::Expression &expr,
+                                  int64_t &out) {
       if (expr.GetExpressionClass() !=
           duckdb::ExpressionClass::BOUND_CONSTANT) {
         return false;
@@ -5143,6 +6422,35 @@ private:
       }
       out = val.GetValue<int64_t>();
       return true;
+    }
+
+    // Extract a constant int64; false if not a non-NULL constant. The
+    // binder wraps frame/offset literals in a BOUND_CAST shell (e.g.
+    // `11 PRECEDING` arrives as CAST(11 AS BIGINT)), so unwrap any chain of
+    // BOUND_CAST nodes before checking for BOUND_CONSTANT underneath.
+    //
+    // Used for window frame bounds (start_expr/end_expr), LAG/LEAD offsets,
+    // and -- as of the lazy-restore-ntile fix -- NTILE's bucket count:
+    // NativeWindowView's NTILE bucket-boundary math (both render call
+    // sites in include/dbsp_window_view.hpp) was rewritten to match stock
+    // DuckDB's WindowNtileExecutor first, so widening the gate here no
+    // longer ships a silently-wrong result. NTH_VALUE's N deliberately
+    // keeps using bare_constant_int (unchanged, still gated): reading its
+    // render logic found it always indexes the N-th row of the whole
+    // PARTITION, ignoring the window's frame bounds entirely -- diverges
+    // from stock DuckDB's frame-relative NTH_VALUE whenever the frame is
+    // narrower than the full partition (the common case, since the
+    // default frame is RANGE UNBOUNDED PRECEDING AND CURRENT ROW).
+    // Widening NTH_VALUE's gate needs that fixed first. See
+    // docs/superpowers/plans/2026-07-31-lazy-restore-ntile.md Task 2 and
+    // TODO.md.
+    static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
+      const duckdb::Expression *cur = &expr;
+      while (duckdb::BoundCastExpression::IsCast(*cur)) {
+        cur = &duckdb::BoundCastExpression::Child(
+            cur->Cast<duckdb::BoundFunctionExpression>());
+      }
+      return bare_constant_int(*cur, out);
     }
 
     SpecPtr visit_window(duckdb::LogicalWindow &op) {
@@ -5274,7 +6582,8 @@ private:
           }
           def.arg_column_idx = resolve_col(*w.GetChildren()[0]);
           if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
-            if (w.GetChildren().size() < 2 || !constant_int(*w.GetChildren()[1], n)) {
+            if (w.GetChildren().size() < 2 ||
+                !bare_constant_int(*w.GetChildren()[1], n)) {
               return unsupported("NTH_VALUE with non-constant N");
             }
             def.offset = static_cast<int>(n);

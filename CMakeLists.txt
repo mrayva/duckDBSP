@@ -6,7 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(TARGET_NAME dbsp)
 set(EXT_VERSION_DBSP "0.1.0")
-option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" OFF)
+# The duckdb/ submodule tracks current DuckDB main (bumped regularly), so
+# the tip compatibility path is the only one the submodule pin actually
+# supports; pass -DDBSP_TIP_PORT=OFF only against a separately checked-out
+# pre-tip DuckDB tree (e.g. an old release branch).
+option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
 option(DBSP_USE_PARENT_DUCKDB
        "Use DuckDB targets from the containing extension build" OFF)
 
@@ -48,11 +52,14 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
 )
 
-# SaaS-fork engine hook consumer. ON requires the patched submodule
-# (patches/v1.5.4-dbsp-txn-callback.patch applied to duckdb/). Pass
-# -DDBSP_ENGINE_HOOK=OFF to build against a stock v1.5.4 tree (capture
-# stack does the work instead).
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
+# SaaS-fork engine hook consumer. Requires the patched engine
+# (patches/v1.5.4-dbsp-txn-callback.patch applied to a v1.5.4-era duckdb/
+# tree) — the duckdb::TransactionModifications/TransactionModificationCallback
+# types it consumes don't exist in stock DuckDB. Since the submodule pin now
+# tracks current tip (unpatched, and the patch predates the tip API moves),
+# this defaults OFF; the capture stack does the work instead. Pass
+# -DDBSP_ENGINE_HOOK=ON only against a separately patched v1.5.4-era tree.
+option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" OFF)
 if(DBSP_ENGINE_HOOK)
     target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_ENGINE_HOOK)
 endif()

@@ -136,9 +136,13 @@ by the circuit-IR optimizer, and built into circuit nodes; bound expressions
 are evaluated row-at-a-time through `ExpressionExecutor`.
 
 Because materialized views are not in DuckDB's catalog, views-on-views are
-bound by shadowing every existing MV as an empty TEMP table on the internal
+bound by shadowing referenced MVs as empty TEMP tables on the internal
 connection during plan extraction (the temp schema shadows main, matching
-CDC's own views-before-tables resolution order).
+CDC's own views-before-tables resolution order). Only views whose names
+appear in the SQL text are shadowed — shadowing all N existing views made
+DAG creation O(N^2) in catalog work. `CREATE MATERIALIZED VIEW` statements
+are classified READ by the commit hook (they only read tracked tables), so
+view creation never triggers a tracked-table scan-diff.
 
 `PlannedCircuitView` builds a multi-source operator tree (one shared
 SourceNode per base table) covering:
@@ -180,9 +184,12 @@ SourceNode per base table) covering:
   recursive steps supported. Insert-only deltas maintain incrementally;
   deltas with deletions on UNION (set-semantics) recursion take the
   incremental DRed (Delete-Rederive) path (overdelete + rederive
-  fixpoints); UNION ALL recursion still falls back to a full fixed-point
-  recompute (weighted deletion in a cycle is ill-defined) (C2, hardening;
-  DRed, 2026-07-07)
+  fixpoints); a **linear** UNION ALL step (the recursive relation
+  referenced exactly once) rides the same incremental fixpoint with
+  signed weights instead — only a **nonlinear** UNION ALL step (referenced
+  ≥2 times) still falls back to a full fixed-point recompute (weighted
+  deletion through a self-join doesn't distribute) (C2, hardening; DRed,
+  2026-07-07; linear signed deltas, 2026-07-31)
 - DISTINCT ON — `NativeDistinctOnView` behind an `EmbeddedViewNode`;
   winner-pick order comes from the DISTINCT node's own order modifier (C3)
 
@@ -237,26 +244,50 @@ delta plus the step's reaction to base-table deltas, then iterates:
 
 UNION dedup state persists across deltas, so a row that becomes reachable
 again later is not double-counted. Deltas containing deletions take one of
-two paths depending on recursion semantics:
+three paths depending on recursion semantics:
 
+- **Linear UNION ALL recursion** (the recursive relation referenced exactly
+  once in the step subtree — `linear_step_`, detected at build time by
+  scanning the step's `PlanOpSpec` for sentinel-table `SOURCE` refs) — the
+  step is linear in the recursive relation: `step(R + δ) = step(R) +
+  step(δ)`. Retraction-bearing deltas therefore skip the deletion
+  special-case entirely and ride the *same* incremental fixpoint as
+  insertions, just with signed weights: `admit`'s UNION ALL branch does
+  plain multiset arithmetic on `accumulated_` (add the signed weight; a row
+  whose running weight nets to zero is erased, exactly like ordinary
+  `ZSet::insert`), and `iterate` pushes signed frontiers through
+  `step_view_` unchanged (join/filter/project are all weight-linear). A
+  `max_iterations_` trip, or any exception during admission/iteration,
+  discards the attempt (restoring `accumulated_`/`output_` from a
+  pre-admission snapshot) and falls back to `recompute()` — logged under
+  `DBSP_DEBUG_SYNC` — rather than emit a partial delta. The same scan also
+  vetoes `linear_step_` when the step subtree contains `AGGREGATE`,
+  `DISTINCT`, `DISTINCT_ON`, `WINDOW`, `SORT_LIMIT`, or non-`UNION ALL`
+  `SET_OP` — even with exactly one sentinel ref, these operators collapse or
+  reorder rows and are not weight-linear, so they cannot ride the signed path
+  (the planner still accepts these shapes inside a recursive step and they
+  remain pre-existing-wrong on every path — this veto only stops the signed
+  path from also claiming linearity for them).
 - **UNION (set-semantics) recursion** — the incremental DRed
   (Delete-Rederive) path: an overdelete fixpoint over-approximates the
   retraction from the affected subgraph, then a rederive fixpoint re-admits
   rows that still have alternative support (cycles included) by re-running
   the step over the surviving relation. `dred()` mirrors every
   `accumulated_` mutation to the sentinel source so the two stay in sync.
-- **UNION ALL (multiplicity) recursion** — `recompute()`: a full
+- **Nonlinear UNION ALL recursion** (recursive relation referenced ≥2 times,
+  e.g. a self-join of the working relation) — `recompute()`: a full
   fixed-point recompute from integrated anchor/base state. Weighted
-  deletion in a cycle is ill-defined incrementally, so this path stays
-  non-incremental by design. `recompute()` also serves as the
-  differential-test oracle for DRed.
+  deletion through a self-join doesn't distribute over `+`, so this path
+  stays non-incremental by design. `recompute()` also serves as the
+  differential-test oracle for both the DRed and linear-signed paths.
 
-Both paths emit the diff against the node's previous result.
+All paths emit the diff against the node's previous result.
 
 **Safety**: Maximum iteration limit (default 1000) prevents infinite loops.
 If a DRed overdelete or rederive fixpoint hits that cap before converging,
 `dred()` restores the pre-delta state and falls back to the self-healing
-`recompute()` rather than emit a silently corrupted diff.
+`recompute()` rather than emit a silently corrupted diff — the linear
+signed path's `iterate()` cap trip recovers the same way.
 
 ### 6. CDC Manager (`src/dbsp_cdc.hpp`)
 
@@ -340,8 +371,8 @@ static void LoadInternal(DatabaseInstance &instance) {
          SELECT customer, SUM(amount) FROM orders GROUP BY customer
          │
 2. Planner frontend: DuckDB binds and plans the SQL
-   (Connection::ExtractPlan, optimizer off; existing MVs shadowed as
-   empty TEMP tables so views-on-views bind)
+   (Connection::ExtractPlan, optimizer off; SQL-referenced MVs shadowed
+   as empty TEMP tables so views-on-views bind)
          │
          ▼
    LogicalOperator tree → PlanOpSpec tree {
@@ -383,12 +414,18 @@ static void LoadInternal(DatabaseInstance &instance) {
    ┌─────┴─────┐
    │           │
    ▼           ▼
-   filter_view.apply_changes('orders', Δorders)
-   totals_view.apply_changes('orders', Δorders)
+   filter_view.apply_changes_batch({'orders': Δorders})
+   totals_view.apply_changes_batch({'orders': Δorders})
          │
          ▼
-   vip_totals.apply_changes('totals', Δtotals)
+   vip_totals.apply_changes_batch({'totals': Δtotals})
 ```
+
+A view fed by SEVERAL sources updated in the same pass (e.g. a join of
+two sibling views over one base table) receives all of their deltas in
+ONE `apply_changes_batch` call = one circuit step — required for the
+join's both-shared bilinear correction (−Δl⋈Δr) to fire. Per-source
+sequential applies would overcount Δl⋈Δr and strand stale rows.
 
 ### Incremental Aggregation Example
 
@@ -434,11 +471,113 @@ State after:
 - All data stored in-memory
 - No automatic eviction or bounds
 - Persistence saves definitions plus (D3b) a circuit-state checkpoint for
-  supported views: aggregate group scalars, private INNER-join indexes,
-  and sink results, watermarked by source COUNT + bit_xor(hash(row))
+  supported views: aggregate group scalars plus (Task 2, cold/restore
+  attack) the per-group values multiset for plain non-DISTINCT MIN/MAX,
+  private INNER/LEFT/RIGHT-join indexes plus (LEFT/RIGHT) their pad
+  bookkeeping, sink results, (Task 1, restore-tail) `WITH RECURSIVE`
+  fixed-point state for UNION ALL recursion whose step is itself wholly
+  checkpointable — the integrated `accumulated_`/`anchor_total_`/
+  `base_totals_` totals plus the step's own nested circuit-node state
+  (embedded sub-blob) — and (Task 2, restore-tail) a `NativeWindowView`
+  embedded behind `EmbeddedViewNode` (the WINDOW plan shape): each
+  partition's ordered source rows plus its rendered-output cache
+  (`partitions_`/`partition_outputs_`), sized however that partition
+  currently is — watermarked by source COUNT + bit_xor(hash(row)).
+  `EmbeddedViewNode` reports whatever its wrapped view reports
+  (`NativeMaterializedView::circuit_state_kind()`), so a `NativeSortView`/
+  `NativeLimitView`/`NativeDistinctOnView` behind the same wrapper (the
+  SORT_LIMIT/DISTINCT_ON plan shapes) still declines. DISTINCT and
+  holistic/ordered aggregates (MEDIAN, QUANTILE_*, MODE, MAD, STRING_AGG,
+  ARRAY_AGG, FIRST), FULL (OUTER) and MARK joins, spilled join/aggregate
+  state, UNION (set-semantics) recursion, a UNION ALL recursive step
+  containing any other UNSUPPORTED node, and sort/limit/distinct-on
+  embedded views stay UNSUPPORTED (rebuild-by-replay).
 - On load, checkpointed views restore without circuit replay when the
-  watermarks still match; everything else is rebuilt from current table
-  data
+  watermarks still match. Watermark validity is **per table** (O(delta)
+  recovery, increment A): a changed table lands in
+  `CkptData.stale_tables`, and only views whose source closure (walked
+  from the persisted `sources` column in `created_at` order) touches a
+  stale table rebuild by replay — every other view keeps its
+  checkpoint. A crash that lost one edit to one table costs a replay of
+  that table's dependents, not the whole DAG
+- **Streaming create mirror** (bounded-RAM Phase 5): with mv tables
+  enabled, `create_view` marks the sink table-backed *before* the
+  initial replay and flushes each replay step's delta straight into the
+  `__mv_` backing table — a view's initial result never integrates in
+  RAM. Companion bounds on the same path: initial baseline population
+  runs through the rebuild flow (never per-row `insert()` into
+  `pending_changes_`), baselines auto-spill above
+  `DBSP_SPILL_THRESHOLD_ROWS` (default 2M) including mid-scan, and
+  `SpilledBaseline::install_rebuild()` swaps a generation in without
+  the diff path's payload read-back. Big-table scans stream
+  pre-serialized row bytes straight off flattened chunk vectors
+  (`serialize_chunk`) — no per-cell `duckdb::Value` on the build path
+- **Durable baselines**: file-backed databases keep spill logs in
+  `<dbfile>.dbsp_spill/`; `dbsp_save` writes a digest-index sidecar
+  under the checkpoint watermark, and a clean reopen's first table
+  touch adopts the log+index pair instead of rescanning the table.
+  Watermark or log-size mismatch rejects the sidecar and rescans
+- **Flat restore layers (tier 2)**: reopen paths never rebuild hash
+  maps. The baseline index sidecar (v2) is digest-sorted and mmap'd
+  read-only (binary-search lookups, mutation overlay on top); packed
+  join checkpoint blobs decode into a contiguous arena + key-sorted
+  directory (`dbsp_flat_packed.hpp`); shared packed arrangements get a
+  fingerprint sidecar written at save and ADOPTED at register over a
+  watermark-verified deferred table (`sharr_*.flat`) — first edit after
+  reopen stops paying a whole-baseline backfill. Serialization folds
+  flat + overlay back into one stream; a dirty save at big-model scale
+  pays the fold
+- **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
+  a watermark-matched load cold-creates the view exactly as before, but
+  instead of decoding its node/sink blobs immediately it stashes the
+  already-read bytes in `CDCManager::pending_restore_` (`name -> {nodes,
+  sink}`) and marks the view pending
+  (`NativeMaterializedView::is_pending_restore()`). `dbsp_load()` returns
+  without paying any per-view decode cost; each view's
+  `realize_pending_view`/`realize_pending_view_locked` decodes on first
+  need — mirrors D3c's `TrackedTable::is_deferred()` +
+  `materialize_deferred_locked` shape (and its locking discipline:
+  `pending_restore_` is guarded by the same `view_mutex_` tier that
+  already owns view content, no new lock level). Realization is wired
+  into every surface that reads a view's live state — `dbsp_query`'s
+  read path (`scan_view`/`query_view`), an incoming delta reaching the
+  view or a pending ancestor of it (`propagate_changes`'s pre-pass, which
+  runs sequentially before any per-level parallel `step_view` work so
+  `pending_restore_`'s single shared map is never touched from more than
+  one thread at a time), a warm `create_view` replay or shared-arrangement
+  backfill reading another view's result as a source, and
+  `dbsp_replace_view`/drop (which discard rather than decode a dropped
+  view's stash). `save_checkpoint` re-saves a still-pending view's stash
+  **verbatim** — valid because "pending" is definitionally "no deltas
+  applied since the stash," so the undecoded bytes are still exactly
+  current. `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
+  behavior (every checkpointed view fully restored during the load call
+  itself).
+- A checkpoint blob format version travels alongside the data (a
+  dedicated `_dbsp_ckpt_version` table); a checkpoint saved under an
+  older layout — or missing the table entirely — is treated as absent
+  rather than misparsed, so a version bump costs at most one
+  rebuild-by-replay on the next load
+- Each checkpointed view also carries a SQL fingerprint (its exact
+  definition at save time). A load compares this against the SQL it is
+  about to use to cold-create the view and declines the checkpoint fast
+  path for that view alone on a mismatch — the guard against a view whose
+  definition changed (e.g. `dbsp_replace_view`) after the checkpoint was
+  written but before the next save landed
+- Blob row values (`BlobWriter`/`BlobReader::row`, `dbsp_checkpoint.hpp`) go
+  through the same typed row codec as spill (`serialize_row`/
+  `deserialize_row`, `dbsp_spill_store.hpp`) — a tag-byte fast path for
+  `INTEGER`/`BIGINT`/`DOUBLE`/`VARCHAR`/`BOOLEAN` and their typed `NULL`s,
+  falling back to DuckDB's `BinarySerializer` for everything else; one
+  codec, no per-checkpoint-site duplication. `BlobReader::hashed_row()`
+  additionally pre-seeds the decoded row's hash cache (`hash_row_fast`,
+  calling the same `duckdb::Hash<T>` primitives `VectorOperations::Hash`
+  uses per element) instead of leaving it for the first hash-map/Z-set
+  insertion to compute lazily via `Value::Hash()` — a restored row becomes
+  a hash-map key immediately (aggregate `states_`, join `Index`/
+  `RowWeights`, the sink `DuckDBZSet`), and the lazy path's per-value
+  temporary-`Vector` cost otherwise dominates restore time (cold/restore
+  attack, Task 3: ~51.5x on a 58k-group aggregate, see CHANGELOG).
 
 ### Lifetime
 

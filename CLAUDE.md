@@ -40,3 +40,17 @@ Never accumulate throwaway files. Rules:
 5. Runtime spill directories are self-cleaning (dbsp_spill(true) sweeps
    directories left by dead processes) — don't add manual cleanup steps
    for them.
+
+## Build Parallelism
+
+Use `make -j 8` (and `cmake --build . -j 8`) for all builds in this repo.
+Never bare `make -j` / `cmake -j` — unbounded parallelism on this tree has
+frozen the machine before. 8 cores / 16GB RAM: if a build starts swapping
+(system stalls, kernel_task churn), drop back to `-j 6` for that build.
+
+## Test Runs
+
+Full `ctest` (from `test/build_test`) is required before every commit that
+touches code (headers, sources, tests, CMake). Doc-only commits (*.md,
+comments-only diffs) may skip it — verify the diff is genuinely doc/comment-
+only (`git diff --stat` + no code lines) before skipping.

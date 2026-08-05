@@ -188,7 +188,10 @@ public:
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
     // reconciliation is impossible incrementally, so views rebuild from
     // committed storage at the next statement boundary (here). Runs even
-    // with auto-sync off (the notify path can schedule it too).
+    // with auto-sync off (the notify path can schedule it too). D-lazy
+    // reuses this same flag/sweep for a corrupt lazy-restored VIEW stash
+    // (realize_pending_view_locked, dbsp_cdc.hpp) — rare either way, same
+    // escape hatch.
     if (manager.rebuild_pending()) {
       try {
         manager.rebuild_all_views(context);
@@ -330,6 +333,18 @@ public:
       capture_ = {};
       return;
     }
+
+    // Auto-persist checkpoint interval (dbsp_autopersist_interval): fires a
+    // piggybacked save_checkpoint() once enough commits have accumulated
+    // (counted by propagate_changes), regardless of which of this
+    // function's several sync paths/early returns below applied. struct_
+    // mutex_ is never held by this thread once TransactionCommit returns,
+    // so it's safe to run save_checkpoint's own locking at that point.
+    struct CheckpointGuard {
+      CDCManager &m;
+      duckdb::ClientContext &ctx;
+      ~CheckpointGuard() { m.maybe_save_checkpoint(ctx); }
+    } checkpoint_guard{manager, context};
 
     try {
       // Engine-hook fast path (SaaS fork): the engine reported this
@@ -565,6 +580,22 @@ private:
       return out;
     }
     out.text = query;
+    // dbsp's own DDL: CREATE MATERIALIZED VIEW only READS tracked tables to
+    // populate the new view — it never writes one. The custom syntax fails
+    // core parsing, so without this carve-out it fell into "unparseable:
+    // assume the worst" → WRITE_UNKNOWN → sync_all, a full scan-diff of
+    // EVERY tracked table on every view creation — O(views × rows) DAG
+    // builds (the residual after the shadow-table fix).
+    {
+      const auto first = query.find_first_not_of(" \t\r\n");
+      if (first != std::string::npos) {
+        const auto head = duckdb::StringUtil::Lower(query.substr(first, 24));
+        if (head == "create materialized view") {
+          out.kind = StmtClass::READ;
+          return out;
+        }
+      }
+    }
 #ifdef DBSP_TIP_PORT
     duckdb::Parser parser;
     try {

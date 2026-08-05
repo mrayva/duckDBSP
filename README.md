@@ -3,7 +3,7 @@
 Real-time incrementally maintained materialized views for DuckDB, based on [Database Stream Processing (DBSP)](https://www.feldera.com/blog/what-is-dbsp) theory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![DuckDB](https://img.shields.io/badge/DuckDB-v1.5.4-blue.svg)](https://duckdb.org/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-tip-blue.svg)](https://duckdb.org/)
 
 ## Overview
 
@@ -26,6 +26,8 @@ DBSP:         INSERT 1 row → Update affected aggregates → O(delta)
   (`... FROM m.orders`); tables are keyed by canonical
   `catalog.schema.table`
 - **Persistence**: Save/restore views across sessions
+- **Auto-persist**: views survive a clean connection reopen with no
+  explicit save/load calls (`dbsp_autopersist`, on by default)
 - **Zero Dependencies**: Pure C++ header-only core library
 - **Bounded Memory**: optional disk-backed state (`dbsp_spill`)
 - **Parallel Updates**: optional multi-core sync, propagation, and join
@@ -117,9 +119,17 @@ See [examples/](examples/) for more comprehensive demos.
 ```
 
 This will:
-1. Download DuckDB source (if not present)
-2. Build the DBSP extension
+1. Initialize the `duckdb/` submodule if not already present (tracks
+   current DuckDB main — bumped regularly, not a fixed release)
+2. Build the DBSP extension against it in tip-compatibility mode (uses
+   `ccache` and Ninja automatically when installed; parallelism capped at
+   `-j 8`)
 3. Output `dbsp.duckdb_extension`
+
+`DBSP_ENGINE_HOOK=1 ./build.sh` instead builds the legacy SaaS-fork path
+against a patched v1.5.4-era engine (`patches/v1.5.4-dbsp-txn-callback.patch`)
+— requires your own patched `duckdb/` checkout; unmaintained against
+current tip and not the primary supported path.
 
 ### Loading the Extension
 
@@ -131,34 +141,28 @@ LOAD '/path/to/dbsp.duckdb_extension';
 
 ### Running Tests
 
-For the pinned release tree:
+Default build/test flow, against the `duckdb/` submodule (current tip):
 
 ```bash
 cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
 cmake --build build -j8
-ctest --test-dir build --output-on-failure
-```
-
-For a current DuckDB tip checkout, use the explicit tip compatibility port:
-
-```bash
-cmake -S . -B build-tip \
-  -DDUCKDB_SOURCE_DIR=/path/to/duckdb \
-  -DDBSP_TIP_PORT=ON \
-  -DDBSP_ENGINE_HOOK=OFF
-cmake --build build-tip -j4
-ctest --test-dir build-tip --output-on-failure -j1 --timeout 120
+ctest --test-dir build --output-on-failure -j1 --timeout 120
 
 # Benchmarks (built but not part of ctest)
-cmake --build build-tip --target bench_planner_eval soak_differential -j4
-build-tip/test/bench_planner_eval
-SOAK_ROUNDS=60 build-tip/test/soak_differential "[soak]"
+cmake --build build --target bench_planner_eval soak_differential -j4
+build/test/bench_planner_eval
+SOAK_ROUNDS=60 build/test/soak_differential "[soak]"
 ```
 
-The supported tip baseline excludes tests tied to DuckDB's removed
-write-capture, optimizer plan-tee, and engine-hook APIs. See
+`DBSP_TIP_PORT`/`DBSP_ENGINE_HOOK` default to the tip-compatible,
+stock-engine configuration (`ON`/`OFF`) since the submodule always tracks
+current DuckDB main. The excluded-on-tip tests (legacy write-capture,
+optimizer plan-tee, engine-hook APIs current DuckDB has removed or
+changed) simply aren't built by default — see
 [docs/TESTING.md](docs/TESTING.md) for the exact boundary and validated
-counts.
+counts. Pass `-DDBSP_TIP_PORT=OFF -DDBSP_ENGINE_HOOK=ON` only against a
+separately checked-out, patched v1.5.4-era DuckDB tree (unmaintained
+legacy path).
 
 ### Test Coverage
 
@@ -191,6 +195,7 @@ See [docs/TESTING.md](docs/TESTING.md) for details.
 | Function | Description |
 |----------|-------------|
 | `dbsp_create_view(name, sql)` | Create view with SQL syntax |
+| `dbsp_replace_view(name, sql)` | Redefine a view, rebuilding only it and its dependents |
 | `dbsp_query(view)` | Query a materialized view |
 | `dbsp_views()` | List all views with stats |
 | `dbsp_drop(view)` | Drop a view |
@@ -211,6 +216,11 @@ views from current table data. Table-form persistence lives in the database
 file, so file copies/backups carry the views. JSON file paths must be
 relative to the working directory — absolute paths are rejected.
 
+`dbsp_save()`/`dbsp_load()` are no longer something a caller has to
+remember: with auto-persist on (the default), a clean connection close
+saves automatically and the next session's first DBSP call loads
+automatically. See `dbsp_autopersist` below.
+
 ### Manual CDC
 
 | Function | Description |
@@ -223,6 +233,9 @@ relative to the working directory — absolute paths are rejected.
 | Function | Description |
 |----------|-------------|
 | `dbsp_auto_sync(bool)` | Toggle automatic sync on commit (default ON; turn off for bulk loads) |
+| `dbsp_autopersist(bool)` | Toggle auto-save-on-close + auto-load-on-reopen (default ON; turn off for bulk loads) |
+| `dbsp_autopersist_interval(n)` | Piggyback a circuit-state checkpoint every `n` commits (default 0 = off) |
+| `dbsp_lazy_restore(bool)` | Toggle lazy per-view checkpoint restore: each view decodes on first need instead of eagerly at load (default ON) |
 | `dbsp_parallel(bool)` | Toggle parallel multi-table sync + same-level view propagation |
 | `dbsp_spill(bool)` | Toggle disk-backed state: baselines, join indexes, top-K windows, big aggregate groups |
 | `dbsp_use_planner([bool])` | No-op since Phase C (planner is the only frontend); kept for script compatibility |
@@ -244,6 +257,8 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 
 **DDL Syntax:**
 - `CREATE MATERIALIZED VIEW name AS SELECT ...`
+- `CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...` - redefine a
+  view, rebuilding only it and its transitive dependents
 - `DROP MATERIALIZED VIEW name [CASCADE]`
 - `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
 
@@ -340,15 +355,15 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Captured autocommit INSERT (1M-row table)** | ~1.0 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
-*Apple M-series, release build (`build`), 100k-row deltas unless
-noted; reproduce with `bench_planner_eval` / `bench_write_capture`.
-Explicit INSERT-only transactions and whitelisted UPDATE/DELETE
-statements (including autocommit) commit O(Δ) via captured deltas; other
-writes pay the scan-and-diff sync (docs/DESIGN_WRITE_CAPTURE.md).*
+*Apple M-series, release build (`build`), 100k-row deltas unless noted;
+reproduce with `bench_planner_eval`.*
 
-Those captured-delta and plan-tee figures describe the pinned release build;
-tip mode falls back to scan-and-diff where the corresponding upstream APIs
-are no longer available.
+The captured-delta and plan-tee rows (commit latencies) describe the
+legacy `DBSP_TIP_PORT=OFF` build against a patched engine — that capture
+stack, and its `bench_write_capture` perf gate, aren't built in the
+default (tip) configuration; tip mode uses scan-and-diff for every write
+(docs/DESIGN_WRITE_CAPTURE.md, docs/TESTING.md). The incremental
+filter/aggregate/join/propagation rows apply to both configurations.
 
 ## Project Structure
 
