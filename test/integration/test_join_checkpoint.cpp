@@ -333,6 +333,16 @@ TEST_CASE("aggregate checkpoint: state_kind gate for MIN/MAX vs "
     // >65536 values under dbsp_spill(true)) cannot be reconstructed from a
     // checkpoint blob — mirrors the join node's exclusion of spilled
     // equi-key indexes (state_kind gate test above).
+    //
+    // Excluded on the tip port: holistic aggregate values deliberately stay
+    // in-memory there (never spill) because the append-backed value log
+    // isn't safe when a rebuild and a render can overlap — see the
+    // DBSP_TIP_PORT guard around the spill trigger in PlanAggregateNode's
+    // MIN/MAX apply path (include/dbsp_plan_translator.hpp). Without a
+    // spill, v_max_spilled never leaves SERIALIZABLE, so the REQUIRE_FALSE
+    // below cannot hold on tip — this is the same intentional compatibility
+    // boundary docs/TESTING.md documents for other tip-incompatible tests.
+#ifndef DBSP_TIP_PORT
     db.exec("CREATE TABLE many (g INTEGER, v INTEGER)");
     db.exec("SELECT * FROM dbsp_track('many')");
     db.exec("SELECT * FROM dbsp_spill(true)");
@@ -342,6 +352,7 @@ TEST_CASE("aggregate checkpoint: state_kind gate for MIN/MAX vs "
     db.exec("SELECT * FROM dbsp_sync('many')");
     REQUIRE_FALSE(db.manager().get_view("v_max_spilled")->checkpointable());
     db.exec("SELECT * FROM dbsp_spill(false)"); // process-global: reset
+#endif
 }
 
 TEST_CASE("aggregate checkpoint: MAX round-trips through save/restore, "

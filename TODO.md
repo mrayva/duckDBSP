@@ -9,6 +9,25 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Not supported (DBSP-E110 at view creation)
 
+- **(DBSP_TIP_PORT only, new as of the Aug 2026 tip bump)** Correlated
+  scalar subqueries whose decorrelated JOIN carries a projection map
+  (`WHERE x > (SELECT AVG(...) FROM ... WHERE correlated)` and similar —
+  see `test/integration/test_planner_frontend.cpp`'s E2 correlated-scalar-
+  subquery and self-correlated-subquery tests, both `#ifdef
+  DBSP_TIP_PORT`-gated to assert the decline). Current DuckDB's optimizer
+  now sometimes folds the projection directly into
+  `LogicalComparisonJoin::left_projection_map` /
+  `right_projection_map` instead of leaving a separate PROJECTION operator
+  above a full-width join. `visit_join` (dbsp_plan_translator.hpp) always
+  builds output columns as "left columns then right columns" in full — it
+  doesn't remap through the projection maps — so it declines rather than
+  risk a parent node reading the wrong output column. Fix: after building
+  `left_columns`/right `columns`, select/reorder through
+  `op.left_projection_map`/`op.right_projection_map` when non-empty (and
+  audit whether any downstream PlanJoinNode row-assembly code assumes the
+  unprojected full-width layout). Was passing under the tip snapshot
+  validated Jul 25 2026 — regressed with DuckDB's continued evolution
+  since.
 - WITH RECURSIVE ... USING KEY
 - Non-constant (expression) LIMIT — constant and percentage forms work
 - approx_quantile / reservoir_quantile / approx_top_k (approximate
