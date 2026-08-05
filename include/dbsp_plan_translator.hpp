@@ -6446,8 +6446,9 @@ private:
     // TODO.md.
     static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
       const duckdb::Expression *cur = &expr;
-      while (cur->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-        cur = cur->Cast<duckdb::BoundCastExpression>().child.get();
+      while (duckdb::BoundCastExpression::IsCast(*cur)) {
+        cur = &duckdb::BoundCastExpression::Child(
+            cur->Cast<duckdb::BoundFunctionExpression>());
       }
       return bare_constant_int(*cur, out);
     }

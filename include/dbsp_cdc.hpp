@@ -3514,7 +3514,7 @@ private:
 
   void mv_append_rows(duckdb::Connection &con, const std::string &table,
                       const DuckDBZSet &rows, bool with_weight) {
-    duckdb::Appender appender(con, table);
+    duckdb::Appender appender(con, duckdb::Identifier(table));
     for (const auto &[row, w] : rows) {
       const int64_t copies = with_weight ? 1 : w;
       for (int64_t k = 0; k < copies; k++) {

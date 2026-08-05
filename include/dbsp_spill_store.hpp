@@ -202,7 +202,7 @@ serialize_chunk(duckdb::DataChunk &chunk,
     uint8_t tag;
     uint8_t type_id;
     const void *data;
-    duckdb::ValidityMask *validity;
+    const duckdb::ValidityMask *validity;
   };
   std::vector<Col> cols(ncols);
   for (duckdb::idx_t c = 0; c < ncols; c++) {
