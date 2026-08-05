@@ -27,14 +27,16 @@ endif()
 # root (cmake -S test -B test/build_test), where the root option() never runs.
 option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
 
-# SaaS-fork engine hook consumer (see root CMakeLists.txt). ON requires the
-# patched submodule; OFF = stock-mode build (hook test excluded).
-# Deliberately NOT a global compile definition: the hook-active flag is
-# process-sticky, so defining it everywhere would stop the plan-tee and
-# write-capture tests from exercising the legacy capture paths. Only the
-# dedicated consumer test builds with the define (see below); every other
-# binary keeps testing the stock-mode stack.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
+# SaaS-fork engine hook consumer (see root CMakeLists.txt). Requires a
+# separately patched v1.5.4-era submodule — the current tip-tracking
+# submodule is unpatched, so this defaults OFF (hook test excluded; the
+# stock-mode capture stack does the work instead).
+# Deliberately NOT a global compile definition when ON: the hook-active
+# flag is process-sticky, so defining it everywhere would stop the plan-tee
+# and write-capture tests from exercising the legacy capture paths. Only
+# the dedicated consumer test builds with the define (see below); every
+# other binary keeps testing the stock-mode stack.
+option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" OFF)
 
 # Include directories
 include_directories(
