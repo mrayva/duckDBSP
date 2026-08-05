@@ -54,9 +54,16 @@ jobs:
         working-directory: test/build_test
         run: ctest --output-on-failure
 
-      # Perf gates (assert-bearing benches; throughput prints land in logs)
+      # Perf gates (assert-bearing benches; throughput prints land in logs).
+      # bench_write_capture only builds with DBSP_TIP_PORT=OFF (see
+      # test/CMakeLists.txt) — its assertions are specific to the legacy
+      # captured-write fast path, unavailable on tip by design.
       - name: Bench gates
         working-directory: test/build_test
         run: |
           ./bench_dataplane
-          ./bench_write_capture
+          if [ -f ./bench_write_capture ]; then
+            ./bench_write_capture
+          else
+            echo "skipped: bench_write_capture not built (DBSP_TIP_PORT=ON)"
+          fi

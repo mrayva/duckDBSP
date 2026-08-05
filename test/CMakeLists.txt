@@ -174,18 +174,22 @@ endif()
 add_test(NAME planner_eval_smoke
          COMMAND bench_planner_eval "[planner_eval],[shard_bench]")
 
-# Write-capture perf gate (run manually: ./bench_write_capture)
-add_executable(bench_write_capture
-    benchmarks/bench_write_capture.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
-target_link_libraries(bench_write_capture catch2_main duckdb_static
-                      duckdb_generated_extension_loader
-                      core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(bench_write_capture PRIVATE DBSP_TIP_PORT)
+# Write-capture perf gate (run manually: ./bench_write_capture). Asserts
+# manager.captured_delta_syncs() advances on UPDATE/DELETE/autocommit
+# INSERT — the legacy O(delta) captured-write fast path (dbsp_write_capture.
+# hpp), unavailable on tip (scan-and-diff takes over there instead, see
+# docs/TESTING.md). Not built under DBSP_TIP_PORT: its assertions can never
+# pass there by design, not because of a regression.
+if(NOT DBSP_TIP_PORT)
+    add_executable(bench_write_capture
+        benchmarks/bench_write_capture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
+    target_link_libraries(bench_write_capture catch2_main duckdb_static
+                          duckdb_generated_extension_loader
+                          core_functions_extension parquet_extension)
 endif()
 
 # Window-delta throughput gate (in ctest: window_bench asserts O(affected))
