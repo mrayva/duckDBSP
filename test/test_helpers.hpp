@@ -6,6 +6,7 @@
 #include "dbsp_duckdb_types.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "verify_vectors.hpp"
 
 // Forward declaration for extension entry point (extern "C" matches
 // DUCKDB_CPP_EXTENSION_ENTRY)
@@ -66,6 +67,17 @@ private:
 
 public:
   DuckDBTestHarness() : db_(nullptr), conn_(db_) {
+    // Re-arm DuckDB's vector verification if DBSP_TEST_VERIFY_VECTORS is set
+    // (see verify_vectors.hpp). catch2_main already armed it once before
+    // main(), so this only matters where something has since disarmed it: the
+    // "read surface: chunks satisfy VERIFY_VECTORS" case in
+    // test_extension_basic.cpp arms the mode by hand and its VerifyModeGuard
+    // resets it to 'none' on the way out. That guard stays as it is — it is
+    // the regression pin for the original 2.0 bug and must keep working with
+    // the env var unset — so the two do not fight: it disarms, and the next
+    // harness constructed re-arms.
+    dbsp_test::ArmVerifyVectorsIfRequested();
+
     // Drop any stale manager entry left at a recycled instance address
     // (per-instance registry, Phase D1); this instance starts fresh.
     dbsp_native::get_cdc_registry().take(db_.instance.get());

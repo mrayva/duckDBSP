@@ -77,6 +77,51 @@ the measurement and the `parser_override` route out:
 "`DROP MATERIALIZED VIEW` does not reach the extension (and never did)"
 below. Pinned by `test/python/test_ddl_syntax.py`.
 
+## `DBSP_TEST_VERIFY_VECTORS=1`: vector verification, suite-wide - Sep 2026
+
+- Follow-up to "`x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0"
+  below. That bug was a chunk handed to the engine with stale child-vector
+  sizes, and exactly ONE test caught it — the one that armed
+  `SET GLOBAL debug_verification_mode='verify_vectors'` by hand. The other 48
+  sites with the same defect were found by grep, not by tests. This makes the
+  check standing: with `DBSP_TEST_VERIFY_VECTORS` set to anything but `""` or
+  `0`, every test binary in the suite runs under `verify_vectors`, so a new
+  stale-size site throws `"DataChunk::Verify - size mismatch"` in whichever
+  test first touches it.
+- Implementation (`test/verify_vectors.hpp` new, +89 test lines): the mode
+  lives in `DBConfigOptions::global_verification_mode`, a PROCESS-wide static
+  (`duckdb/src/main/config.cpp:28`), so `test/catch2_main.cpp` — which every
+  test binary links — arms it once before `main()`. That is what covers the
+  binaries that never construct a `DuckDBTestHarness` and open a raw
+  `DuckDB db(nullptr)` instead (all the unit tests, both crash-recovery
+  integration tests, `bench_window`). Assigning the static is what the SQL
+  setting itself does (`DebugVerificationModeSetting::SetGlobal`,
+  `custom_settings.cpp:436`), and unlike `SET GLOBAL` it needs no Connection.
+  `DuckDBTestHarness` re-arms on each database open, because the
+  `read surface: chunks satisfy VERIFY_VECTORS` case arms the mode itself and
+  its `VerifyModeGuard` resets it to `none` on the way out; that case is the
+  regression pin for the original bug and is unchanged.
+- No ctest label and no second test registration: CI runs the same suite twice,
+  `ctest` and `DBSP_TEST_VERIFY_VECTORS=1 ctest`. `test/python/*.py` are not
+  covered — they open their own connections and are not in ctest.
+- **Result of the first suite-wide run: 47/47 green, no new failures.** No
+  latent stale-size site remains — the 2.0 migration sweep had already
+  converted all 50 (`src/dbsp_extension.cpp`, `include/dbsp_plan_translator.hpp`,
+  and the one justified `SetCardinalityUnsafe` at
+  `include/dbsp_plan_tee.hpp:129`). Nothing was fixed here because nothing was
+  broken; the value is the standing gate. No new DuckDB 2.0 alpha issues
+  surfaced either.
+- The switch was proved to bite rather than assumed to, by mutation: reverting
+  `src/dbsp_extension.cpp:167` (`dbsp_track`) to the deprecated
+  `SetCardinality(1)` turns `test_extension_basic` from 10/10 green into 9/9
+  test cases failing under the switch, against 1 failing case without it (the
+  hand-armed pin). A `PROBE` build of `catch2_main.cpp` confirmed the
+  before-`main()` arm in `test_zset`, a binary with no harness: mode 1 (`NONE`)
+  unset and with `=0`, mode 2 (`VERIFY_VECTORS`) with `=1`. Both temporary
+  changes were reverted.
+- Suite timings on the release tree (`ctest -j4`, 47 entries): 67.1s plain,
+  70.2s under the switch.
+
 ## Engine-hook patch rebased onto v2.0.0-alpha39998 - Sep 2026
 
 The fork's whole reason to exist is one engine patch: a transaction-commit

@@ -167,6 +167,10 @@ cd test/build_test
 cmake .. && make -j8
 ctest
 
+# Same suite under DuckDB's vector verification — catches chunks handed to
+# the engine with stale child-vector sizes. CI runs both.
+DBSP_TEST_VERIFY_VECTORS=1 ctest
+
 # Benchmarks (built but not part of ctest)
 make bench_planner_eval soak_differential
 ./bench_planner_eval

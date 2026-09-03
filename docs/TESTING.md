@@ -22,6 +22,48 @@ ctest                       # full suite, ~15-45s
 ./test_planner_frontend     # the big differential suite on its own
 ```
 
+### `DBSP_TEST_VERIFY_VECTORS=1` — vector verification, suite-wide
+
+```bash
+ctest                                  # normal run
+DBSP_TEST_VERIFY_VECTORS=1 ctest       # same suite under VERIFY_VECTORS
+```
+
+With the variable set to anything but `""` or `0`, every test binary runs with
+DuckDB's `debug_verification_mode='verify_vectors'`. Under that mode
+`DataChunk::VerifyInternal` checks at every operator boundary that each child
+vector reports the same size as the chunk, and throws
+
+```
+DataChunk::Verify - size mismatch: vector N (VARCHAR) has size 0 but chunk has size 1
+```
+
+instead of quietly passing a malformed chunk along.
+
+This exists because of a real wrong-answer bug. On DuckDB 2.0 a Vector carries
+its own size and the deprecated `DataChunk::SetCardinality` no longer sizes the
+children, so every table function that ended a scan callback with it emitted
+chunks whose columns claimed to be empty — which made `IS NULL` false for every
+row in the planner frontend (CHANGELOG, "DuckDB 2.0 alpha issues"). One test
+armed the mode by hand and caught it; the other 48 sites were found by grep.
+The switch is the standing version of that: any new stale-size site is loud in
+whichever test first touches it.
+
+Mechanics (`test/verify_vectors.hpp`): the mode lives in
+`DBConfigOptions::global_verification_mode`, a process-wide static, so it is
+armed once before `main()` from `catch2_main.cpp` — which every test binary
+links, including the ones that open a raw `DuckDB db(nullptr)` and never build
+a `DuckDBTestHarness`. The harness re-arms on each database open, because the
+`read surface: chunks satisfy VERIFY_VECTORS` case in `test_extension_basic.cpp`
+arms the mode itself and resets it to `none` on the way out (that case is the
+regression pin for the original bug and is unchanged by the switch).
+
+There is deliberately **no ctest label** for this: an environment variable
+means CI runs the same suite twice with no second test registration. Both runs
+are expected green; a failure only under the switch is a real latent bug, not
+a test-harness artifact. `test/python/*.py` are not covered — they open their
+own connections and are not in ctest anyway.
+
 ### Python scripts (`test/python/`)
 
 `test/python/*.py` are standalone probe scripts, **not wired into ctest** —
