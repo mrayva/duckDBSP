@@ -23,7 +23,7 @@ add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 # Extension source
 # Extension build
 set(DUCKDB_MODULE_BASE_DIR "${DUCKDB_SOURCE_DIR}")
-set(DUCKDB_NORMALIZED_VERSION "v1.5.4")
+set(DUCKDB_NORMALIZED_VERSION "v2.0.0-alpha39998")
 set(DUCKDB_EXTENSION_DBSP_EXT_VERSION ${EXT_VERSION_DBSP})
 set(PARAMETERS "-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
@@ -40,8 +40,8 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
 )
 
 # SaaS-fork engine hook consumer. ON requires the patched submodule
-# (patches/v1.5.4-dbsp-txn-callback.patch applied to duckdb/). Pass
-# -DDBSP_ENGINE_HOOK=OFF to build against a stock v1.5.4 tree (capture
+# (patches/v2.0.0-alpha39998-dbsp-txn-callback.patch applied to duckdb/). Pass
+# -DDBSP_ENGINE_HOOK=OFF to build against a stock v2.0.0-alpha39998 tree (capture
 # stack does the work instead).
 option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
 if(DBSP_ENGINE_HOOK)
