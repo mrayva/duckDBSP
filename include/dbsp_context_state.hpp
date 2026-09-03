@@ -42,6 +42,8 @@
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+// DuckDB 2.0: UpdateStatement only forward-declares its UpdateQueryNode
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -604,7 +606,11 @@ private:
   static std::string base_table_name(const duckdb::TableRef *ref) {
     if (ref && ref->type == duckdb::TableReferenceType::BASE_TABLE) {
       auto &base = ref->Cast<duckdb::BaseTableRef>();
-      return dotted_ref(base.catalog_name, base.schema_name, base.table_name);
+      // DuckDB 2.0: BaseTableRef holds one QualifiedName behind accessors
+      const auto &qn = base.GetQualifiedName();
+      return dotted_ref(qn.Catalog().GetIdentifierName(),
+                        qn.Schema().GetIdentifierName(),
+                        qn.Name().GetIdentifierName());
     }
     return {};
   }
@@ -686,21 +692,25 @@ private:
       return out;
     case duckdb::StatementType::INSERT_STATEMENT: {
       auto &insert = stmt.Cast<duckdb::InsertStatement>();
-      out.table = dotted_ref(insert.catalog, insert.schema, insert.table);
-      out.kind = insert.on_conflict_info ? StmtClass::WRITE_KNOWN
-                                         : StmtClass::INSERT_OK;
+      // DuckDB 2.0: the DML payload moved onto a QueryNode (InsertQueryNode)
+      const auto &qn = insert.node->qualified_name;
+      out.table = dotted_ref(qn.Catalog().GetIdentifierName(),
+                             qn.Schema().GetIdentifierName(),
+                             qn.Name().GetIdentifierName());
+      out.kind = insert.node->on_conflict_info ? StmtClass::WRITE_KNOWN
+                                               : StmtClass::INSERT_OK;
       return out;
     }
     case duckdb::StatementType::DELETE_STATEMENT: {
       auto &del = stmt.Cast<duckdb::DeleteStatement>();
-      out.table = base_table_name(del.table.get());
+      out.table = base_table_name(del.node->table.get());
       out.kind =
           out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
       return out;
     }
     case duckdb::StatementType::UPDATE_STATEMENT: {
       auto &upd = stmt.Cast<duckdb::UpdateStatement>();
-      out.table = base_table_name(upd.table.get());
+      out.table = base_table_name(upd.node->table.get());
       out.kind =
           out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
       return out;
@@ -913,7 +923,8 @@ private:
     const bool is_insert =
         parsed.type == duckdb::StatementType::INSERT_STATEMENT;
     const bool is_upsert =
-        is_insert && parsed.Cast<duckdb::InsertStatement>().on_conflict_info;
+        is_insert &&
+        parsed.Cast<duckdb::InsertStatement>().node->on_conflict_info;
     if (parsed.type != duckdb::StatementType::UPDATE_STATEMENT &&
         parsed.type != duckdb::StatementType::DELETE_STATEMENT && !is_insert) {
       return;

@@ -34,7 +34,11 @@
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
+// DuckDB 2.0: UpdateStatement only forward-declares its UpdateQueryNode
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
+// DuckDB 2.0: TableStorageInfo is no longer pulled in transitively
+#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -89,8 +93,8 @@ inline bool parsed_expr_capturable_ex(const duckdb::ParsedExpression &expr,
       return false;
     }
     auto &sub = expr.Cast<duckdb::SubqueryExpression>();
-    if (!sub.subquery || !sub.subquery->node ||
-        !source_node_capturable(*sub.subquery->node)) {
+    if (!sub.Subquery() || !sub.Subquery()->node ||
+        !source_node_capturable(*sub.Subquery()->node)) {
       return false;
     }
     // fall through: EnumerateChildren covers the IN/comparison child
@@ -116,7 +120,8 @@ inline bool parsed_expr_capturable(const duckdb::ParsedExpression &expr) {
 inline bool bound_expr_consistent(const duckdb::Expression &expr) {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_FUNCTION) {
     auto &fn = expr.Cast<duckdb::BoundFunctionExpression>();
-    if (fn.function.GetStability() != duckdb::FunctionStability::CONSISTENT) {
+    if (fn.Function().GetStability() !=
+        duckdb::FunctionStability::CONSISTENT) {
       return false;
     }
   }
@@ -180,37 +185,38 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   switch (stmt.type) {
   case duckdb::StatementType::UPDATE_STATEMENT: {
     auto &upd = stmt.Cast<duckdb::UpdateStatement>();
-    if (upd.from_table || !upd.returning_list.empty() ||
-        !upd.cte_map.map.empty() || !upd.set_info) {
+    if (upd.node->from_table || !upd.node->returning_list.empty() ||
+        !upd.node->cte_map.map.empty() || !upd.node->set_info) {
       return nullptr;
     }
     plan->kind = WriteCapturePlan::Kind::Update;
-    target = upd.table.get();
-    set_info = upd.set_info.get();
+    target = upd.node->table.get();
+    set_info = upd.node->set_info.get();
     condition = set_info->condition.get();
     break;
   }
   case duckdb::StatementType::DELETE_STATEMENT: {
     auto &del = stmt.Cast<duckdb::DeleteStatement>();
-    if (!del.returning_list.empty() || !del.cte_map.map.empty()) {
+    if (!del.node->returning_list.empty() ||
+        !del.node->cte_map.map.empty()) {
       return nullptr;
     }
-    if (!del.using_clauses.empty()) {
+    if (!del.node->using_clauses.empty()) {
       // DELETE ... USING is a semi-join delete: rewritable as EXISTS,
       // but only with a committed-state view of the USING tables
       if (!allow_subqueries) {
         return nullptr;
       }
-      for (auto &ref : del.using_clauses) {
+      for (auto &ref : del.node->using_clauses) {
         if (!ref || !source_ref_capturable(*ref)) {
           return nullptr;
         }
       }
-      using_refs = &del.using_clauses;
+      using_refs = &del.node->using_clauses;
     }
     plan->kind = WriteCapturePlan::Kind::Delete;
-    target = del.table.get();
-    condition = del.condition.get();
+    target = del.node->table.get();
+    condition = del.node->condition.get();
     break;
   }
   default:
@@ -227,7 +233,8 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   // The guard re-verifies captured rowids; a user column named "rowid"
   // shadows the pseudo-column, so the guard could not run.
   for (auto &col : entry.GetColumns().Physical()) {
-    if (duckdb::StringUtil::Lower(col.Name()) == "rowid") {
+    if (duckdb::StringUtil::Lower(col.Name().GetIdentifierName()) ==
+        "rowid") {
       return nullptr;
     }
   }
@@ -235,7 +242,7 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   std::string sql = "SELECT rowid";
   size_t n_cols = 0;
   for (auto &col : entry.GetColumns().Physical()) {
-    sql += ", " + quote_ident(col.Name());
+    sql += ", " + quote_ident(col.Name().GetIdentifierName());
     n_cols++;
   }
   plan->n_cols = n_cols;
@@ -280,7 +287,7 @@ plan_write_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   // SET/WHERE expressions may qualify columns with the statement's alias
   const auto &alias = target->alias;
   if (!alias.empty()) {
-    sql += " AS " + quote_ident(alias);
+    sql += " AS " + quote_ident(alias.GetIdentifierName());
   }
   if (using_refs) {
     // DELETE t USING u WHERE cond  ==  delete every t row with at least
@@ -343,7 +350,8 @@ inline bool source_node_capturable(const duckdb::QueryNode &node) {
   }
   for (auto &mod : node.modifiers) {
     if (mod->type == duckdb::ResultModifierType::LIMIT_MODIFIER ||
-        mod->type == duckdb::ResultModifierType::LIMIT_PERCENT_MODIFIER) {
+        mod->type ==
+            duckdb::ResultModifierType::LEGACY_LIMIT_PERCENT_MODIFIER) {
       return false; // which rows survive depends on scan order
     }
   }
@@ -390,20 +398,21 @@ inline bool source_node_capturable(const duckdb::QueryNode &node) {
 // names in supply order, and the lowercased set of provided columns.
 struct InsertSource {
   std::string source_sql;
-  std::vector<std::string> value_names;
+  std::vector<duckdb::Identifier> value_names;
   std::unordered_set<std::string> provided;
 };
 
 inline bool build_insert_source(duckdb::InsertStatement &ins,
                                 duckdb::TableCatalogEntry &entry,
                                 InsertSource &out) {
-  if (!ins.returning_list.empty() || !ins.cte_map.map.empty() ||
-      ins.default_values ||
-      ins.column_order != duckdb::InsertColumnOrder::INSERT_BY_POSITION ||
-      !ins.select_statement || !ins.select_statement->node) {
+  if (!ins.node->returning_list.empty() || !ins.node->cte_map.map.empty() ||
+      ins.node->default_values ||
+      ins.node->column_order !=
+          duckdb::InsertColumnOrder::INSERT_BY_POSITION ||
+      !ins.node->select_statement || !ins.node->select_statement->node) {
     return false;
   }
-  out.value_names = ins.columns;
+  out.value_names = ins.node->columns;
   if (out.value_names.empty()) {
     for (auto &col : entry.GetColumns().Physical()) {
       out.value_names.push_back(col.Name());
@@ -413,7 +422,9 @@ inline bool build_insert_source(duckdb::InsertStatement &ins,
     if (!entry.ColumnExists(name) || entry.GetColumn(name).Generated()) {
       return false;
     }
-    if (!out.provided.insert(duckdb::StringUtil::Lower(name)).second) {
+    if (!out.provided
+             .insert(duckdb::StringUtil::Lower(name.GetIdentifierName()))
+             .second) {
       return false; // duplicate column name
     }
   }
@@ -440,12 +451,12 @@ inline bool build_insert_source(duckdb::InsertStatement &ins,
     out.source_sql = "(VALUES " + rows + ")";
     return true;
   }
-  if (!source_node_capturable(*ins.select_statement->node)) {
+  if (!source_node_capturable(*ins.node->select_statement->node)) {
     return false;
   }
   // A source-arity/column-list mismatch makes the capture SELECT (or
   // the statement itself) error out — declined at execution, no risk
-  out.source_sql = "(" + ins.select_statement->node->ToString() + ")";
+  out.source_sql = "(" + ins.node->select_statement->node->ToString() + ")";
   return true;
 }
 
@@ -458,8 +469,10 @@ inline std::string insert_image_projection(duckdb::TableCatalogEntry &entry,
   std::string proj;
   for (auto &col : entry.GetColumns().Physical()) {
     proj += proj.empty() ? "" : ", ";
-    if (src.provided.count(duckdb::StringUtil::Lower(col.Name()))) {
-      proj += "CAST(" + alias + "." + quote_ident(col.Name()) + " AS " +
+    if (src.provided.count(
+            duckdb::StringUtil::Lower(col.Name().GetIdentifierName()))) {
+      proj += "CAST(" + alias + "." +
+              quote_ident(col.Name().GetIdentifierName()) + " AS " +
               col.Type().ToString() + ")";
     } else if (col.HasDefaultValue()) {
       if (!parsed_expr_capturable(col.DefaultValue())) {
@@ -492,7 +505,7 @@ plan_insert_capture(duckdb::SQLStatement &stmt,
     return nullptr;
   }
   auto &ins = stmt.Cast<duckdb::InsertStatement>();
-  if (ins.on_conflict_info) {
+  if (ins.node->on_conflict_info) {
     return nullptr; // upserts have their own planner
   }
   InsertSource src;
@@ -510,7 +523,8 @@ plan_insert_capture(duckdb::SQLStatement &stmt,
 
   std::string alias_cols;
   for (const auto &name : src.value_names) {
-    alias_cols += (alias_cols.empty() ? "" : ", ") + quote_ident(name);
+    alias_cols += (alias_cols.empty() ? "" : ", ") +
+                  quote_ident(name.GetIdentifierName());
   }
   plan->capture_sql =
       "SELECT " + proj + " FROM " + src.source_sql + " v(" + alias_cols + ")";
@@ -540,10 +554,10 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
     return nullptr;
   }
   auto &ins = stmt.Cast<duckdb::InsertStatement>();
-  if (!ins.on_conflict_info) {
+  if (!ins.node->on_conflict_info) {
     return nullptr;
   }
-  auto &conflict = *ins.on_conflict_info;
+  auto &conflict = *ins.node->on_conflict_info;
   const bool do_update =
       conflict.action_type == duckdb::OnConflictAction::UPDATE;
   if (!do_update &&
@@ -557,7 +571,8 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
     return nullptr;
   }
   for (auto &col : entry.GetColumns().Physical()) {
-    if (duckdb::StringUtil::Lower(col.Name()) == "rowid") {
+    if (duckdb::StringUtil::Lower(col.Name().GetIdentifierName()) ==
+        "rowid") {
       return nullptr; // shadows the guard pseudo-column
     }
   }
@@ -567,7 +582,8 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   }
   // conflict columns must be provided by the source (the join needs them)
   for (const auto &name : conflict.indexed_columns) {
-    if (!src.provided.count(duckdb::StringUtil::Lower(name))) {
+    if (!src.provided.count(
+            duckdb::StringUtil::Lower(name.GetIdentifierName()))) {
       return nullptr;
     }
   }
@@ -579,7 +595,7 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
 
   std::string sql = "SELECT t.rowid";
   for (auto &col : entry.GetColumns().Physical()) {
-    sql += ", t." + quote_ident(col.Name());
+    sql += ", t." + quote_ident(col.Name().GetIdentifierName());
   }
   const std::string insert_proj =
       insert_image_projection(entry, src, "excluded");
@@ -621,7 +637,8 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
 
   std::string alias_cols;
   for (const auto &name : src.value_names) {
-    alias_cols += (alias_cols.empty() ? "" : ", ") + quote_ident(name);
+    alias_cols += (alias_cols.empty() ? "" : ", ") +
+                  quote_ident(name.GetIdentifierName());
   }
   sql += " FROM " + src.source_sql + " excluded(" + alias_cols +
          ") LEFT JOIN " + quote_table_key(table_key) + " t ON ";
@@ -629,7 +646,8 @@ plan_upsert_capture(duckdb::ClientContext &context, duckdb::SQLStatement &stmt,
   for (const auto &name : conflict.indexed_columns) {
     sql += first ? "" : " AND ";
     first = false;
-    sql += "t." + quote_ident(name) + " = excluded." + quote_ident(name);
+    sql += "t." + quote_ident(name.GetIdentifierName()) + " = excluded." +
+           quote_ident(name.GetIdentifierName());
   }
   plan->capture_sql = std::move(sql);
   return plan;

@@ -37,6 +37,10 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${DUCKDB_SOURCE_DIR}/src/include
     ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
+    # DuckDB 2.0: core headers (cast_helpers.hpp) include "fmt/format.h".
+    # DuckDB adds third_party/fmt/include at its own project scope, which does
+    # not reach targets defined in this parent project.
+    ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
 )
 
 # SaaS-fork engine hook consumer. ON requires the patched submodule

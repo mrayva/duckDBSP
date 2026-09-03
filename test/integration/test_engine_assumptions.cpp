@@ -134,7 +134,8 @@ TEST_CASE("canary: UPDATE child is a projection with the rowid LAST",
   REQUIRE(upd.children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION);
   auto &proj = upd.children[0]->Cast<LogicalProjection>();
   REQUIRE_FALSE(proj.expressions.empty());
-  REQUIRE(proj.expressions.back()->return_type.id() == LogicalTypeId::BIGINT);
+  REQUIRE(proj.expressions.back()->GetReturnType().id() ==
+          LogicalTypeId::BIGINT);
   REQUIRE(upd.columns.size() == upd.expressions.size());
 }
 
@@ -159,7 +160,8 @@ TEST_CASE("canary: projection-pushdown GET exposes only projection_ids",
   auto before = get.GetColumnBindings().size();
   get.AddColumnId(0);
   if (!get.projection_ids.empty()) {
-    get.projection_ids.push_back(get.GetColumnIds().size() - 1);
+    get.projection_ids.push_back(
+        ProjectionIndex(get.GetColumnIds().size() - 1));
   }
   REQUIRE(get.GetColumnBindings().size() == before + 1);
 }

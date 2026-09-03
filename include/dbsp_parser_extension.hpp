@@ -226,28 +226,66 @@ inline ParserExtensionParseResult ParseRefreshMaterializedView(const string &que
     return ParserExtensionParseResult(std::move(result));
 }
 
+// DuckDB 2.0 replaced the PostgreSQL-derived parser with a PEG parser, and
+// with it the parse hook's contract: instead of the raw statement text the
+// extension now receives the tokenized tail of the query from the PEG failure
+// point (SimpleToken = raw source slice + classified type) and reports, via
+// ParserExtensionParseResult::consumed_tokens, how many leading tokens it
+// claimed (>0 accepted, 0 not ours, <0 raise `error`).
+//
+// SimpleToken::text is the verbatim source slice (quotes and all), so joining
+// the tokens with single spaces rebuilds an equivalent statement for the
+// text-based parsers below. Only insignificant whitespace and comments are
+// normalized away. The whole tail is claimed, matching the pre-2.0 hook, which
+// was handed — and consumed — the entire remaining query string.
+inline string dbsp_tokens_to_query(const vector<SimpleToken> &tokens) {
+    string query;
+    for (auto &token : tokens) {
+        if (token.type == TokenType::TERMINATOR || token.type == TokenType::END_OF_INPUT ||
+            token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE || token.type == TokenType::COMMENT) {
+            continue;
+        }
+        if (!query.empty()) {
+            query += " ";
+        }
+        query += token.text;
+    }
+    return query;
+}
+
 // Main parse function - tries all statement types
-inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info, const string &query) {
+inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info,
+                                                        const vector<SimpleToken> &tokens) {
+    const auto query = dbsp_tokens_to_query(tokens);
     auto query_upper = StringUtil::Upper(query);
 
+    ParserExtensionParseResult result;
     // Try CREATE [OR REPLACE] MATERIALIZED VIEW
     if (query_upper.find("CREATE OR REPLACE MATERIALIZED VIEW") == 0 ||
         query_upper.find("CREATE MATERIALIZED VIEW") == 0) {
-        return ParseCreateMaterializedView(query);
+        result = ParseCreateMaterializedView(query);
+    } else if (query_upper.find("DROP MATERIALIZED VIEW") == 0) {
+        result = ParseDropMaterializedView(query);
+    } else if (query_upper.find("REFRESH MATERIALIZED VIEW") == 0) {
+        result = ParseRefreshMaterializedView(query);
+    } else {
+        // Not a materialized view statement
+        return result;
     }
 
-    // Try DROP MATERIALIZED VIEW
-    if (query_upper.find("DROP MATERIALIZED VIEW") == 0) {
-        return ParseDropMaterializedView(query);
+    switch (result.type) {
+    case ParserExtensionResultType::PARSE_SUCCESSFUL:
+        result.consumed_tokens = NumericCast<int64_t>(tokens.size());
+        break;
+    case ParserExtensionResultType::DISPLAY_EXTENSION_ERROR:
+        // A negative count is what makes the peeler surface `error` — a zero
+        // count would silently hand the input to the next extension.
+        result.consumed_tokens = -1;
+        break;
+    default:
+        break;
     }
-
-    // Try REFRESH MATERIALIZED VIEW
-    if (query_upper.find("REFRESH MATERIALIZED VIEW") == 0) {
-        return ParseRefreshMaterializedView(query);
-    }
-
-    // Not a materialized view statement
-    return ParserExtensionParseResult();
+    return result;
 }
 
 //===--------------------------------------------------------------------===//

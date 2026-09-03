@@ -209,7 +209,9 @@ serialize_chunk(duckdb::DataChunk &chunk,
     uint8_t tag;
     uint8_t type_id;
     const void *data;
-    duckdb::ValidityMask *validity;
+    // DuckDB 2.0: FlatVector::Validity() returns a const ref (ValidityMutable
+    // is the writable accessor); this path only reads the mask.
+    const duckdb::ValidityMask *validity;
   };
   std::vector<Col> cols(ncols);
   for (duckdb::idx_t c = 0; c < ncols; c++) {

@@ -37,6 +37,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${DUCKDB_SOURCE_DIR}/src/include
     ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
+    # DuckDB 2.0: core headers (cast_helpers.hpp) include "fmt/format.h"
+    ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
     ${DUCKDB_SOURCE_DIR}/third_party/catch
 )
 
@@ -79,7 +81,11 @@ add_dbsp_test(write_capture unit/test_write_capture.cpp)
 add_dbsp_test(row_hash unit/test_row_hash.cpp)
 add_dbsp_test(window_incremental unit/test_window_incremental.cpp)
 add_dbsp_test(window_packed unit/test_window_packed.cpp)
-add_dbsp_test(engine_hook unit/test_engine_hook.cpp)
+# Needs the patched engine's txn-callback symbols — stock-mode builds exclude
+# it, like the integration consumer test below.
+if(DBSP_ENGINE_HOOK)
+    add_dbsp_test(engine_hook unit/test_engine_hook.cpp)
+endif()
 
 # Integration tests (require DuckDB)
 function(add_dbsp_integration_test TEST_NAME SOURCE)

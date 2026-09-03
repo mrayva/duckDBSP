@@ -98,7 +98,7 @@ struct TrackBindData : public TableFunctionData {
 unique_ptr<FunctionData> TrackBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<TrackBindData>();
 
@@ -163,7 +163,7 @@ struct CreateViewBindData : public TableFunctionData {
 unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<CreateViewBindData>();
 
@@ -283,7 +283,7 @@ struct NotifyBindData : public TableFunctionData {
 unique_ptr<FunctionData> NotifyBind(ClientContext &context,
                                     TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types,
-                                    vector<string> &names) {
+                                    vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<NotifyBindData>();
 
@@ -381,7 +381,7 @@ struct SyncBindData : public TableFunctionData {
 unique_ptr<FunctionData> SyncBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<SyncBindData>();
 
@@ -435,7 +435,7 @@ struct QueryBindData : public TableFunctionData {
 unique_ptr<FunctionData> QueryBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<QueryBindData>();
 
@@ -469,7 +469,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.push_back(col.name);
+      names.push_back(Identifier(col.name));
     }
     data->types = return_types;
   } else if (!data->rows.empty()) {
@@ -477,7 +477,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.push_back("col" + std::to_string(i));
+      names.push_back(Identifier("col" + std::to_string(i)));
     }
     data->types = return_types;
   } else {
@@ -526,7 +526,7 @@ struct ChangesBindData : public TableFunctionData {
 unique_ptr<FunctionData> ChangesBind(ClientContext &context,
                                      TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<ChangesBindData>();
 
@@ -553,13 +553,13 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.push_back(col.name);
+      names.push_back(Identifier(col.name));
     }
   } else if (!data->rows.empty()) {
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.push_back("col" + std::to_string(i));
+      names.push_back(Identifier("col" + std::to_string(i)));
     }
   }
   return_types.push_back(LogicalType::BIGINT);
@@ -604,7 +604,7 @@ struct MvTablesBindData : public TableFunctionData {
 unique_ptr<FunctionData> MvTablesBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<MvTablesBindData>();
   if (input.inputs.empty()) {
@@ -654,7 +654,7 @@ struct RealizeBindData : public TableFunctionData {
 unique_ptr<FunctionData> RealizeBind(ClientContext &context,
                                      TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<RealizeBindData>();
   if (input.inputs.empty()) {
@@ -706,7 +706,7 @@ struct WaitTeardownBindData : public TableFunctionData {
 unique_ptr<FunctionData> WaitTeardownBind(ClientContext &context,
                                           TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types,
-                                          vector<string> &names) {
+                                          vector<Identifier> &names) {
   auto data = make_uniq<WaitTeardownBindData>();
   for (int i = 0; i < 3000; i++) {
     if (g_teardown_threads.load() <= 0) {
@@ -752,7 +752,7 @@ struct ViewStateBindData : public TableFunctionData {
 unique_ptr<FunctionData> ViewStateBind(ClientContext &context,
                                        TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<ViewStateBindData>();
 
@@ -817,7 +817,7 @@ struct TableStateBindData : public TableFunctionData {
 unique_ptr<FunctionData> TableStateBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<TableStateBindData>();
 
@@ -873,7 +873,7 @@ struct DeltaGenerationsBindData : public TableFunctionData {
 unique_ptr<FunctionData> DeltaGenerationsBind(ClientContext &context,
                                               TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types,
-                                              vector<string> &names) {
+                                              vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<DeltaGenerationsBindData>();
 
@@ -918,7 +918,7 @@ struct ListViewsBindData : public TableFunctionData {
 unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
                                        TableFunctionBindInput &input,
                                        vector<LogicalType> &return_types,
-                                       vector<string> &names) {
+                                       vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<ListViewsBindData>();
 
@@ -971,7 +971,7 @@ struct ListTablesBindData : public TableFunctionData {
 unique_ptr<FunctionData> ListTablesBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<ListTablesBindData>();
 
@@ -1019,7 +1019,7 @@ struct StatsBindData : public TableFunctionData {
 unique_ptr<FunctionData> StatsBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
@@ -1110,7 +1110,7 @@ struct SaveBindData : public TableFunctionData {
 unique_ptr<FunctionData> SaveBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<SaveBindData>();
 
@@ -1218,7 +1218,7 @@ struct LoadBindData : public TableFunctionData {
 unique_ptr<FunctionData> LoadBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<LoadBindData>();
 
@@ -1337,7 +1337,7 @@ struct DepsBindData : public TableFunctionData {
 unique_ptr<FunctionData> DepsBind(ClientContext &context,
                                   TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types,
-                                  vector<string> &names) {
+                                  vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<DepsBindData>();
 
@@ -1402,7 +1402,7 @@ struct AutoSyncBindData : public TableFunctionData {
 unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<AutoSyncBindData>();
 
@@ -1466,7 +1466,7 @@ struct AutoPersistBindData : public TableFunctionData {
 unique_ptr<FunctionData> AutoPersistBind(ClientContext &context,
                                          TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types,
-                                         vector<string> &names) {
+                                         vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<AutoPersistBindData>();
 
@@ -1535,7 +1535,7 @@ struct AutoPersistIntervalBindData : public TableFunctionData {
 
 unique_ptr<FunctionData> AutoPersistIntervalBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<AutoPersistIntervalBindData>();
 
   if (!input.inputs.empty()) {
@@ -1600,7 +1600,7 @@ struct LazyRestoreBindData : public TableFunctionData {
 unique_ptr<FunctionData> LazyRestoreBind(ClientContext &context,
                                          TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types,
-                                         vector<string> &names) {
+                                         vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<LazyRestoreBindData>();
 
@@ -1666,7 +1666,7 @@ struct ParallelBindData : public TableFunctionData {
 unique_ptr<FunctionData> ParallelBind(ClientContext &context,
                                       TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types,
-                                      vector<string> &names) {
+                                      vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<ParallelBindData>();
   if (input.inputs.empty()) {
@@ -1721,7 +1721,7 @@ struct SpillBindData : public TableFunctionData {
 unique_ptr<FunctionData> SpillBind(ClientContext &context,
                                    TableFunctionBindInput &input,
                                    vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<SpillBindData>();
   if (input.inputs.empty()) {
@@ -1778,7 +1778,7 @@ struct UsePlannerBindData : public TableFunctionData {
 unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
                                         TableFunctionBindInput &input,
                                         vector<LogicalType> &return_types,
-                                        vector<string> &names) {
+                                        vector<Identifier> &names) {
   EnsureContextState(context);
   auto data = make_uniq<UsePlannerBindData>();
 
@@ -1824,7 +1824,7 @@ struct CreateMaterializedViewData : public TableFunctionData {
 
 unique_ptr<FunctionData> CreateMaterializedViewBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<CreateMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->select_query = input.inputs[1].GetValue<string>();
@@ -1902,7 +1902,7 @@ struct ReplaceViewData : public TableFunctionData {
 
 unique_ptr<FunctionData>
 ReplaceViewBind(ClientContext &context, TableFunctionBindInput &input,
-                vector<LogicalType> &return_types, vector<string> &names) {
+                vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<ReplaceViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->sql = input.inputs[1].GetValue<string>();
@@ -1963,7 +1963,7 @@ struct DropMaterializedViewData : public TableFunctionData {
 unique_ptr<FunctionData>
 DropMaterializedViewBind(ClientContext &context, TableFunctionBindInput &input,
                          vector<LogicalType> &return_types,
-                         vector<string> &names) {
+                         vector<Identifier> &names) {
   auto data = make_uniq<DropMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->cascade = input.inputs[1].GetValue<bool>();
@@ -2048,7 +2048,7 @@ struct RefreshMaterializedViewData : public TableFunctionData {
 
 unique_ptr<FunctionData> RefreshMaterializedViewBind(
     ClientContext &context, TableFunctionBindInput &input,
-    vector<LogicalType> &return_types, vector<string> &names) {
+    vector<LogicalType> &return_types, vector<Identifier> &names) {
   auto data = make_uniq<RefreshMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   return_types.push_back(LogicalType::VARCHAR);

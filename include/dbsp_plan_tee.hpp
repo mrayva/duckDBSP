@@ -248,9 +248,9 @@ inline bool widen_delete_child(duckdb::LogicalOperator &child,
     // entries (as (table_index, proj_id) bindings) — the appended
     // columns must join that list to be visible at all
     if (!get.projection_ids.empty()) {
-      get.projection_ids.push_back(prev + c);
+      get.projection_ids.push_back(duckdb::ProjectionIndex(prev + c));
     }
-    appended.emplace_back(get.table_index, prev + c);
+    appended.emplace_back(get.table_index, duckdb::ProjectionIndex(prev + c));
   }
 
   // re-expose through the chain, bottom-up. Joins pass left bindings
@@ -271,7 +271,7 @@ inline bool widen_delete_child(duckdb::LogicalOperator &child,
           bool found = false;
           for (duckdb::idx_t i = 0; i < child_bindings.size(); i++) {
             if (child_bindings[i] == target) {
-              filter.projection_map.push_back(i);
+              filter.projection_map.push_back(duckdb::ProjectionIndex(i));
               found = true;
               break;
             }
@@ -288,8 +288,9 @@ inline bool widen_delete_child(duckdb::LogicalOperator &child,
         proj.expressions.push_back(
             duckdb::make_uniq<duckdb::BoundColumnRefExpression>(
                 table.GetColumns().GetColumnTypes()[c], appended[c]));
-        appended[c] = duckdb::ColumnBinding(proj.table_index,
-                                            proj.expressions.size() - 1);
+        appended[c] = duckdb::ColumnBinding(
+            proj.table_index,
+            duckdb::ProjectionIndex(proj.expressions.size() - 1));
       }
     }
   }
@@ -329,7 +330,7 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
         const auto rowid_binding =
             del.expressions[0]
                 ->Cast<duckdb::BoundColumnRefExpression>()
-                .binding;
+                .Binding();
         const auto bindings = del.children[0]->GetColumnBindings();
         for (duckdb::idx_t i = 0; i < bindings.size(); i++) {
           if (bindings[i] == rowid_binding) {
@@ -375,7 +376,7 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
         }
         const auto binding = upd.expressions[i]
                                  ->Cast<duckdb::BoundColumnRefExpression>()
-                                 .binding;
+                                 .Binding();
         if (binding.table_index != proj.table_index ||
             binding.column_index >= n_output) {
           ok = false;

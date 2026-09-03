@@ -69,6 +69,7 @@
 #include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "core_functions/aggregate/quantile_helpers.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -165,7 +166,7 @@ public:
     // profiled as the hottest frame of a cold build.
     if (row_eval_fastpath_enabled() &&
         expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-      const auto idx = expr.Cast<duckdb::BoundReferenceExpression>().index;
+      const auto idx = expr.Cast<duckdb::BoundReferenceExpression>().Index();
       // An index past the input types stays on the generic path rather than
       // being clamped: that case reads a virtual column, and quietly
       // returning a different column is worse than being slow.
@@ -187,8 +188,8 @@ public:
       if (v.type() != input_types_[i]) {
         v = v.DefaultCastAs(input_types_[i]);
       }
-      if (v.type() != expr_.return_type) {
-        v = v.DefaultCastAs(expr_.return_type);
+      if (v.type() != expr_.GetReturnType()) {
+        v = v.DefaultCastAs(expr_.GetReturnType());
       }
       return v;
     }
@@ -203,7 +204,7 @@ public:
       chunk_.SetValue(i, 0, v);
     }
     chunk_.SetCardinality(1);
-    duckdb::Vector result(expr_.return_type);
+    duckdb::Vector result(expr_.GetReturnType());
     executor_.ExecuteExpression(chunk_, result);
     return result.GetValue(0);
   }
@@ -240,7 +241,7 @@ public:
     for (const auto *expr : exprs_) {
       executors_.push_back(
           std::make_unique<duckdb::ExpressionExecutor>(context_, *expr));
-      result_caches_.emplace_back(allocator, expr->return_type);
+      result_caches_.emplace_back(allocator, expr->GetReturnType());
       results_.emplace_back(result_caches_.back());
     }
   }
@@ -250,7 +251,7 @@ public:
   size_t expr_count() const { return exprs_.size(); }
 
   const duckdb::LogicalType &return_type(size_t e) const {
-    return exprs_[e]->return_type;
+    return exprs_[e]->GetReturnType();
   }
 
   // Fill the shared input chunk once per batch (count <= kBatch).
@@ -346,7 +347,7 @@ private:
   static void fill_column(duckdb::Vector &vec, const duckdb::LogicalType &type,
                           const DuckDBRow *const *rows, duckdb::idx_t count,
                           duckdb::idx_t c) {
-    auto &validity = duckdb::FlatVector::Validity(vec);
+    auto &validity = duckdb::FlatVector::ValidityMutable(vec);
     validity.SetAllValid(count);
 
     auto value_at = [&](duckdb::idx_t i) -> const duckdb::Value * {
@@ -378,7 +379,7 @@ private:
       fill_typed<double>(vec, validity, type, count, value_at, slow_cell);
       break;
     case duckdb::LogicalTypeId::VARCHAR: {
-      auto data = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
+      auto data = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(vec);
       for (duckdb::idx_t i = 0; i < count; i++) {
         const duckdb::Value *v = value_at(i);
         if (!v || v->IsNull()) {
@@ -404,7 +405,7 @@ private:
   static void fill_typed(duckdb::Vector &vec, duckdb::ValidityMask &validity,
                          const duckdb::LogicalType &type, duckdb::idx_t count,
                          ValueAt &&value_at, SlowCell &&slow_cell) {
-    auto data = duckdb::FlatVector::GetData<T>(vec);
+    auto data = duckdb::FlatVector::GetDataMutable<T>(vec);
     for (duckdb::idx_t i = 0; i < count; i++) {
       const duckdb::Value *v = value_at(i);
       if (!v || v->IsNull()) {
@@ -567,7 +568,7 @@ namespace plan_ir {
 inline void collect_bound_refs(const duckdb::Expression &expr,
                                std::vector<duckdb::idx_t> &out) {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    out.push_back(expr.Cast<duckdb::BoundReferenceExpression>().index);
+    out.push_back(expr.Cast<duckdb::BoundReferenceExpression>().Index());
   }
   duckdb::ExpressionIterator::EnumerateChildren(
       expr, [&](const duckdb::Expression &child) {
@@ -577,7 +578,7 @@ inline void collect_bound_refs(const duckdb::Expression &expr,
 
 inline void shift_bound_refs(duckdb::Expression &expr, duckdb::idx_t delta) {
   if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
-    expr.Cast<duckdb::BoundReferenceExpression>().index -= delta;
+    expr.Cast<duckdb::BoundReferenceExpression>().IndexMutable() -= delta;
   }
   duckdb::ExpressionIterator::EnumerateChildren(
       expr,
@@ -692,11 +693,11 @@ remap_bound_refs(const duckdb::Expression &expr,
       [&](duckdb::Expression &e) {
         if (e.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
           auto &ref = e.Cast<duckdb::BoundReferenceExpression>();
-          if (ref.index >= idxs.size() || idxs[ref.index] >= source_arity) {
+          if (ref.Index() >= idxs.size() || idxs[ref.Index()] >= source_arity) {
             ok = false;
             return;
           }
-          ref.index = idxs[ref.index];
+          ref.IndexMutable() = idxs[ref.Index()];
           return;
         }
         duckdb::ExpressionIterator::EnumerateChildren(
@@ -5314,10 +5315,10 @@ private:
                                const std::vector<duckdb::idx_t> &idxs) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::BOUND_REF) {
       auto &ref = expr.Cast<duckdb::BoundReferenceExpression>();
-      if (ref.index >= idxs.size()) {
+      if (ref.Index() >= idxs.size()) {
         return false;
       }
-      ref.index = idxs[ref.index];
+      ref.IndexMutable() = idxs[ref.Index()];
       return true;
     }
     bool ok = true;
@@ -5900,7 +5901,9 @@ public:
       // Canonical plan shapes: no filter pushdown into GET, no projection
       // collapse. ExtractPlan still runs ColumnBindingResolver and
       // ResolveOperatorTypes.
-      keep_alive->connection->context->config.enable_optimizer = false;
+      duckdb::Settings::Set<duckdb::EnableOptimizerSetting>(
+          *keep_alive->connection->context, duckdb::SetScope::SESSION,
+          duckdb::Value::BOOLEAN(false));
       keep_alive->plan = keep_alive->connection->ExtractPlan(sql);
     } catch (const std::exception &e) {
       return {nullptr, std::string("planner frontend: ") + e.what()};
@@ -5937,7 +5940,7 @@ public:
         const auto &names = prep->GetNames();
         if (names.size() == schema.columns.size()) {
           for (size_t i = 0; i < names.size(); i++) {
-            schema.columns[i].name = names[i];
+            schema.columns[i].name = names[i].GetIdentifierName();
           }
         }
       }
@@ -6041,11 +6044,11 @@ private:
         if (pure_refs) {
           for (const auto &expr : op.expressions) {
             child->project_idxs.push_back(
-                expr->Cast<duckdb::BoundReferenceExpression>().index);
+                expr->Cast<duckdb::BoundReferenceExpression>().Index());
           }
           columns.clear();
           for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
-            columns.push_back({op.expressions[i]->GetName(), op.types[i]});
+            columns.push_back({op.expressions[i]->GetName().GetIdentifierName(), op.types[i]});
           }
           return child;
         }
@@ -6060,7 +6063,7 @@ private:
 
       columns.clear();
       for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
-        columns.push_back({op.expressions[i]->GetName(), op.types[i]});
+        columns.push_back({op.expressions[i]->GetName().GetIdentifierName(), op.types[i]});
       }
       return spec;
     }
@@ -6126,7 +6129,7 @@ private:
         }
         auto &ref = o.expression->Cast<duckdb::BoundReferenceExpression>();
         NativeSortView::SortColumn sc;
-        sc.column_idx = static_cast<size_t>(ref.index);
+        sc.column_idx = static_cast<size_t>(ref.Index());
         sc.ascending = o.type != duckdb::OrderType::DESCENDING;
         sc.nulls_first = o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
         cols.push_back(sc);
@@ -6181,11 +6184,11 @@ private:
       // Output layout: group values first, then aggregate values
       columns.clear();
       for (duckdb::idx_t i = 0; i < op.groups.size(); i++) {
-        columns.push_back({op.groups[i]->GetName(), op.types[i]});
+        columns.push_back({op.groups[i]->GetName().GetIdentifierName(), op.types[i]});
       }
       for (duckdb::idx_t i = 0; i < op.expressions.size(); i++) {
         columns.push_back(
-            {op.expressions[i]->GetName(), op.types[op.groups.size() + i]});
+            {op.expressions[i]->GetName().GetIdentifierName(), op.types[op.groups.size() + i]});
       }
       return spec;
     }
@@ -6205,7 +6208,7 @@ private:
       if (sets.empty()) {
         duckdb::GroupingSet all;
         for (duckdb::idx_t j = 0; j < num_groups; j++) {
-          all.insert(j);
+          all.insert(duckdb::ProjectionIndex(j));
         }
         sets.push_back(std::move(all));
       }
@@ -6291,11 +6294,11 @@ private:
 
       columns.clear();
       for (duckdb::idx_t j = 0; j < num_groups; j++) {
-        columns.push_back({op.groups[j]->GetName(), op.types[j]});
+        columns.push_back({op.groups[j]->GetName().GetIdentifierName(), op.types[j]});
       }
       for (size_t k = 0; k < num_aggs; k++) {
         columns.push_back(
-            {op.expressions[k]->GetName(), op.types[num_groups + k]});
+            {op.expressions[k]->GetName().GetIdentifierName(), op.types[num_groups + k]});
       }
       for (size_t f = 0; f < op.grouping_functions.size(); f++) {
         columns.push_back({"grouping_" + std::to_string(f),
@@ -6328,9 +6331,9 @@ private:
 
         PlanAggSpec agg_spec;
         agg_spec.distinct = agg.IsDistinct();
-        agg_spec.filter = agg.filter.get();
-        agg_spec.return_type = agg.return_type;
-        const std::string &fn = agg.function.name;
+        agg_spec.filter = agg.GetFilter().get();
+        agg_spec.return_type = agg.GetReturnType();
+        const std::string &fn = agg.Function().GetName().GetIdentifierName();
         if (fn == "count_star") {
           agg_spec.fn = PlanAggSpec::Fn::COUNT_STAR;
         } else if (fn == "count") {
@@ -6363,12 +6366,12 @@ private:
           // The fraction argument is erased at bind time and stored in
           // QuantileBindData (public core_functions header — no layout
           // mirror needed, unlike string_agg's separator)
-          if (!agg.bind_info) {
+          if (!agg.BindInfo()) {
             unsupported(fn + " without bind data");
             return false;
           }
           const auto &qbd =
-              agg.bind_info->Cast<duckdb::QuantileBindData>();
+              agg.BindInfo()->Cast<duckdb::QuantileBindData>();
           if (qbd.quantiles.size() != 1) {
             unsupported(fn + " with a fraction LIST (single fraction only)");
             return false;
@@ -6380,10 +6383,10 @@ private:
           agg_spec.fn = PlanAggSpec::Fn::MAD;
           // Temporal mad (DATE/TIMESTAMP → INTERVAL) needs interval
           // arithmetic we don't do — numeric only
-          if (!agg.children.empty() &&
-              !agg.children[0]->return_type.IsNumeric()) {
+          if (!agg.GetChildren().empty() &&
+              !agg.GetChildren()[0]->GetReturnType().IsNumeric()) {
             unsupported("mad over " +
-                        agg.children[0]->return_type.ToString());
+                        agg.GetChildren()[0]->GetReturnType().ToString());
             return false;
           }
         } else {
@@ -6400,7 +6403,7 @@ private:
           return false;
         }
         if (agg_spec.fn == PlanAggSpec::Fn::FIRST &&
-            (agg_spec.distinct || agg.order_bys)) {
+            (agg_spec.distinct || agg.GetOrderBys())) {
           // first() IS order/multiplicity sensitive — modifiers would
           // change its meaning
           unsupported("DISTINCT/ORDER BY on " + fn);
@@ -6414,7 +6417,7 @@ private:
           // Without an internal ORDER BY the result order is whatever
           // DuckDB's scan produced — unreproducible incrementally after
           // deletes/reinserts. Deterministic subset only.
-          if (!agg.order_bys || agg.order_bys->orders.empty()) {
+          if (!agg.GetOrderBys() || agg.GetOrderBys()->orders.empty()) {
             unsupported(fn + " without ORDER BY inside the aggregate "
                              "(add e.g. " + fn + "(x ORDER BY x))");
             return false;
@@ -6423,7 +6426,7 @@ private:
             unsupported("DISTINCT on " + fn);
             return false;
           }
-          for (const auto &o : agg.order_bys->orders) {
+          for (const auto &o : agg.GetOrderBys()->orders) {
             PlanAggSpec::OrderKey key;
             key.expr = o.expression.get();
             key.ascending = o.type != duckdb::OrderType::DESCENDING;
@@ -6432,7 +6435,7 @@ private:
             agg_spec.order_keys.push_back(key);
           }
           if (agg_spec.fn == PlanAggSpec::Fn::STRING_AGG &&
-              agg.bind_info) {
+              agg.BindInfo()) {
             // DuckDB's bind erases the separator argument and stores it
             // in a TU-local StringAggBindData { string sep; }. The engine
             // is pinned (v1.5.4, built in-tree), so a layout mirror is
@@ -6449,25 +6452,25 @@ private:
             };
             agg_spec.separator =
                 reinterpret_cast<const SeparatorMirror *>(
-                    agg.bind_info.get())
+                    agg.BindInfo().get())
                     ->sep;
           }
-          agg_spec.arg = agg.children[0].get();
+          agg_spec.arg = agg.GetChildren()[0].get();
           out.push_back(std::move(agg_spec));
           continue;
         }
 
         if (agg_spec.fn != PlanAggSpec::Fn::COUNT_STAR) {
-          if (agg.children.size() != 1) {
+          if (agg.GetChildren().size() != 1) {
             unsupported("aggregate with " +
-                        std::to_string(agg.children.size()) +
+                        std::to_string(agg.GetChildren().size()) +
                         " arguments (" + fn + ")");
             return false;
           }
-          agg_spec.arg = agg.children[0].get();
+          agg_spec.arg = agg.GetChildren()[0].get();
           if (agg_spec.fn == PlanAggSpec::Fn::SUM ||
               agg_spec.fn == PlanAggSpec::Fn::AVG) {
-            switch (agg_spec.arg->return_type.id()) {
+            switch (agg_spec.arg->GetReturnType().id()) {
             case duckdb::LogicalTypeId::TINYINT:
             case duckdb::LogicalTypeId::SMALLINT:
             case duckdb::LogicalTypeId::INTEGER:
@@ -6487,14 +6490,14 @@ private:
                 // DuckDB, so the double path matches its semantics
                 agg_spec.decimal_arg = true;
                 agg_spec.decimal_scale =
-                    duckdb::DecimalType::GetScale(agg_spec.arg->return_type);
+                    duckdb::DecimalType::GetScale(agg_spec.arg->GetReturnType());
               } else {
                 agg_spec.integer_arg = false;
               }
               break;
             default:
               unsupported(fn + " over " +
-                          agg_spec.arg->return_type.ToString());
+                          agg_spec.arg->GetReturnType().ToString());
               return false;
             }
           }
@@ -6529,9 +6532,16 @@ private:
                             ? duckdb::JoinType::LEFT
                             : op.join_type;
       for (const auto &cond : op.conditions) {
-        PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
-                                cond.comparison};
-        switch (cond.comparison) {
+        // DuckDB 2.0: a non-comparison JoinCondition carries a single-sided
+        // ON predicate (the old LogicalComparisonJoin::predicate); the
+        // left/right/comparison accessors throw on one.
+        if (!cond.IsComparison()) {
+          return unsupported("DELIM join with a single-sided ON predicate");
+        }
+        PlanOpSpec::JoinCond jc{cond.LeftReference().get(),
+                                cond.RightReference().get(),
+                                cond.GetComparisonType()};
+        switch (cond.GetComparisonType()) {
         case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
           spec->null_safe_keys = true;
           spec->equi_conds.push_back(jc);
@@ -6541,7 +6551,7 @@ private:
           break;
         default:
           return unsupported("DELIM join comparison " +
-                             duckdb::EnumUtil::ToString(cond.comparison));
+                             duckdb::EnumUtil::ToString(cond.GetComparisonType()));
         }
       }
 
@@ -6559,7 +6569,7 @@ private:
         const auto &e = op.duplicate_eliminated_columns[i];
         spec->exprs.push_back(e.get());
         delim_cols.push_back(
-            {"delim_" + std::to_string(i), e->return_type});
+            {"delim_" + std::to_string(i), e->GetReturnType()});
       }
       if (spec->exprs.empty()) {
         return unsupported("DELIM join without correlated columns");
@@ -6614,8 +6624,12 @@ private:
       if (!op.duplicate_eliminated_columns.empty()) {
         return unsupported("duplicate-eliminated (DELIM) join");
       }
-      if (op.predicate) {
-        return unsupported("join with single-sided ON predicate");
+      // DuckDB 2.0: LogicalComparisonJoin::predicate is gone — a single-sided
+      // ON predicate is now carried as a non-comparison JoinCondition.
+      for (const auto &cond : op.conditions) {
+        if (!cond.IsComparison()) {
+          return unsupported("join with single-sided ON predicate");
+        }
       }
       if (!op.left_projection_map.empty() ||
           !op.right_projection_map.empty()) {
@@ -6626,9 +6640,10 @@ private:
       spec->kind = PlanOpSpec::Kind::JOIN;
       spec->join_type = op.join_type;
       for (const auto &cond : op.conditions) {
-        PlanOpSpec::JoinCond jc{cond.left.get(), cond.right.get(),
-                                cond.comparison};
-        switch (cond.comparison) {
+        PlanOpSpec::JoinCond jc{cond.LeftReference().get(),
+                                cond.RightReference().get(),
+                                cond.GetComparisonType()};
+        switch (cond.GetComparisonType()) {
         case duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM:
           // Null-safe equality (NULL matches NULL) — emitted by subquery
           // decorrelation; DuckDBRow key equality is already null-safe
@@ -6648,14 +6663,14 @@ private:
         default:
           return unsupported(
               "join comparison " +
-              duckdb::EnumUtil::ToString(cond.comparison));
+              duckdb::EnumUtil::ToString(cond.GetComparisonType()));
         }
       }
       if (spec->null_safe_keys) {
         // null_safe applies to ALL equi keys of the node; mixing = and
         // IS NOT DISTINCT FROM in one join would null-match the = key too
         for (const auto &cond : op.conditions) {
-          if (cond.comparison == duckdb::ExpressionType::COMPARE_EQUAL) {
+          if (cond.GetComparisonType() == duckdb::ExpressionType::COMPARE_EQUAL) {
             return unsupported(
                 "mixed null-safe and plain equality join keys");
           }
@@ -6734,7 +6749,7 @@ private:
             duckdb::ExpressionClass::BOUND_REF) {
           return unsupported("DISTINCT over computed targets");
         }
-        if (target->Cast<duckdb::BoundReferenceExpression>().index != i) {
+        if (target->Cast<duckdb::BoundReferenceExpression>().Index() != i) {
           return unsupported("DISTINCT with reordered targets");
         }
       }
@@ -6759,7 +6774,7 @@ private:
                              "(use a plain column)");
         }
         spec->column_idxs.push_back(
-            target->Cast<duckdb::BoundReferenceExpression>().index);
+            target->Cast<duckdb::BoundReferenceExpression>().Index());
       }
       // Winner-pick order (which row survives per key) rides on the DISTINCT
       // node itself; the ORDER_BY operator above is presentation only
@@ -6772,7 +6787,7 @@ private:
           }
           auto &ref = o.expression->Cast<duckdb::BoundReferenceExpression>();
           NativeSortView::SortColumn sc;
-          sc.column_idx = static_cast<size_t>(ref.index);
+          sc.column_idx = static_cast<size_t>(ref.Index());
           sc.ascending = o.type != duckdb::OrderType::DESCENDING;
           sc.nulls_first =
               o.null_order == duckdb::OrderByNullType::NULLS_FIRST;
@@ -6831,7 +6846,7 @@ private:
         return -1;
       }
       return static_cast<int>(
-          expr.Cast<duckdb::BoundReferenceExpression>().index);
+          expr.Cast<duckdb::BoundReferenceExpression>().Index());
     }
 
     // Extract a constant int64 from a bare BOUND_CONSTANT; false otherwise.
@@ -6843,7 +6858,7 @@ private:
           duckdb::ExpressionClass::BOUND_CONSTANT) {
         return false;
       }
-      const auto &val = expr.Cast<duckdb::BoundConstantExpression>().value;
+      const auto &val = expr.Cast<duckdb::BoundConstantExpression>().GetValue();
       if (val.IsNull() || !val.type().IsNumeric()) {
         return false;
       }
@@ -6867,10 +6882,32 @@ private:
     // constant_int like every other frame literal.
     static bool constant_int(const duckdb::Expression &expr, int64_t &out) {
       const duckdb::Expression *cur = &expr;
-      while (cur->GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-        cur = cur->Cast<duckdb::BoundCastExpression>().child.get();
+      // DuckDB 2.0: a bound cast is a BoundFunctionExpression (the __cast
+      // scalar function); ExpressionClass::BOUND_CAST is gone and
+      // BoundCastExpression is now a set of static helpers over it.
+      while (duckdb::BoundCastExpression::IsCast(*cur)) {
+        cur = &duckdb::BoundCastExpression::Child(
+            cur->Cast<duckdb::BoundFunctionExpression>());
       }
       return bare_constant_int(*cur, out);
+    }
+
+    // True for a constant NULL (through any cast chain). DuckDB 2.0's
+    // lead/lag signature declares defaults for its optional arguments
+    // (offset = 1, default = NULL), so the binder pads every LEAD/LAG to
+    // three children — a padded NULL default means "no default", exactly as
+    // an absent BoundWindowExpression::default_expr did before 2.0.
+    static bool constant_null(const duckdb::Expression &expr) {
+      const duckdb::Expression *cur = &expr;
+      while (duckdb::BoundCastExpression::IsCast(*cur)) {
+        cur = &duckdb::BoundCastExpression::Child(
+            cur->Cast<duckdb::BoundFunctionExpression>());
+      }
+      if (cur->GetExpressionClass() !=
+          duckdb::ExpressionClass::BOUND_CONSTANT) {
+        return false;
+      }
+      return cur->Cast<duckdb::BoundConstantExpression>().GetValue().IsNull();
     }
 
     SpecPtr visit_window(duckdb::LogicalWindow &op) {
@@ -6910,22 +6947,22 @@ private:
           return unsupported("non-window expression in WINDOW");
         }
         auto &w = expr->Cast<duckdb::BoundWindowExpression>();
-        if (w.filter_expr || w.distinct || w.ignore_nulls ||
-            !w.arg_orders.empty() ||
-            w.exclude_clause != duckdb::WindowExcludeMode::NO_OTHER) {
+        if (w.Filter() || w.Distinct() || w.IgnoreNulls() ||
+            !w.ArgOrders().empty() ||
+            w.WindowExclude() != duckdb::WindowExcludeMode::NO_OTHER) {
           return unsupported("window FILTER/DISTINCT/IGNORE NULLS/EXCLUDE");
         }
 
         NativeWindowView::WindowDef def;
-        def.alias = expr->GetName();
-        def.start = w.start;
-        def.end = w.end;
+        def.alias = expr->GetName().GetIdentifierName();
+        def.start = w.WindowStart();
+        def.end = w.WindowEnd();
 
-        for (const auto &p : w.partitions) {
+        for (const auto &p : w.Partitions()) {
           def.partition_indices.push_back(
               static_cast<size_t>(resolve_col(*p)));
         }
-        for (const auto &o : w.orders) {
+        for (const auto &o : w.OrderBy()) {
           NativeSortView::SortColumn sc;
           sc.column_idx = static_cast<size_t>(resolve_col(*o.expression));
           sc.ascending = o.type != duckdb::OrderType::DESCENDING;
@@ -6946,7 +6983,7 @@ private:
           break;
         case duckdb::ExpressionType::WINDOW_NTILE:
           def.function = "NTILE";
-          if (w.children.empty() || !constant_int(*w.children[0], n)) {
+          if (w.GetChildren().empty() || !constant_int(*w.GetChildren()[0], n)) {
             return unsupported("NTILE with non-constant bucket count");
           }
           def.offset = static_cast<int>(n);
@@ -6957,18 +6994,22 @@ private:
                                  duckdb::ExpressionType::WINDOW_LAG
                              ? "LAG"
                              : "LEAD";
-          if (w.children.empty()) {
+          if (w.GetChildren().empty()) {
             return unsupported(def.function + " without argument");
           }
-          def.arg_column_idx = resolve_col(*w.children[0]);
+          def.arg_column_idx = resolve_col(*w.GetChildren()[0]);
           def.offset = 1;
-          if (w.offset_expr) {
-            if (!constant_int(*w.offset_expr, n)) {
+          // DuckDB 2.0: LEAD/LAG carry their offset and default as children
+          // [1] and [2] (BoundWindowExpression::offset_expr/default_expr are
+          // gone) — see WindowLeadLagStreamingState::ComputeOffset/Default.
+          if (w.GetChildren().size() > 1 && w.GetChildren()[1]) {
+            if (!constant_int(*w.GetChildren()[1], n)) {
               return unsupported(def.function + " with non-constant offset");
             }
             def.offset = static_cast<int>(n);
           }
-          if (w.default_expr) {
+          if (w.GetChildren().size() > 2 && w.GetChildren()[2] &&
+              !constant_null(*w.GetChildren()[2])) {
             return unsupported(def.function + " with a default value");
           }
           break;
@@ -6983,15 +7024,16 @@ private:
                   : t == duckdb::ExpressionType::WINDOW_LAST_VALUE
                         ? "LAST_VALUE"
                         : "NTH_VALUE";
-          if (w.children.empty()) {
+          if (w.GetChildren().empty()) {
             return unsupported(def.function + " without argument");
           }
-          def.arg_column_idx = resolve_col(*w.children[0]);
+          def.arg_column_idx = resolve_col(*w.GetChildren()[0]);
           if (t == duckdb::ExpressionType::WINDOW_NTH_VALUE) {
             // constant_int (cast-unwrapping), not bare_constant_int: the
             // render is frame-relative now (see dbsp_window_view.hpp), so
             // the deliberate narrow gate documented above is lifted.
-            if (w.children.size() < 2 || !constant_int(*w.children[1], n)) {
+            if (w.GetChildren().size() < 2 ||
+                !constant_int(*w.GetChildren()[1], n)) {
               return unsupported("NTH_VALUE with non-constant N");
             }
             def.offset = static_cast<int>(n);
@@ -7000,7 +7042,9 @@ private:
         }
         case duckdb::ExpressionType::WINDOW_AGGREGATE: {
           std::string fn =
-              duckdb::StringUtil::Upper(w.aggregate ? w.aggregate->name : "");
+              duckdb::StringUtil::Upper(w.AggregateFunction()
+                                        ? w.AggregateFunction()->GetName().GetIdentifierName()
+                                        : std::string());
           if (fn == "COUNT_STAR") {
             fn = "COUNT";
           }
@@ -7009,8 +7053,8 @@ private:
             return unsupported("window aggregate " + fn);
           }
           def.function = fn;
-          if (!w.children.empty()) {
-            def.arg_column_idx = resolve_col(*w.children[0]);
+          if (!w.GetChildren().empty()) {
+            def.arg_column_idx = resolve_col(*w.GetChildren()[0]);
           }
           break;
         }
@@ -7021,14 +7065,14 @@ private:
         }
 
         // Frame offsets must be constants when boundaries use expressions
-        if (w.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS) {
-          if (!w.start_expr || !constant_int(*w.start_expr, n)) {
+        if (w.WindowStart() == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS) {
+          if (!w.StartExpr() || !constant_int(*w.StartExpr(), n)) {
             return unsupported("non-constant frame start");
           }
           def.start_offset = static_cast<int>(n);
         }
-        if (w.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
-          if (!w.end_expr || !constant_int(*w.end_expr, n)) {
+        if (w.WindowEnd() == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS) {
+          if (!w.EndExpr() || !constant_int(*w.EndExpr(), n)) {
             return unsupported("non-constant frame end");
           }
           def.end_offset = static_cast<int>(n);
@@ -7061,7 +7105,7 @@ private:
       std::vector<ColumnInfo> window_cols;
       for (duckdb::idx_t i = 0; i < num_windows; i++) {
         window_cols.push_back(
-            {op.expressions[i]->GetName(), op.types[ncols + i]});
+            {op.expressions[i]->GetName().GetIdentifierName(), op.types[ncols + i]});
       }
 
       if (helper_exprs.empty()) {
@@ -7090,8 +7134,8 @@ private:
       for (size_t k = 0; k < nhelp; k++) {
         pre_map->exprs.push_back(helper_exprs[k]);
         widened_cols.push_back({"__w_expr_" + std::to_string(k),
-                                helper_exprs[k]->return_type});
-        widened_types.push_back(helper_exprs[k]->return_type);
+                                helper_exprs[k]->GetReturnType()});
+        widened_types.push_back(helper_exprs[k]->GetReturnType());
       }
       pre_map->children.push_back(std::move(child));
 
@@ -7132,14 +7176,14 @@ private:
       if (!def) {
         return nullptr;
       }
-      cte_columns[op.table_index] = columns;
+      cte_columns[op.table_index.index] = columns;
       auto main = visit(*op.children[1]);
       if (!main) {
         return nullptr;
       }
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::CTE;
-      spec->cte_index = op.table_index;
+      spec->cte_index = op.table_index.index;
       spec->children.push_back(std::move(def));
       spec->children.push_back(std::move(main));
       // columns already reflect the main query's output
@@ -7158,14 +7202,14 @@ private:
       if (!op.key_targets.empty()) {
         return unsupported("recursive CTE USING KEY");
       }
-      recursive_cte_indexes.insert(op.table_index);
+      recursive_cte_indexes.insert(op.table_index.index);
       auto anchor = visit(*op.children[0]);
       if (!anchor) {
         return nullptr;
       }
       // Output layout = anchor layout (ResolveTypes: types = children[0])
       auto anchor_cols = columns;
-      cte_columns[op.table_index] = anchor_cols; // step's CTE_SCAN resolves
+      cte_columns[op.table_index.index] = anchor_cols; // step's CTE_SCAN resolves
       auto step = visit(*op.children[1]);
       if (!step) {
         return nullptr;
@@ -7180,7 +7224,7 @@ private:
       // assert_step_linear); reject loudly instead.
       PlannedCircuitView::StepLinearity step_shape;
       PlannedCircuitView::scan_step_linearity(
-          *step, rec_cte_sentinel(op.table_index), step_shape);
+          *step, rec_cte_sentinel(op.table_index.index), step_shape);
       if (step_shape.has_weight_nonlinear_op) {
         return unsupported(
             "recursive step contains a row-collapsing operator "
@@ -7192,41 +7236,41 @@ private:
       spec->kind = PlanOpSpec::Kind::REC_CTE;
       spec->set_op = op.union_all ? PlanOpSpec::SetOp::UNION_ALL
                                   : PlanOpSpec::SetOp::UNION;
-      spec->cte_index = op.table_index;
+      spec->cte_index = op.table_index.index;
       spec->children.push_back(std::move(anchor));
       spec->children.push_back(std::move(step));
       return spec;
     }
 
     SpecPtr visit_cte_ref(duckdb::LogicalCTERef &op) {
-      if (recursive_cte_indexes.count(op.cte_index)) {
-        auto rec_it = cte_columns.find(op.cte_index);
+      if (recursive_cte_indexes.count(op.cte_index.index)) {
+        auto rec_it = cte_columns.find(op.cte_index.index);
         if (rec_it == cte_columns.end()) {
           return unsupported("self-reference outside its recursive CTE");
         }
         auto spec = std::make_unique<PlanOpSpec>();
         spec->kind = PlanOpSpec::Kind::SOURCE;
-        spec->table = rec_cte_sentinel(op.cte_index);
+        spec->table = rec_cte_sentinel(op.cte_index.index);
         columns.clear();
         for (duckdb::idx_t i = 0; i < op.chunk_types.size(); i++) {
           std::string name = i < op.bound_columns.size()
-                                 ? op.bound_columns[i]
+                                 ? op.bound_columns[i].GetIdentifierName()
                                  : rec_it->second[i].name;
           columns.push_back({name, op.chunk_types[i]});
         }
         return spec;
       }
-      auto it = cte_columns.find(op.cte_index);
+      auto it = cte_columns.find(op.cte_index.index);
       if (it == cte_columns.end()) {
         return unsupported("reference to an untranslated CTE");
       }
       auto spec = std::make_unique<PlanOpSpec>();
       spec->kind = PlanOpSpec::Kind::CTE_REF;
-      spec->cte_index = op.cte_index;
+      spec->cte_index = op.cte_index.index;
       columns.clear();
       for (duckdb::idx_t i = 0; i < op.chunk_types.size(); i++) {
         std::string name = i < op.bound_columns.size()
-                               ? op.bound_columns[i]
+                               ? op.bound_columns[i].GetIdentifierName()
                                : it->second[i].name;
         columns.push_back({name, op.chunk_types[i]});
       }
@@ -7240,7 +7284,7 @@ private:
       if (!table_entry) {
         return unsupported("non-table scan (" + op.function.name + ")");
       }
-      if (!op.table_filters.filters.empty()) {
+      if (op.table_filters.HasFilters()) {
         return unsupported("GET with pushed-down table filters");
       }
       if (!op.projection_ids.empty()) {
@@ -7255,7 +7299,7 @@ private:
       // entries keep their bare name: views-on-views bind through TEMP
       // shadow tables whose names must match the referenced view's key.
       if (table_entry->ParentCatalog().GetName() == TEMP_CATALOG) {
-        source->table = table_entry->name;
+        source->table = table_entry->name.GetIdentifierName();
       } else {
         source->table = canonical_table_key(*table_entry);
       }
@@ -7285,7 +7329,7 @@ private:
           identity = false;
         }
         idxs.push_back(col);
-        columns.push_back({op.names[col], op.returned_types[col]});
+        columns.push_back({op.names[col].GetIdentifierName(), op.returned_types[col]});
       }
       if (identity) {
         return source;
