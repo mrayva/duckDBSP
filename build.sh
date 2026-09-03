@@ -4,7 +4,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-DUCKDB_VERSION="v1.5.4"
+DUCKDB_VERSION="v2.0.0-alpha39998"
+DUCKDB_COMMIT="a00803f7687ca3d7188d417216e288c5c4b22b58"
 
 echo "=== DBSP DuckDB Extension Build ==="
 echo ""
@@ -13,9 +14,13 @@ echo ""
 # checkout of this repo leaves duckdb/ as an EMPTY submodule dir, and git
 # commands run inside it silently resolve against THIS repo — the patch
 # reverse-check then false-positives and the build fails at configure.
+# Alpha engines are pinned by COMMIT (a tag would drift with the branch).
 if [ ! -f "$SCRIPT_DIR/duckdb/CMakeLists.txt" ]; then
-    echo "Fetching DuckDB ${DUCKDB_VERSION}..."
-    git clone --depth 1 --branch ${DUCKDB_VERSION} https://github.com/duckdb/duckdb.git "$SCRIPT_DIR/duckdb"
+    echo "Fetching DuckDB ${DUCKDB_VERSION} (${DUCKDB_COMMIT})..."
+    git init -q "$SCRIPT_DIR/duckdb"
+    git -C "$SCRIPT_DIR/duckdb" remote add origin https://github.com/duckdb/duckdb.git
+    git -C "$SCRIPT_DIR/duckdb" fetch --depth 1 origin "$DUCKDB_COMMIT"
+    git -C "$SCRIPT_DIR/duckdb" checkout --detach FETCH_HEAD
 fi
 
 # Guard: duckdb/ must be its own git checkout (patch checks below would
@@ -29,7 +34,9 @@ fi
 # Apply the engine patches (the patch files ARE the fork — stock DuckDB lacks
 # the txn-callback symbols the extension needs). Idempotent: skip patches the
 # tree already carries, fail loudly if one neither applies nor reverse-applies.
+if [ "${DBSP_ENGINE_HOOK:-ON}" = "ON" ]; then
 for patch in "$SCRIPT_DIR"/patches/*.patch; do
+    [ -e "$patch" ] || { echo "No engine patch for ${DUCKDB_VERSION} — building hook-OFF"; DBSP_ENGINE_HOOK=OFF; break; }
     if git -C "$SCRIPT_DIR/duckdb" apply --check --reverse "$patch" 2>/dev/null; then
         echo "Patch already applied: $(basename "$patch")"
     elif git -C "$SCRIPT_DIR/duckdb" apply --check "$patch" 2>/dev/null; then
@@ -41,6 +48,7 @@ for patch in "$SCRIPT_DIR"/patches/*.patch; do
         exit 1
     fi
 done
+fi
 
 # Create build directory
 mkdir -p "$BUILD_DIR"
@@ -59,9 +67,11 @@ fi
 
 # Configure
 echo "Configuring..."
-cmake .. \
+DUCKDB_VERSION="$DUCKDB_VERSION" cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DDUCKDB_SOURCE_DIR="$SCRIPT_DIR/duckdb" \
+    -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_VERSION" \
+    -DDBSP_ENGINE_HOOK="${DBSP_ENGINE_HOOK:-ON}" \
     "${CMAKE_EXTRA_ARGS[@]}"
 
 # Build (parallelism capped at 8 — higher has frozen this machine before)
