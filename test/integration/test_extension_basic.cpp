@@ -308,3 +308,100 @@ TEST_CASE("MIN and MAX aggregate functions", "[integration][aggregates]") {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// DuckDB 2.0 chunk-size invariant on the table-function read surface.
+//
+// On 2.0 a Vector carries its own size and DataChunk::SetCardinality sets only
+// the chunk's logical count, leaving the child vectors at 0 (see the note at
+// the top of src/dbsp_extension.cpp). Every DBSP table function used to end
+// that way, so every chunk it emitted violated the engine's own invariant.
+//
+// These two cases are the proof. Against the pre-fix binary the first one
+// THROWS ("DataChunk::Verify - size mismatch: vector 0 (VARCHAR) has size 0
+// but chunk has size 1") on the very first dbsp_ call under
+// debug_verification_mode='verify_vectors'. The second pins the read-surface
+// answers that the stale sizes put at risk: dbsp_query has no filter
+// pushdown, so `WHERE col IS [NOT] NULL` lands a PhysicalFilter directly on
+// the scan, and IsNull/IsNotNull read the input vector's own size.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("read surface: chunks satisfy VERIFY_VECTORS",
+          "[integration][extension][verify_vectors]") {
+  DuckDBTestHarness db;
+  // debug_verification_mode is read from DBConfigOptions::global_verification_mode,
+  // a PROCESS-wide static (DataChunk::VerifyInternal), so it outlives this
+  // harness's DatabaseInstance and would poison every later test in this
+  // binary. Reset it from a destructor: a REQUIRE failure or an engine throw
+  // unwinds out of this test case, and a plain trailing SET would be skipped.
+  struct VerifyModeGuard {
+    DuckDBTestHarness &h;
+    ~VerifyModeGuard() {
+      h.query("SET GLOBAL debug_verification_mode='none'");
+    }
+  } guard{db};
+  db.exec("SET GLOBAL debug_verification_mode='verify_vectors'");
+  REQUIRE(db.query("SELECT current_setting('debug_verification_mode')")
+              ->GetValue(0, 0)
+              .ToString() == "VERIFY_VECTORS");
+
+  db.createTable("vt", "id INT, val INT, tag VARCHAR",
+                 {"(1, 10, 'a')", "(2, NULL, 'b')", "(3, 30, NULL)"});
+  // Each of these drives a different table function's scan callback; under
+  // VERIFY_VECTORS any one of them with unsized child vectors throws at
+  // PipelineExecutor::FetchFromSource.
+  db.exec("SELECT * FROM dbsp_track('vt')");
+  db.exec("SELECT * FROM dbsp_sync('vt')");
+  db.exec("SELECT * FROM dbsp_create_view('vv', "
+          "'SELECT id, val, tag FROM vt')");
+  db.exec("SELECT * FROM dbsp_query('vv')");
+  db.exec("SELECT * FROM dbsp_views()");
+  db.exec("SELECT * FROM dbsp_tables()");
+  db.exec("SELECT * FROM dbsp_stats()");
+  db.exec("SELECT * FROM dbsp_changes('vv')");
+  db.exec("SELECT * FROM dbsp_deps('vv')");
+  // and through operators stacked on the scan
+  db.exec("SELECT * FROM dbsp_query('vv') WHERE val IS NULL");
+  db.exec("SELECT count(*) FROM dbsp_query('vv') WHERE tag IS NOT NULL");
+  db.exec("SELECT * FROM dbsp_query('vv') ORDER BY id DESC");
+  db.exec("SELECT dbsp_drop('vv')"); // scalar fn, not a table fn
+  // reset happens in ~VerifyModeGuard
+}
+
+TEST_CASE("read surface: IS [NOT] NULL over dbsp_query matches SQL",
+          "[integration][extension]") {
+  DuckDBTestHarness db;
+  db.createTable("nt", "id INT, val INT, tag VARCHAR",
+                 {"(1, 10, 'a')", "(2, NULL, 'b')", "(3, 30, NULL)",
+                  "(4, NULL, NULL)", "(5, 50, 'e')"});
+  db.exec("SELECT * FROM dbsp_track('nt')");
+  db.exec("SELECT * FROM dbsp_sync('nt')");
+  db.exec("SELECT * FROM dbsp_create_view('nv', "
+          "'SELECT id, val, tag FROM nt')");
+
+  auto same = [&](const std::string &over_view, const std::string &over_sql) {
+    auto actual = db.query(over_view);
+    auto expected = db.query(over_sql);
+    INFO("view q: " << over_view);
+    REQUIRE_FALSE(actual->HasError());
+    REQUIRE_FALSE(expected->HasError());
+    REQUIRE(actual->RowCount() == expected->RowCount());
+    for (size_t r = 0; r < expected->RowCount(); r++) {
+      for (size_t c = 0; c < expected->ColumnCount(); c++) {
+        REQUIRE(actual->GetValue(c, r).ToString() ==
+                expected->GetValue(c, r).ToString());
+      }
+    }
+  };
+  same("SELECT id FROM dbsp_query('nv') WHERE val IS NULL ORDER BY ALL",
+       "SELECT id FROM nt WHERE val IS NULL ORDER BY ALL");
+  same("SELECT id FROM dbsp_query('nv') WHERE val IS NOT NULL ORDER BY ALL",
+       "SELECT id FROM nt WHERE val IS NOT NULL ORDER BY ALL");
+  same("SELECT id FROM dbsp_query('nv') WHERE tag IS NULL ORDER BY ALL",
+       "SELECT id FROM nt WHERE tag IS NULL ORDER BY ALL");
+  same("SELECT id, val IS NULL FROM dbsp_query('nv') ORDER BY ALL",
+       "SELECT id, val IS NULL FROM nt ORDER BY ALL");
+  same("SELECT tag IS NULL AS n, count(*) FROM dbsp_query('nv') "
+       "GROUP BY 1 ORDER BY ALL",
+       "SELECT tag IS NULL AS n, count(*) FROM nt GROUP BY 1 ORDER BY ALL");
+}

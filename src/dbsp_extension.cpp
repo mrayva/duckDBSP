@@ -32,6 +32,35 @@
 //   -- View dependencies
 //   SELECT * FROM dbsp_deps('view_name');
 //   SELECT dbsp_drop_cascade('view_name'); -- Drop view and dependents
+//
+// ---------------------------------------------------------------------------
+// Table-function output chunks: ALWAYS finish a scan callback with
+// output.SetChildCardinality(n), never SetCardinality(n).
+//
+// On DuckDB 2.0 a Vector carries its own size. DataChunk::SetCardinality is
+// deprecated and sets ONLY the chunk's logical count -- it deliberately leaves
+// every child vector at the size Reset() gave it (0), and
+// StandardVectorBuffer::SetValue does not grow it either
+// (duckdb/src/common/vector/flat_vector.cpp:279). The result is a chunk whose
+// size() says n while every column says 0. That is an invariant violation the
+// engine checks for: with debug_verification_mode='verify_vectors',
+// PipelineExecutor::FetchFromSource throws
+//   "DataChunk::Verify - size mismatch: vector 0 (VARCHAR) has size 0 but
+//    chunk has size 1"
+// on the first DBSP table function called. It is silent by default only
+// because global_verification_mode is NONE (duckdb/src/main/config.cpp:28).
+// Operators above the scan mostly self-heal (ExpressionExecutor::Execute
+// restamps a result from input->size(), expression_executor.cpp:93), which is
+// why this produced no wrong answers in practice -- but it is the same
+// mechanism that made every `x IS [NOT] NULL` false in the planner frontend
+// (see CHANGELOG), and DuckDB's own table functions were all migrated to
+// SetChildCardinality (arrow.cpp:208, range.cpp:381, repeat.cpp:46,
+// repeat_row.cpp:50, direct_file_reader.cpp:179).
+//
+// The rule is uniform, including the "emit nothing" n == 0 early returns:
+// SetCardinalityUnsafe(0) would be correct only for as long as nothing above
+// it writes a row, and that is not a property worth re-deriving per site.
+// ---------------------------------------------------------------------------
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -135,7 +164,7 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException(formatted_error);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto schema = manager.get_table_schema(data.table_name);
   string cols =
       schema ? std::to_string(schema->columns.size()) + " columns" : "";
@@ -263,7 +292,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
     result = "Created " + type + " view: " + data.view_name;
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(result));
   data.done = true;
 }
@@ -344,7 +373,7 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
   manager.on_insert(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value("Notified insert into " + data.table_name));
   data.done = true;
 }
@@ -361,7 +390,7 @@ void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
   manager.on_delete(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value("Notified delete from " + data.table_name));
   data.done = true;
 }
@@ -408,11 +437,11 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.sync_all) {
     manager.sync_all(context);
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0, Value("Synced all tracked tables"));
   } else {
     bool ok = manager.sync_table(context, CanonicalTableRef(context, data.table_name));
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
   }
@@ -505,7 +534,7 @@ void QueryFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -584,7 +613,7 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -628,11 +657,11 @@ void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
                   DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<MvTablesBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value(data.message));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -683,12 +712,12 @@ void RealizeFunc(ClientContext &context, TableFunctionInput &input,
                  DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<RealizeBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value::BOOLEAN(data.was_pending));
   output.SetValue(1, 0, Value::BIGINT(data.state_bytes));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -723,11 +752,11 @@ void WaitTeardownFunc(ClientContext &context, TableFunctionInput &input,
                       DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<WaitTeardownBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value(data.message));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -791,7 +820,7 @@ void ViewStateFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -852,7 +881,7 @@ void TableStateFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -903,7 +932,7 @@ void DeltaGenerationsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -956,7 +985,7 @@ void ListViewsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1004,7 +1033,7 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1056,7 +1085,7 @@ void StatsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1197,7 +1226,7 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException("%s", msg);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(msg));
   data.done = true;
 }
@@ -1317,7 +1346,7 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   }
   msg += ")";
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(msg));
   data.done = true;
 }
@@ -1383,7 +1412,7 @@ void DepsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1428,20 +1457,20 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.is_auto_sync_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Auto-sync is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_auto_sync();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-sync ENABLED: views will update on transaction commit"));
     } else {
       manager.disable_auto_sync();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-sync DISABLED: use dbsp_sync() for manual updates"));
@@ -1496,21 +1525,21 @@ void AutoPersistFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.autopersist_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Auto-persist is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_autopersist();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-persist ENABLED: views survive a clean connection "
                 "reopen"));
     } else {
       manager.disable_autopersist();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-persist DISABLED: use dbsp_save()/dbsp_load() "
@@ -1560,7 +1589,7 @@ void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.n < 0) {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value("Auto-persist checkpoint interval: " +
@@ -1568,7 +1597,7 @@ void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
               " commits (0 = off)"));
   } else {
     manager.set_autopersist_interval(static_cast<size_t>(data.n));
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value("Auto-persist checkpoint interval set to " +
                           std::to_string(data.n) + " commits"));
@@ -1626,21 +1655,21 @@ void LazyRestoreFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.lazy_restore_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Lazy restore is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_lazy_restore();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Lazy restore ENABLED: checkpointed views decode on first "
                 "need"));
     } else {
       manager.disable_lazy_restore();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Lazy restore DISABLED: dbsp_load() restores every "
@@ -1687,13 +1716,13 @@ void ParallelFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.get_parallel_sync();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value(string("Parallel mode is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
   } else {
     manager.set_parallel_sync(data.enable);
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(data.enable
@@ -1742,16 +1771,16 @@ void SpillFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.spill_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value(string("Baseline spill is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
   } else if (!manager.set_spill(context, data.enable)) {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0, Value("Spill toggle FAILED: " +
                                 manager.last_error()));
   } else {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(data.enable
@@ -1802,7 +1831,7 @@ void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
 
   // The planner is the only frontend since Phase C5 (the bespoke parser was
   // deleted); toggling is a no-op kept for backwards compatibility
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0,
                   Value("Planner frontend is ENABLED (always: the bespoke "
                         "parser was removed in Phase C5)"));
@@ -1845,7 +1874,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<CreateMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
@@ -1872,7 +1901,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
   }
 
   // Return success message
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto info = manager.get_view_info(state.view_name);
   string sources = "";
   for (size_t i = 0; i < info.source_tables.size(); i++) {
@@ -1917,7 +1946,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
   auto &state = input.bind_data->CastNoConst<ReplaceViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
@@ -1934,7 +1963,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException(error);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto info = manager.get_view_info(state.view_name);
   string sources = "";
   for (size_t i = 0; i < info.source_tables.size(); i++) {
@@ -1977,7 +2006,7 @@ void DropMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<DropMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
@@ -2026,7 +2055,7 @@ void DropMaterializedViewExecute(ClientContext &context,
   }
 
   // Return success message
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   string message = "Dropped materialized view: " + state.view_name;
   if (dropped_count > 1) {
     message +=
@@ -2062,12 +2091,12 @@ void RefreshMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<RefreshMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
   // REFRESH is a no-op since views are automatically incremental
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(
       0, 0,
       Value("Materialized view '" + state.view_name +

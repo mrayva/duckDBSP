@@ -12,7 +12,7 @@ creates views, and exits WITHOUT closing its connection prints all its
 output and then dies with `SIGSEGV` (exit 139). The 1.5.4 build under
 `duckdb==1.5.4` does not do this (0/5).
 
-**Repro** (2/5 to 3/8 of runs):
+**Repro** (2 of 5 runs, and 2 of 8 on a repeat):
 
 ```bash
 uv run --isolated --with 'duckdb==1.6.0.dev379' python \
@@ -78,11 +78,69 @@ leaked/never-destroyed singleton.
   `include/dbsp_plan_translator.hpp`) now call
   `DataChunk::SetChildCardinality`, which stamps each child vector's size
   via `FlatVector::SetSize` without touching the data just written.
-  Table-function output chunks in `src/dbsp_extension.cpp` are unaffected
-  (verified): DuckDB's own pipeline normalises those.
-- Law: on DuckDB 2.0, a hand-filled DataChunk that is handed to an
-  `ExpressionExecutor` must set the CHILD cardinality. `SetCardinality`
-  compiles with only a deprecation warning and fails silently-wrong.
+- The SAME defect was live at all 48 table-function output sites in
+  `src/dbsp_extension.cpp` and at `include/dbsp_plan_tee.hpp:123`; they are
+  converted in the same sweep. An earlier revision of this entry claimed
+  they were "unaffected ... DuckDB's own pipeline normalises those". That
+  claim was wrong and was based on one passing query. What actually
+  happens: every chunk those functions emitted violated the engine's own
+  invariant, and `SET GLOBAL debug_verification_mode='verify_vectors'`
+  proves it — `PipelineExecutor::FetchFromSource` throws
+  `"DataChunk::Verify - size mismatch: vector 0 (VARCHAR) has size 0 but
+  chunk has size 1"` on the FIRST `dbsp_` call. It was silent by default
+  only because `global_verification_mode` is `NONE`
+  (`duckdb/src/main/config.cpp:28`), and it produced no wrong answers in
+  the shapes reachable through `dbsp_query` only because operators above
+  the scan re-stamp sizes (`ExpressionExecutor::Execute` does
+  `result.SetChildCardinality(input->size())`,
+  `expression_executor.cpp:93`). That is luck, not a guarantee — some
+  shapes self-heal and others would not. DuckDB's own table functions were
+  all migrated (`arrow.cpp:208`, `range.cpp:381`, `repeat.cpp:46`,
+  `repeat_row.cpp:50`, `direct_file_reader.cpp:179`).
+- Regression tests: `test/integration/test_extension_basic.cpp` —
+  `read surface: chunks satisfy VERIFY_VECTORS` (runs the whole read
+  surface under `verify_vectors`; throws on the pre-fix binary) and
+  `read surface: IS [NOT] NULL over dbsp_query matches SQL`.
+- Law: on DuckDB 2.0, a hand-filled DataChunk — one handed to an
+  `ExpressionExecutor`, or one returned from a table function — must set
+  the CHILD cardinality. `SetCardinality` compiles with only a deprecation
+  warning and fails silently-wrong. Run the suite under
+  `debug_verification_mode='verify_vectors'` after any engine bump; it is
+  the only thing that makes this class of bug loud.
+
+## Planner follow-up: shapes that decline on 2.0, and paths that went dead - Sep 2026
+
+Accepted declines for this phase (a decline is never a wrong answer, and
+NumPad emits none of these). Each is pinned by a test that asserts the
+specific decline text, so accepting one later is a visible change.
+
+- `quantile_cont` / `quantile_disc`: 2.0 keeps the fraction as a second
+  aggregate child instead of erasing it into `QuantileBindData`, so the
+  translator's `children.size() == 1` gate rejects it.
+- `mode`: 2.0's binder resolves it to `arg_max`, unknown to the
+  aggregate-name switch.
+- Correlated SCALAR subquery: 2.0 decorrelates it into materialized delim
+  CTEs plus a plain `LogicalComparisonJoin` of `JoinType::SINGLE` that also
+  carries a `left/right_projection_map`. Mapping `SINGLE => LEFT` (as the
+  DELIM path does) is necessary but not sufficient — the projection-map
+  decline sits behind it. Correlated EXISTS / NOT EXISTS / IN are
+  unaffected: they decorrelate to MARK joins without projection maps.
+
+**Coverage lost, and not yet replaced.** 2.0's rewrite means several
+translator paths are no longer reached by the suite, so they are now
+untested rather than known-good. Whoever takes the follow-up should decide
+whether to keep or delete them:
+
+- `Walker::visit_delim_join` and its `SINGLE`/`MARK`/`INNER`/`LEFT` cases,
+  plus the `delim_columns_stack` bookkeeping — 2.0 emits materialized delim
+  CTEs, not `LOGICAL_DELIM_JOIN`, so this whole path is dead for freshly
+  bound plans.
+- `Walker::visit_delim_get` (`PlanOpSpec::Kind::DELIM_REF`), reachable only
+  from the above.
+- The DELIM path's `!cond.IsComparison()` guard added in Task 4.
+- The non-empty `LogicalInsert::column_index_map` branch in
+  `include/dbsp_plan_tee.hpp` (2.0 populates the map only when
+  deserializing a pre-2.0 plan).
 
 ## INSERT defaults now resolve below the tee (DuckDB 2.0) - Sep 2026
 

@@ -120,7 +120,13 @@ public:
       for (duckdb::idx_t c = 0; c < n_output; c++) {
         chunk.data[c].Reference(input.data[c]);
       }
-      chunk.SetCardinality(input.size());
+      // Unsafe variant is the correct one here: every output column is a
+      // Reference to the matching input column, so the child vectors already
+      // carry input's sizes and only the chunk's logical count is missing.
+      // (A plain SetCardinality would be the DuckDB 2.0 stale-child-size trap
+      // documented at the top of src/dbsp_extension.cpp; SetChildCardinality
+      // would re-stamp sizes that are already correct.)
+      chunk.SetCardinalityUnsafe(input.size());
     }
     return duckdb::OperatorResultType::NEED_MORE_INPUT;
   }

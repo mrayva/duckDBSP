@@ -418,8 +418,10 @@ TEST_CASE("planner frontend: self-correlated subquery and table-less recursion",
       "WHERE b.tag = a.tag)')");
   REQUIRE(corr->HasError());
   INFO("decline: " << corr->GetError());
-  REQUIRE(corr->GetError().find("unsupported in planner frontend") !=
-          std::string::npos);
+  // Pin the specific 2.0 cause, not just "declined": visit_join's join-type
+  // switch is what rejects it. If a later change accepts SINGLE, this fires
+  // and the next decline (projection maps) has to be pinned instead.
+  REQUIRE(corr->GetError().find("join type SINGLE") != std::string::npos);
   REQUIRE(db.manager().get_view("v_corr") == nullptr);
 
   // Recursive CTE: planner rejects, parser path handles it
@@ -1122,8 +1124,11 @@ TEST_CASE("planner E2: correlated scalar subquery declines on 2.0",
                       "')");
   REQUIRE(res->HasError());
   INFO("decline: " << res->GetError());
-  REQUIRE(res->GetError().find("unsupported in planner frontend") !=
-          std::string::npos);
+  // Pin the specific 2.0 cause. This one reports the join TYPE because the
+  // type switch runs first; the projection-map decline sits behind it (proved
+  // by temporarily mapping SINGLE to LEFT, which moved the message to
+  // "join with projection maps"). Both must be handled to accept the shape.
+  REQUIRE(res->GetError().find("join type SINGLE") != std::string::npos);
   REQUIRE(db.manager().get_view("v_corr") == nullptr);
 }
 
