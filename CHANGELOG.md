@@ -77,12 +77,17 @@ kept at `patches/archive/`).
 - **Hook points are unchanged.** `UndoBuffer::Commit`,
   `UndoBuffer::IterateEntries` and `DuckTransaction::Commit` all still exist
   with the same signatures, and the callback still fires between
-  `undo_buffer.Commit(...)` and the WAL flush. Two of the four hunks needed
-  re-cutting for context drift only (the header's forward-declaration block,
-  which 2.0 extended with `class CommitDropState;`, and the `Commit`
-  insertion point, which 2.0 follows with a
+  `undo_buffer.Commit(...)` and the WAL flush. Four of the patch's six hunks
+  rejected on CONTEXT drift alone and were re-cut by hand: 2.0 added
+  `class CommitDropState;` to the header's forward declarations and rewrote
+  the doc comment above `UndoBuffer::Commit`, and in `duck_transaction.cpp`
+  it added five includes above the first hunk's anchor and now follows
+  `undo_buffer.Commit(...)` with a
   `Settings::Get<DebugForceCommitFailureSetting>` check rather than the old
-  commented-out `DebugForceAbortCommit`).
+  commented-out `DebugForceAbortCommit`. Both `undo_buffer.cpp` hunks —
+  including the 200-line `StreamModifications` body — applied as-is (one at
+  an offset), despite the file shrinking 428 -> 217 lines as 2.0 moved the
+  commit logic out to `commit_state.cpp`.
 - **`StreamModifications` needed two real adaptations to 2.0 layouts.**
   1. The undo entries now carry the *catalog entry*, not the storage table:
      `AppendInfo::table`, `DeleteInfo::table` and `UpdateInfo::table` are all
@@ -102,7 +107,7 @@ kept at `patches/archive/`).
   their signatures.
 - **The SetCardinality law is satisfied without new code.** 2.0's
   `RowGroupCollection::Fetch` sets the child cardinality itself
-  (`row_group_collection.cpp:519,590`), so the chunks `StreamModifications`
+  (`row_group_collection.cpp:519,591`), so the chunks `StreamModifications`
   appends to its `ColumnDataCollection`s are correctly sized. The patch
   contains no `SetCardinality` call.
 - **Semantics re-verified, not assumed.** Old images carry weight -1, new
