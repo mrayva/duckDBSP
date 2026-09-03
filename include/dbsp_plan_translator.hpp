@@ -6450,10 +6450,23 @@ private:
           }
           if (agg_spec.fn == PlanAggSpec::Fn::STRING_AGG &&
               agg.BindInfo()) {
-            // DuckDB's bind erases the separator argument and stores it
-            // in a TU-local StringAggBindData { string sep; }. The engine
-            // is pinned (v1.5.4, built in-tree), so a layout mirror is
-            // safe; sep is the sole member after the FunctionData base.
+            // DuckDB's bind erases the separator argument and stores it in
+            // a StringAggBindData that is private to its own translation
+            // unit (extension/core_functions/aggregate/distributive/
+            // string_agg.cpp), so there is no supported way to read it.
+            // This mirrors that struct's LAYOUT: `string sep` as the sole
+            // member after the FunctionData base.
+            //
+            // UNSAFE BY CONSTRUCTION, kept only because it is verified.
+            // The engine is pinned in-tree (currently v2.0.0-alpha39998),
+            // and the layout was re-checked against 2.0's source and
+            // re-verified empirically by the differential sweep
+            // (`string_agg(v, '-' ORDER BY v)` byte-identical to plain
+            // SQL). Neither of those is a guarantee: nothing here fails to
+            // compile if upstream adds a member or reorders it — it would
+            // read the wrong bytes and produce a wrong separator. RE-VERIFY
+            // ON EVERY ENGINE BUMP, and prefer a supported accessor if one
+            // ever appears.
             struct SeparatorMirror : public duckdb::FunctionData {
               std::string sep;
               duckdb::unique_ptr<duckdb::FunctionData>
@@ -6874,7 +6887,7 @@ private:
     }
 
     // Extract a constant int64 from a bare BOUND_CONSTANT; false otherwise.
-    // No BOUND_CAST unwrapping -- see constant_int() below for why that
+    // Does NOT unwrap casts -- see constant_int() below for why that
     // matters.
     static bool bare_constant_int(const duckdb::Expression &expr,
                                   int64_t &out) {
@@ -6891,9 +6904,11 @@ private:
     }
 
     // Extract a constant int64; false if not a non-NULL constant. The
-    // binder wraps frame/offset literals in a BOUND_CAST shell (e.g.
-    // `11 PRECEDING` arrives as CAST(11 AS BIGINT)), so unwrap any chain of
-    // BOUND_CAST nodes before checking for BOUND_CONSTANT underneath.
+    // binder wraps frame/offset literals in a cast (e.g. `11 PRECEDING`
+    // arrives as CAST(11 AS BIGINT)), so unwrap any chain of cast nodes
+    // before checking for BOUND_CONSTANT underneath. In DuckDB 2.0 a bound
+    // cast is a BoundFunctionExpression (the `__cast` scalar function) —
+    // see the inline comment in the loop below.
     //
     // Used for window frame bounds (start_expr/end_expr), LAG/LEAD offsets,
     // and -- as of the lazy-restore-ntile fix -- NTILE's bucket count:

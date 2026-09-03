@@ -37,14 +37,14 @@
 // DuckDB 2.0: UpdateStatement only forward-declares its UpdateQueryNode
 #include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
-// DuckDB 2.0: TableStorageInfo is no longer pulled in transitively
-#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
+// DuckDB 2.0: TableStorageInfo is no longer pulled in transitively
+#include "duckdb/storage/table_storage_info.hpp"
 
 #include <memory>
 #include <string>

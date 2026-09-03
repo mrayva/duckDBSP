@@ -84,6 +84,12 @@ JOBS=$(( NCPU < 8 ? NCPU : 8 ))
 echo "Building (-j${JOBS})..."
 cmake --build . -j"${JOBS}"
 
+# The DuckDB shell is NOT part of `all`: the root CMakeLists sets BUILD_SHELL ON
+# but pulls the DuckDB tree in with EXCLUDE_FROM_ALL, so the `shell` target has to
+# be named explicitly. verify_extension.sh looks for build/duckdb/duckdb first.
+echo "Building DuckDB shell (-j${JOBS})..."
+cmake --build . --target shell -j"${JOBS}"
+
 echo ""
 echo "=== Build Complete ==="
 echo "Extension: $BUILD_DIR/dbsp.duckdb_extension"
