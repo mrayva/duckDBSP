@@ -132,6 +132,56 @@ but is not exposed. Proving the hook fires today means either the C++
 differential suites or a debugger breakpoint on
 `UndoBuffer::StreamModifications`.
 
+## `DROP MATERIALIZED VIEW` is broken on 2.0, and a DDL test that finds it - Sep 2026
+
+`include/dbsp_parser_extension.hpp` is the extension's SQL front door, and
+NumPad's only route into it (`calcengine/engine/mvcompile` rewrites
+`CREATE VIEW` into `CREATE MATERIALIZED VIEW`). It was rewritten for 2.0's PEG
+parser — the old hook was handed the raw statement text, the new one is handed
+a token stream, so the extension now *reconstructs* the statement by joining
+token slices with single spaces — and nothing tested it.
+`test/python/test_ddl_syntax.py` now does.
+
+**What it found: `DROP MATERIALIZED VIEW` no longer reaches the extension.**
+DuckDB 2.0 added the statement to its OWN grammar
+(`src/parser/peg/grammar/statements/drop.gram:32`,
+`MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'`), so the PEG parse now
+SUCCEEDS and the core transformer throws before any parser extension is
+consulted:
+
+```cpp
+// src/parser/peg/transformer/transform_drop.cpp:34
+CatalogType PEGTransformerFactory::TransformMaterializedViewEntry(PEGTransformer &) {
+	throw NotImplementedException("Cannot drop MATERIALIZED VIEW yet");
+}
+```
+
+The parser extension only fires on a PEG *failure*, so
+`ParseDropMaterializedView` and the `drop_materialized_view` table function
+behind it are unreachable on 2.0 — including the `IF EXISTS` form. On 1.5.4
+both worked. `CREATE` and `REFRESH` are unaffected: 2.0's grammar does not
+claim those, so they still fall through to the extension.
+
+This is a live break for callers, not a theoretical one:
+`calcengine/session/mv_reattach.py:166` issues
+`DROP MATERIALIZED VIEW IF EXISTS <name>`. The scalar functions
+`dbsp_drop_view(name)` / `dbsp_drop_view_cascade(name)` are the working
+route. The test pins the failure deliberately — it asserts the
+`NotImplementedException` and fails the moment the behaviour changes, so
+whoever is here next re-points the callers.
+
+**What else the test pins** (all green, and reconstructed statements are
+compared against the same SQL run natively): a quoted mixed-case identifier,
+a string literal holding an escaped quote and runs of two spaces (the
+single-space join must not reach inside a token), `t.col` references
+rebuilt as `t . col`, a negative literal across the `-` / `5` token split,
+`--` and block comments inside the SELECT, `||` concatenation, that the view
+keeps tracking writes afterwards, that `REFRESH` reports incremental
+maintenance, that the view survives the failed `DROP`, and that a
+multi-statement input (`CREATE MATERIALIZED VIEW ...; INSERT ...`) errors
+loudly with neither statement half-applied. A mutation that upper-cases the
+rebuilt token text turns the suite red.
+
 ## `x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0 - Sep 2026
 
 - Found while getting the C++ suite green against the v2.0.0-alpha39998
