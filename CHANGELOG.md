@@ -1,5 +1,61 @@
 # Changelog
 
+## DuckDB 2.0 alpha issues
+
+Open problems in the pinned engine (v2.0.0-alpha39998, `a00803f7`) that the
+fork works around or lives with. Re-check each on an engine bump.
+
+### SIGSEGV when a DBSP-carrying instance is destroyed at interpreter exit
+
+**Symptom.** Roughly 2 runs in 5, a Python script that loads the extension,
+creates views, and exits WITHOUT closing its connection prints all its
+output and then dies with `SIGSEGV` (exit 139). The 1.5.4 build under
+`duckdb==1.5.4` does not do this (0/5).
+
+**Repro** (2/5 to 3/8 of runs):
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' python \
+  test/python/test_self_join_case.py build/dbsp.duckdb_extension
+# prints the full "ok:" list and "PASS", then exits 139
+```
+
+`test/python/test_nth_value_frames.py` reproduces it too. Both scripts leave
+their `duckdb.connect()` handle open at exit.
+
+**Diagnosis.** The macOS crash report is `EXC_BAD_ACCESS` /
+`KERN_INVALID_ADDRESS at 0x278`, and the faulting stack is a *binder* stack,
+not a teardown stack:
+
+```
+duckdb::DuckDBKeywordHelper::KeywordCategoryType(...)
+duckdb::KeywordHelper::RequiresQuotes(...)
+duckdb::BoundAggregateExpression::ToString() const
+duckdb::BaseSelectBinder::BindAggregate(...)
+...
+duckdb::Binder::Bind(duckdb::SelectStatement&)
+```
+
+`DuckDBKeywordHelper::Instance()`
+(`src/parser/peg/keyword_helper/duckdb_keyword_helper.cpp:9`) is a
+function-local `static`, i.e. destroyed during static destruction at exit.
+New in 2.0, the BINDER depends on it: `BoundAggregateExpression::ToString()`
+quotes identifiers via `KeywordHelper::RequiresQuotes`, which calls
+`Instance()`. DBSP's teardown destroys the instance's views and runs SQL
+while doing so, so an exit-time destruction can bind a statement *after*
+that singleton is gone and dereference it.
+
+**Workaround / mitigation.** Close the connection explicitly. Patching
+`circ.close()` / `stock.close()` in before the final `print` makes the same
+script pass 8/8. The C++ suite is unaffected (Catch2 destroys each
+`DuckDBTestHarness` well before static destruction), and so is
+`verify_extension.sh`.
+
+**Not fixed here.** A real fix means DBSP teardown must not bind SQL during
+static destruction, which is a design change to the CDC shutdown path — out
+of scope for the migration. Upstream could also make the keyword helper a
+leaked/never-destroyed singleton.
+
 ## `x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0 - Sep 2026
 
 - Found while getting the C++ suite green against the v2.0.0-alpha39998

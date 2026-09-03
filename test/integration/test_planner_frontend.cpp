@@ -1095,7 +1095,10 @@ TEST_CASE("planner E1: diamond dependency applies both parent deltas",
   requireViewMatchesQuery(db, "v_e1_u", sql_u_direct);
 }
 
-// ===== Phase E2: correlated subqueries (DELIM_JOIN) =====
+// ===== Phase E2: correlated subqueries =====
+// Through 1.5.4 these all decorrelated to a DELIM_JOIN (visit_delim_join).
+// DuckDB 2.0 rewrites them into materialized delim CTEs plus plain
+// comparison joins, so they now take visit_join / the CTE path instead.
 
 TEST_CASE("planner E2: correlated scalar subquery declines on 2.0",
           "[integration][planner][delim]") {

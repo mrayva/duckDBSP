@@ -413,10 +413,12 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
       // it sees table-width rows in table order with defaults already
       // evaluated exactly once. Through 1.5.4 the defaults projection was
       // PHYSICAL and sat above the tee, so a partial column list had to
-      // decline (replicating it would have run sequences twice); the
-      // non-empty branch below keeps that decline for plans that still
-      // carry the map (deserialized pre-2.0 plans — plan_insert.cpp:122
-      // calls it "only populated by older versions").
+      // decline (replicating it would have run sequences twice). The
+      // non-empty branch below is the 1.5.4 handling, kept for any plan
+      // that still carries the map — a full-cover map is teed as a
+      // permutation, an INVALID entry (a DEFAULT) declines. 2.0 only
+      // populates it when deserializing an older plan
+      // (plan_insert.cpp:122: "only populated by older versions").
       if (!manager.is_table_tracked(key) ||
           !context.transaction.IsAutoCommit() || ins.children.empty() ||
           ins.on_conflict_info.action_type !=
