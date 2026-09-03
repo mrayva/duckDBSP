@@ -81,17 +81,27 @@ jobs:
           pip install build
           python -m build --wheel
 
-      # Smoke the pair, not just the wheel: a wheel that imports fine but whose
-      # engine version string no longer matches the extension is the failure
-      # mode this build has already hit once (see OVERRIDE_DUCKDB_GIT_DESCRIBE).
+      # Smoke the pair where there is a pair to smoke. A wheel that imports fine
+      # but whose engine version string no longer matches the extension is the
+      # failure mode this build has already hit once (see
+      # OVERRIDE_DUCKDB_GIT_DESCRIBE) -- but build/dbsp.duckdb_extension is
+      # gitignored and NO job here builds it, so on this runner the LOAD would
+      # always raise and the wheel would never be uploaded. Gate on the file and
+      # say so out loud; the vendored-engine-sha step above is what actually
+      # guards the pairing in CI.
       - name: Smoke check
         run: |
-          pip install ../duckdb-python/dist/*.whl
+          pip install ../duckdb-python/dist/duckdb-1.6.0.post1-*.whl
           python - <<'PY'
+          import os
           import duckdb
-          assert duckdb.__version__.endswith(".post1"), duckdb.__version__
+          assert duckdb.__version__ == "1.6.0.post1", duckdb.__version__
+          ext = "build/dbsp.duckdb_extension"
+          if not os.path.exists(ext):
+              print(f"wheel OK ({duckdb.__version__}); skipping extension LOAD: {ext} not built in this job")
+              raise SystemExit(0)
           con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-          con.execute("LOAD 'build/dbsp.duckdb_extension'")
+          con.execute(f"LOAD '{ext}'")
           print(duckdb.__version__, con.sql("pragma version").fetchall())
           con.close()
           PY

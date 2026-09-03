@@ -27,6 +27,10 @@ set -euo pipefail
 DBSP_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYPKG="${1:-$DBSP_ROOT/../duckdb-python}"
 PATCH="$DBSP_ROOT/patches/v2.0.0-alpha39998-dbsp-txn-callback.patch"
+# The engine commit this repo's patch and build/dbsp.duckdb_extension are cut
+# against. The wheel and the extension binary must share it or the extension
+# will not load.
+ENGINE_SHA=a00803f7687ca3d7188d417216e288c5c4b22b58
 # NO DEFAULT ON PURPOSE. The alpha has no matching client tag yet, so this is
 # a branch/commit, and `main` is NOT it: main's external/duckdb gitlink moves,
 # so defaulting to it would clone an arbitrary engine, apply the patch to it (or
@@ -41,9 +45,32 @@ if [ ! -d "$PYPKG" ]; then
   git -C "$PYPKG" remote add origin https://github.com/duckdb/duckdb-python.git
   git -C "$PYPKG" fetch --depth 1 origin "$DUCKDB_PYTHON_REF"
   git -C "$PYPKG" checkout -q --detach FETCH_HEAD
+elif [ "$(git -C "$PYPKG" rev-parse HEAD)" \
+     != "$(git -C "$PYPKG" rev-parse --verify -q "$DUCKDB_PYTHON_REF^{commit}" || echo none)" ]; then
+  # An existing checkout is NOT a licence to ignore the ref. Without this the
+  # script would demand DUCKDB_PYTHON_REF, accept it, and then build against
+  # whatever happened to be checked out here.
+  echo "checking out $DUCKDB_PYTHON_REF in $PYPKG (was $(git -C "$PYPKG" rev-parse --short HEAD))"
+  git -C "$PYPKG" fetch --depth 1 origin "$DUCKDB_PYTHON_REF"
+  git -C "$PYPKG" checkout -q --detach FETCH_HEAD
 fi
 cd "$PYPKG"
 git submodule update --init --depth 1 external/duckdb
+
+# Fail loud on the invariant that actually matters: the client's vendored engine
+# must be the commit our patch is cut against. The patch apply below would catch
+# a wildly different engine, but a NEAR-miss can apply cleanly and still produce
+# a wheel whose version string the extension rejects at LOAD.
+got_link="$(git ls-tree HEAD external/duckdb | awk '{print $3}')"
+got_head="$(git -C external/duckdb rev-parse HEAD)"
+for got in "$got_link" "$got_head"; do
+  [ "$got" = "$ENGINE_SHA" ] || {
+    echo "ERROR: vendored engine mismatch: got $got, want $ENGINE_SHA"
+    echo "       ($DUCKDB_PYTHON_REF does not pin the engine this patch is cut against)"
+    exit 1
+  }
+done
+echo "vendored engine verified: $ENGINE_SHA"
 
 # apply the engine patch (idempotent: skip if already applied)
 if git -C external/duckdb apply --check "$PATCH" 2>/dev/null; then
@@ -80,19 +107,37 @@ export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-4}"
 uv build --wheel
 
 echo
-WHEEL="$(ls -t dist/duckdb-*.whl | head -1)"
+# Select the wheel by the version we asked for, not by mtime: dist/ accumulates
+# older builds (the 1.5.4.post1 wheel is still there) and `ls -t dist/*.whl`
+# would happily hand a stale one to the smoke check below.
+# v1.6.0-post1 -> 1.6.0.post1, the PEP440 form the client's packaging produces.
+WHEEL_VERSION="$(printf '%s' "${OVERRIDE_GIT_DESCRIBE#v}" | sed 's/-post/.post/')"
+WHEEL="$(ls -t "dist/duckdb-$WHEEL_VERSION-"*.whl | head -1)"
 ls -la "$WHEEL"
 
 # Smoke the pair, not just the wheel. A wheel that imports but cannot load the
 # extension is the failure mode this build has already hit once (see the
 # OVERRIDE_DUCKDB_GIT_DESCRIBE note above), and it is invisible until NumPad
 # opens a model.
+#
+# The extension binary is gitignored and this script does not build it, so on a
+# fresh clone there is nothing to load. That is not a build failure: skip the
+# pair check rather than ending a 30-60 minute wheel build in a false red.
+EXT="$DBSP_ROOT/build/dbsp.duckdb_extension"
+if [ ! -f "$EXT" ]; then
+  echo "wheel OK; skipping the extension LOAD smoke: $EXT not built"
+  echo "  (build the extension, then re-run this script to check the pair)"
+  exit 0
+fi
+
 # --no-project: we are cwd'd inside duckdb-python, and without it uv resolves
 # THAT project's dev dependency groups (torch, pyspark, ...) — GBs of download
 # for a two-line check.
-uv run --no-project --isolated --with "$PWD/$WHEEL" python - "$DBSP_ROOT/build/dbsp.duckdb_extension" <<'PY'
+uv run --no-project --isolated --with "$PWD/$WHEEL" python - "$EXT" "$WHEEL_VERSION" <<'PY'
 import sys, duckdb
-assert duckdb.__version__.endswith(".post1"), duckdb.__version__
+# Exact, not endswith(".post1"): dist/ also holds older .post1 wheels (the
+# 1.5.4 one), and `ls -t` picking the wrong file must fail here, not pass.
+assert duckdb.__version__ == sys.argv[2], f"{duckdb.__version__} != {sys.argv[2]}"
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 con.execute(f"LOAD '{sys.argv[1]}'")
 ver, src, _ = con.sql("pragma version").fetchall()[0]
