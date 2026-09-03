@@ -2,8 +2,9 @@
 // Engine-hook consumer (SaaS fork, work item 2 of the engine-hook plan).
 //
 // When compiled with DBSP_ENGINE_HOOK against the patched engine
-// (patches/v1.5.4-dbsp-txn-callback.patch), register_engine_hook subscribes
-// to DBConfig::transaction_modification_callbacks. The engine then hands each
+// (patches/v2.0.0-alpha39998-dbsp-txn-callback.patch), register_engine_hook
+// registers a callback in the DatabaseInstance's ObjectCache (DBConfig is
+// deliberately untouched — see undo_buffer.hpp). The engine then hands each
 // committing transaction's exact per-table old/new images (full-width,
 // weight -1/+1) to the callback, which converts them into a signed DuckDBZSet
 // and BUFFERS it in the committing connection's DBSPContextState.

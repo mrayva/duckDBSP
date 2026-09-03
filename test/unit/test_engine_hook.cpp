@@ -1,4 +1,4 @@
-// Differential tests for the engine hook (patches/v1.5.4-dbsp-txn-callback):
+// Differential tests for the engine hook (patches/v2.0.0-alpha39998-dbsp-txn-callback):
 // TransactionModificationCallback must receive, per modified table per commit,
 // the exact full-width pre-images (old_rows, Z-weight -1) and post-images
 // (new_rows, Z-weight +1) of that transaction's tuple modifications.
@@ -88,7 +88,9 @@ struct HookedDB {
 		TransactionModificationCallback cb;
 		cb.on_commit = [this](duckdb::ClientContext &, DataTableInfo &info, TransactionModifications &m) {
 			HookEvent ev;
-			ev.table = info.GetTableName();
+			// 2.0: DataTableInfo::GetTableName() returns an Identifier (common/identifier.hpp:26);
+			// GetIdentifierName() is the raw string, preserving the original casing.
+			ev.table = info.GetTableName().GetIdentifierName();
 			if (m.old_rows) {
 				ev.old_rows = materialize(*m.old_rows);
 			}

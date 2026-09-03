@@ -1053,8 +1053,10 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->metrics = {
-      // commits served by captured deltas (design-1 probes, plan tee,
-      // G2 LocalStorage) — one count per applied table delta
+      // commits served by an exact delta instead of scan-and-diff — one
+      // count per applied table delta. Sources: design-1 probes, the plan
+      // tee, G2 LocalStorage, AND (hook builds) the engine-hook commit
+      // path, so this counter does NOT distinguish hook from capture.
       {"captured_delta_syncs",
        NumericCast<int64_t>(manager.captured_delta_syncs())},
       // scan-and-diff table scans (the fallback path)
@@ -2334,7 +2336,7 @@ static void LoadInternal(ExtensionLoader &loader) {
   dbsp_native::register_plan_tee(config);
 
   // SaaS-fork engine hook: exact commit deltas straight from the patched
-  // engine (patches/v1.5.4-dbsp-txn-callback.patch). Returns false (no-op)
+  // engine (patches/v2.0.0-alpha39998-dbsp-txn-callback.patch). Returns false
   // when built without DBSP_ENGINE_HOOK; while active, the capture stack
   // above stays disarmed (dbsp_context_state.hpp gates on the flag).
   dbsp_native::register_engine_hook(instance);

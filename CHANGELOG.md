@@ -56,6 +56,82 @@ static destruction, which is a design change to the CDC shutdown path — out
 of scope for the migration. Upstream could also make the keyword helper a
 leaked/never-destroyed singleton.
 
+**Also reproduces in the built shell** (found while verifying the hook-ON
+binary): `build/duckdb/duckdb -unsigned -c "LOAD ...; <DBSP writes>"` exits
+139 roughly 1 run in 5, after printing every result correctly. Under `lldb`
+the fault is `EXC_BAD_ACCESS` on a *background* thread inside
+`duckdb::ShellPostBind` — the CLI's own planner extension, racing DBSP's
+detached teardown thread. Same family, same non-fix; it is a shutdown race,
+not a wrong answer, and it is independent of `DBSP_ENGINE_HOOK` (a plain
+`-c` with no DBSP writes never reproduced it in 5 runs).
+
+## Engine-hook patch rebased onto v2.0.0-alpha39998 - Sep 2026
+
+The fork's whole reason to exist is one engine patch: a transaction-commit
+callback that hands DBSP the exact rows a committing transaction changed,
+instead of DBSP re-scanning tables to work it out. That patch is now rebased
+from 1.5.4 onto the pinned alpha, as
+`patches/v2.0.0-alpha39998-dbsp-txn-callback.patch` (the 1.5.4 original is
+kept at `patches/archive/`).
+
+- **Hook points are unchanged.** `UndoBuffer::Commit`,
+  `UndoBuffer::IterateEntries` and `DuckTransaction::Commit` all still exist
+  with the same signatures, and the callback still fires between
+  `undo_buffer.Commit(...)` and the WAL flush. Two of the four hunks needed
+  re-cutting for context drift only (the header's forward-declaration block,
+  which 2.0 extended with `class CommitDropState;`, and the `Commit`
+  insertion point, which 2.0 follows with a
+  `Settings::Get<DebugForceCommitFailureSetting>` check rather than the old
+  commented-out `DebugForceAbortCommit`).
+- **`StreamModifications` needed two real adaptations to 2.0 layouts.**
+  1. The undo entries now carry the *catalog entry*, not the storage table:
+     `AppendInfo::table`, `DeleteInfo::table` and `UpdateInfo::table` are all
+     `DuckTableEntry *` (`transaction/append_info.hpp:17`,
+     `delete_info.hpp:18`, `update_info.hpp:31`). The storage is reached via
+     `GetStorage()` — the same idiom the engine's own `UndoBuffer::
+     GetProperties` and `IndexDataRemover::PushDelete` use. The per-table map
+     is still keyed on the `DataTable *`, so the grouping is unchanged.
+  2. A `Vector` now carries its own size, so the borrowed-buffer constructor
+     takes a count: `Vector(LogicalType, data_ptr_t, idx_t)`
+     (`common/types/vector.hpp:49`). The row-id vector handed to
+     `DataTable::Fetch` is built with the batch count.
+  Everything else survived: `DeleteInfo::base_row` is still an absolute row
+  id, `is_consecutive`/`GetRows()` are unchanged, `UpdateInfo` still exposes
+  `row_group_start`, `vector_index`, `N` and `GetTuples()`, and
+  `DataTable::Fetch`/`FetchCommitted`/`GetTypes`/`GetDataTableInfo` keep
+  their signatures.
+- **The SetCardinality law is satisfied without new code.** 2.0's
+  `RowGroupCollection::Fetch` sets the child cardinality itself
+  (`row_group_collection.cpp:519,590`), so the chunks `StreamModifications`
+  appends to its `ColumnDataCollection`s are correctly sized. The patch
+  contains no `SetCardinality` call.
+- **Semantics re-verified, not assumed.** Old images carry weight -1, new
+  images +1; a row updated then deleted in one transaction appears once, in
+  `old_rows`, with its pre-transaction image; a row inserted then deleted
+  appears nowhere. All eleven differential cases in
+  `test/unit/test_engine_hook.cpp` and all four in
+  `test/integration/test_engine_hook_consumer.cpp` pass (151 assertions), and
+  a deliberate mutation (fetching delete pre-images from the committed reader
+  instead of the transaction's snapshot) turns three of them red — the tests
+  bite.
+- **Full hook-ON ctest is green: 47/47** (the 45 hook-OFF binaries plus
+  `engine_hook` and `engine_hook_consumer`).
+- One test-side 2.0 fix: `DataTableInfo::GetTableName()` now returns an
+  `Identifier`, whose conversion to `string` is deliberately explicit
+  (`common/identifier.hpp:26`), so the test reads it via
+  `GetIdentifierName()`.
+
+**`captured_delta_syncs` is not a hook-vs-capture discriminator.** Verifying
+"the hook actually fires" by expecting that counter to stay 0 is wrong: the
+multi-table engine-hook commit path increments it too, by design and since
+`b689912`. In a hook-ON shell every tracked commit is served by the hook and
+the counter equals `commit_seq`. There is currently NO metric on
+`dbsp_stats()` that distinguishes the two paths —
+`dbsp_native::engine_hook_stats()` counts `tables_ingested`/`rows_ingested`
+but is not exposed. Proving the hook fires today means either the C++
+differential suites or a debugger breakpoint on
+`UndoBuffer::StreamModifications`.
+
 ## `x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0 - Sep 2026
 
 - Found while getting the C++ suite green against the v2.0.0-alpha39998
