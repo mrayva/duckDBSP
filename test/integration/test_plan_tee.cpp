@@ -225,19 +225,47 @@ TEST_CASE("plan tee: non-repeatable INSERT sources stay O(delta)",
     REQUIRE(m.captured_delta_syncs() == caps + 1);
     fx.check();
   }
-  SECTION("sequence DEFAULT declines the tee, sequence advances once") {
-    // partial column list => the physical defaults projection sits above
-    // the tee; teeing would evaluate nextval twice. Must scan instead.
+  SECTION("sequence DEFAULT tees, sequence still advances once") {
+    // Engine behaviour change in DuckDB 2.0. Through 1.5.4 a partial column
+    // list left the defaults unresolved on LogicalInsert::column_index_map
+    // and the PHYSICAL planner injected the defaults projection ABOVE the
+    // tee (PhysicalPlanGenerator::ResolveDefaultsProjection), so teeing the
+    // child would have evaluated nextval a second time — the tee declined
+    // and the commit scanned instead.
+    // In 2.0 the BINDER resolves the column list and the defaults into a
+    // logical projection BELOW the insert (Binder::ResolveInputProjection,
+    // src/planner/binder/statement/bind_insert.cpp:99,689) and leaves
+    // column_index_map empty; the physical path now calls that map
+    // "Deprecated: only populated by older versions"
+    // (src/execution/physical_plan/plan_insert.cpp:122). The tee therefore
+    // sits ABOVE the defaults projection and reads table-width rows in
+    // table order, with nextval evaluated exactly once beneath it.
+    // Pinned: the tee fires (no scan), the sequence still advances once,
+    // and the captured delta is exact.
     fx.db.exec("CREATE SEQUENCE tsq");
     fx.db.exec("CREATE TABLE tseq (id INT DEFAULT nextval('tsq'), v INT)");
     fx.db.exec("SELECT * FROM dbsp_track('tseq')");
     fx.db.exec("SELECT * FROM dbsp_sync('tseq')");
+    fx.db.exec("SELECT * FROM dbsp_create_view('tv_seq', "
+               "'SELECT id, v FROM tseq')");
     const uint64_t scans = m.scan_syncs();
+    const uint64_t caps = m.captured_delta_syncs();
     fx.db.exec("INSERT INTO tseq (v) VALUES (1)");
-    REQUIRE(m.scan_syncs() == scans + 1);
+    REQUIRE(m.scan_syncs() == scans);
+    REQUIRE(m.captured_delta_syncs() == caps + 1);
     auto res = fx.db.query("SELECT MAX(id), COUNT(*) FROM tseq");
     REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == 1); // advanced once
     REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == 1);
+    // the teed delta must be exactly what the table holds
+    auto view = fx.db.query("SELECT * FROM dbsp_query('tv_seq') ORDER BY ALL");
+    auto truth = fx.db.query("SELECT id, v FROM tseq ORDER BY ALL");
+    REQUIRE(view->RowCount() == truth->RowCount());
+    for (size_t r = 0; r < truth->RowCount(); r++) {
+      for (size_t c = 0; c < truth->ColumnCount(); c++) {
+        REQUIRE(view->GetValue(c, r).ToString() ==
+                truth->GetValue(c, r).ToString());
+      }
+    }
   }
   fx.finish();
 }

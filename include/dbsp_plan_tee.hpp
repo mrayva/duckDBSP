@@ -405,10 +405,18 @@ inline void tee_walk(duckdb::ClientContext &context, CDCManager &manager,
       // Explicit-transaction INSERTs are G2's job (LocalStorage scan is
       // exact there; teeing both would double-count). ON CONFLICT rows
       // are resolved inside the insert operator — child rows are not the
-      // final effect. Defaults and partial column lists resolve in a
-      // PHYSICAL projection injected ABOVE this tee at plan time, so
-      // only identity or pure-permutation column maps are teeable
-      // (replicating default evaluation would run sequences twice).
+      // final effect.
+      // DuckDB 2.0: the binder resolves the column list AND the DEFAULT
+      // expressions into a logical projection below the insert
+      // (Binder::ResolveInputProjection), so column_index_map is empty on
+      // every freshly bound plan and this tee sits above that projection —
+      // it sees table-width rows in table order with defaults already
+      // evaluated exactly once. Through 1.5.4 the defaults projection was
+      // PHYSICAL and sat above the tee, so a partial column list had to
+      // decline (replicating it would have run sequences twice); the
+      // non-empty branch below keeps that decline for plans that still
+      // carry the map (deserialized pre-2.0 plans — plan_insert.cpp:122
+      // calls it "only populated by older versions").
       if (!manager.is_table_tracked(key) ||
           !context.transaction.IsAutoCommit() || ins.children.empty() ||
           ins.on_conflict_info.action_type !=

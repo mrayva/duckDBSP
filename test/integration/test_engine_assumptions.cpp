@@ -182,29 +182,38 @@ TEST_CASE("canary: update_is_del_and_insert fires exactly on indexed SET",
   REQUIRE_FALSE(u2.update_is_del_and_insert); // non-indexed column
 }
 
-TEST_CASE("canary: full-insert child is table-width, defaults use the map",
+TEST_CASE("canary: every INSERT child is table-width in table order",
           "[engine_assumptions]") {
-  // The INSERT tee assumes: no column list => child already emits
-  // table-order/table-width rows; a partial list marks missing columns
-  // INVALID in column_index_map (resolved by a PHYSICAL projection the
-  // tee cannot see past).
+  // The INSERT tee reads the LogicalInsert's child rows as the inserted
+  // rows, so the child must emit table-width rows in table order.
+  //
+  // Changed in DuckDB 2.0. Through 1.5.4 only a *full* insert satisfied
+  // that: a partial column list left the mapping on
+  // LogicalInsert::column_index_map (INVALID for unlisted columns) and the
+  // PHYSICAL planner injected the defaults projection above the tee, so the
+  // tee had to decline. In 2.0 the BINDER resolves both the column list and
+  // the DEFAULT expressions into a logical projection beneath the insert
+  // (Binder::ResolveInputProjection, bind_insert.cpp:99, called at :689 and
+  // :702) and leaves column_index_map empty for every freshly bound plan —
+  // the physical path keeps reading it only for old serialized plans and
+  // says so: "Deprecated: The column_index_map is only populated by older
+  // versions" (execution/physical_plan/plan_insert.cpp:122).
+  //
+  // Pinned below: BOTH shapes now bind with an empty column_index_map and a
+  // table-width child. If a future engine ever repopulates the map, this
+  // fires and include/dbsp_plan_tee.hpp's INSERT branch has to care again.
   CanaryFixture fx;
+  const idx_t n_cols = 3; // ca(id, val, name)
   auto p1 = fx.plan("INSERT INTO ca SELECT id + 100, val, name FROM ca");
   auto &i1 = CanaryFixture::find(p1.get(), LogicalOperatorType::LOGICAL_INSERT)
                  ->Cast<LogicalInsert>();
   REQUIRE(i1.column_index_map.empty());
-  REQUIRE(i1.children[0]->GetColumnBindings().size() == 3);
+  REQUIRE(i1.children[0]->GetColumnBindings().size() == n_cols);
   auto p2 = fx.plan("INSERT INTO ca (id) VALUES (300)");
   auto &i2 = CanaryFixture::find(p2.get(), LogicalOperatorType::LOGICAL_INSERT)
                  ->Cast<LogicalInsert>();
-  REQUIRE_FALSE(i2.column_index_map.empty());
-  bool has_invalid = false;
-  for (auto &col : i2.table.GetColumns().Physical()) {
-    if (i2.column_index_map[col.Physical()] == DConstants::INVALID_INDEX) {
-      has_invalid = true;
-    }
-  }
-  REQUIRE(has_invalid);
+  REQUIRE(i2.column_index_map.empty());
+  REQUIRE(i2.children[0]->GetColumnBindings().size() == n_cols);
 }
 
 TEST_CASE("canary: autocommit hook ordering", "[engine_assumptions]") {

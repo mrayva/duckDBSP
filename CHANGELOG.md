@@ -1,5 +1,52 @@
 # Changelog
 
+## `x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0 - Sep 2026
+
+- Found while getting the C++ suite green against the v2.0.0-alpha39998
+  engine. Any planner-frontend view whose plan contained an `IS NULL` or
+  `IS NOT NULL` — directly, or via the `NOT IN` / `NOT EXISTS`
+  decorrelation that emits one — returned an EMPTY result with no error.
+  Ten test cases across `planner_frontend` and `recursive_integration`
+  were red; the same shapes are correct on 1.5.4.
+- Root cause is a DuckDB 2.0 API-semantics change, not an alpha bug. A
+  `Vector` now carries its own size, and `DataChunk::SetCardinality` is
+  deprecated: it sets ONLY the chunk's logical count and deliberately
+  leaves every child vector at the size `Reset()` gave it (0). Most
+  executors take the count passed down the `Execute` call, so they were
+  unaffected — but `VectorOperations::IsNull`/`IsNotNull` read the *input
+  vector's* own size (`common/vector_operations/null_operations.cpp:17`,
+  `auto count = input.size();`), so they looped zero times and left the
+  boolean result buffer zeroed, i.e. `false` for every row, for both
+  polarities.
+- Fix: `RowExprEval::eval` and `BatchEvaluator::fill` (both in
+  `include/dbsp_plan_translator.hpp`) now call
+  `DataChunk::SetChildCardinality`, which stamps each child vector's size
+  via `FlatVector::SetSize` without touching the data just written.
+  Table-function output chunks in `src/dbsp_extension.cpp` are unaffected
+  (verified): DuckDB's own pipeline normalises those.
+- Law: on DuckDB 2.0, a hand-filled DataChunk that is handed to an
+  `ExpressionExecutor` must set the CHILD cardinality. `SetCardinality`
+  compiles with only a deprecation warning and fails silently-wrong.
+
+## INSERT defaults now resolve below the tee (DuckDB 2.0) - Sep 2026
+
+- Through 1.5.4 a partial INSERT column list left the mapping on
+  `LogicalInsert::column_index_map` and the PHYSICAL planner injected the
+  defaults projection ABOVE the plan tee, so the tee had to decline (it
+  would have evaluated `nextval` twice) and the commit paid a full scan.
+- DuckDB 2.0 resolves the column list and the DEFAULT expressions in the
+  BINDER, into a logical projection BELOW the insert
+  (`Binder::ResolveInputProjection`, `bind_insert.cpp:99`), and leaves
+  `column_index_map` empty on every freshly bound plan — the physical path
+  now calls that map "Deprecated: only populated by older versions"
+  (`execution/physical_plan/plan_insert.cpp:122`).
+- Consequence: partial-column INSERTs with defaults are now teed, stay
+  O(delta), and the sequence still advances exactly once. No extension
+  code change was needed; the canary
+  (`test/integration/test_engine_assumptions.cpp`) and the `plan_tee`
+  expectation were re-pinned to the new behaviour, and the tee's stale
+  comment was corrected.
+
 ## View-sourced arrangement sidecars: reattach skips the __mv_ backfill scan - Aug 2026
 
 - Shared arrangements sourced on a VIEW (the probe-target side of a join)

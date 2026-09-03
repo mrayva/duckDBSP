@@ -203,7 +203,17 @@ public:
       }
       chunk_.SetValue(i, 0, v);
     }
-    chunk_.SetCardinality(1);
+    // DuckDB 2.0: a Vector carries its own size, and DataChunk::SetCardinality
+    // sets ONLY the chunk's logical count -- it leaves every child vector at
+    // the size Reset() gave it (0). Executors that read the *input vector's*
+    // size rather than the passed-down count then see an empty input:
+    // VectorOperations::IsNull/IsNotNull (common/vector_operations/
+    // null_operations.cpp:17 `auto count = input.size();`) is one, so every
+    // `x IS [NOT] NULL` silently evaluated to false for every row.
+    // SetChildCardinality sets the child sizes (FlatVector::SetSize, which
+    // only stamps the buffer's size -- it does not touch the data we just
+    // wrote).
+    chunk_.SetChildCardinality(1);
     duckdb::Vector result(expr_.GetReturnType());
     executor_.ExecuteExpression(chunk_, result);
     return result.GetValue(0);
@@ -265,7 +275,11 @@ public:
       const duckdb::idx_t src = col_map ? (*col_map)[c] : c;
       fill_column(chunk_.data[c], input_types_[c], rows, count, src);
     }
-    chunk_.SetCardinality(count);
+    // DuckDB 2.0: SetCardinality sets only the chunk's logical count; the
+    // child vectors keep the size Reset() gave them. Executors that read the
+    // input vector's own size (VectorOperations::IsNull/IsNotNull) would see
+    // zero rows. See the matching comment in RowExprEval::eval.
+    chunk_.SetChildCardinality(count);
     count_ = count;
   }
 
@@ -6617,6 +6631,16 @@ private:
       case duckdb::JoinType::OUTER:
       case duckdb::JoinType::MARK:
         break;
+      // JoinType::SINGLE is deliberately NOT here. DuckDB 2.0 rewrites a
+      // correlated scalar subquery into materialized delim CTEs plus a
+      // PLAIN comparison join of type SINGLE (1.5.4 produced a DELIM join,
+      // which visit_delim_join maps SINGLE => LEFT). Adding the same
+      // mapping here compiles and is semantically right, but does not make
+      // the shape work: 2.0's rewrite also populates the join's
+      // left/right_projection_map, which this path declines two checks
+      // below. Accepting SINGLE alone would be untested code, so the shape
+      // stays a decline until projection maps are supported. Pinned by
+      // "planner E2: correlated scalar subquery declines on 2.0".
       default:
         return unsupported("join type " +
                            duckdb::EnumUtil::ToString(op.join_type));
