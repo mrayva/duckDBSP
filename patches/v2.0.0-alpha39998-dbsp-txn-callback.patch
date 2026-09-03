@@ -93,7 +93,7 @@ index f16ec771..f686bbff 100644
  	void RevertCommit(UndoBuffer::IteratorState &iterator_state, transaction_t transaction_id);
  	//! Rollback the changes made in this UndoBuffer: should be called on
 diff --git a/src/transaction/duck_transaction.cpp b/src/transaction/duck_transaction.cpp
-index 7f940e51..28fa18be 100644
+index 7f940e51..e6256e7c 100644
 --- a/src/transaction/duck_transaction.cpp
 +++ b/src/transaction/duck_transaction.cpp
 @@ -1,4 +1,6 @@
@@ -103,13 +103,25 @@ index 7f940e51..28fa18be 100644
  #include "duckdb/transaction/commit_state.hpp"
  #include "duckdb/transaction/duck_transaction_manager.hpp"
  #include "duckdb/main/client_context.hpp"
-@@ -281,6 +283,16 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
+@@ -281,6 +283,28 @@ ErrorData DuckTransaction::Commit(AttachedDatabase &db, CommitInfo &commit_info,
  	try {
  		storage->Commit(commit_state.get());
  		undo_buffer.Commit(iterator_state, commit_info);
 +		// DBSP: stream exact per-table modifications to registered consumers.
 +		// ObjectCache-backed registry on the shared instance — see
 +		// undo_buffer.hpp (ABI + cross-image correctness).
++		//
++		// TWO HARD RULES FOR A CALLBACK, both created by this call site:
++		//  1. Callbacks run UNDER THE REGISTRY LOCK — a non-recursive mutex held
++		//     across the whole StreamModifications call. A callback must BUFFER
++		//     ONLY: never run SQL and never register or unregister a callback
++		//     from inside one. Either self-deadlocks, because both re-enter this
++		//     block on the same instance.
++		//  2. A callback MUST NOT THROW. This call sits inside the try whose
++		//     catch runs RevertCommit(), so a std::exception escaping a callback
++		//     silently REVERTS an otherwise-successful commit; a non-std throw
++		//     escapes this noexcept function and terminates. Catch everything
++		//     inside the callback.
 +		auto txn_registry = GetTxnModificationCallbacks(db.GetDatabase());
 +		if (txn_registry) {
 +			std::lock_guard<std::mutex> txn_cb_guard(txn_registry->lock);

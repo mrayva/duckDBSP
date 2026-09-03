@@ -88,7 +88,7 @@ struct HookedDB {
 		TransactionModificationCallback cb;
 		cb.on_commit = [this](duckdb::ClientContext &, DataTableInfo &info, TransactionModifications &m) {
 			HookEvent ev;
-			// 2.0: DataTableInfo::GetTableName() returns an Identifier (common/identifier.hpp:26);
+			// 2.0: DataTableInfo::GetTableName() returns an Identifier (common/identifier.hpp:61);
 			// GetIdentifierName() is the raw string, preserving the original casing.
 			ev.table = info.GetTableName().GetIdentifierName();
 			if (m.old_rows) {

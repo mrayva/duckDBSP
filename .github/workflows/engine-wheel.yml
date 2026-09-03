@@ -27,11 +27,21 @@ jobs:
       - name: Verify engine patch exists
         run: test -f patches/v2.0.0-alpha39998-dbsp-txn-callback.patch
 
-      # PLACEHOLDER ref — Task 10 pins the duckdb-python commit whose
-      # external/duckdb submodule points at engine commit a00803f7.
-      - name: Clone duckdb-python at the matching client ref
+      # NO DEFAULT ON PURPOSE. Task 10 pins the duckdb-python commit whose
+      # external/duckdb gitlink is a00803f7. Defaulting to `main` would build a
+      # wheel against whatever engine main happens to point at and upload it
+      # under the paired-artifact name, so an unset ref fails the job here.
+      - name: Require the pinned client ref
         run: |
-          git clone --branch "${DUCKDB_PYTHON_REF:-main}" --depth 1 \
+          : "${DUCKDB_PYTHON_REF:?set the DUCKDB_PYTHON_REF repository/environment variable to the duckdb-python ref whose external/duckdb gitlink is a00803f7687ca3d7188d417216e288c5c4b22b58 (Task 10 owns this)}"
+        env:
+          DUCKDB_PYTHON_REF: ${{ vars.DUCKDB_PYTHON_REF }}
+
+      - name: Clone duckdb-python at the matching client ref
+        env:
+          DUCKDB_PYTHON_REF: ${{ vars.DUCKDB_PYTHON_REF }}
+        run: |
+          git clone --branch "$DUCKDB_PYTHON_REF" --depth 1 \
             https://github.com/duckdb/duckdb-python.git ../duckdb-python
           git -C ../duckdb-python submodule update --init --depth 1 external/duckdb
 
@@ -48,9 +58,10 @@ jobs:
         working-directory: ../duckdb-python
         env:
           # the client's custom backend only honors OVERRIDE_GIT_DESCRIBE
-          # (vX.Y.Z[-postN]); local segments are impossible → fork = .post1
-          # PLACEHOLDER — Task 10 pins this alongside DUCKDB_PYTHON_REF.
-          OVERRIDE_GIT_DESCRIBE: "v2.0.0-post1"
+          # (vX.Y.Z[-postN]); local segments are impossible → fork = .post1.
+          # 1.6.0 is the CLIENT series (PyPI ships the alpha engine as
+          # duckdb 1.6.0.dev379); 2.0.0 is the engine version, not this one.
+          OVERRIDE_GIT_DESCRIBE: "v1.6.0-post1"
         run: |
           pip install build
           python -m build --wheel
@@ -58,7 +69,7 @@ jobs:
       - name: Smoke check
         run: |
           pip install ../duckdb-python/dist/*.whl
-          python -c "import duckdb; print(duckdb.__version__)"
+          python -c "import duckdb; assert duckdb.__version__.endswith('.post1'), duckdb.__version__; print(duckdb.__version__)"
 
       - uses: actions/upload-artifact@v4
         with:

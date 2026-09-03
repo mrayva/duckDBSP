@@ -1,6 +1,9 @@
 #include "catch.hpp"
 #include "../test_helpers.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+
 using namespace dbsp_test;
 
 TEST_CASE("dbsp_track tracks table", "[integration][track]") {
@@ -337,7 +340,19 @@ TEST_CASE("read surface: chunks satisfy VERIFY_VECTORS",
   struct VerifyModeGuard {
     DuckDBTestHarness &h;
     ~VerifyModeGuard() {
-      h.query("SET GLOBAL debug_verification_mode='none'");
+      // A REQUIRE here would be unsafe (Catch2 throws, and this destructor can
+      // run while unwinding). But the result must not be discarded either: a
+      // failed reset leaves VERIFY_VECTORS on for every later test in this
+      // process, which would look like unrelated failures. Abort loudly.
+      auto result = h.query("SET GLOBAL debug_verification_mode='none'");
+      if (!result || result->HasError()) {
+        fprintf(stderr,
+                "FATAL: could not reset global debug_verification_mode; "
+                "every later test in this binary would run under "
+                "VERIFY_VECTORS: %s\n",
+                result ? result->GetError().c_str() : "null result");
+        std::abort();
+      }
     }
   } guard{db};
   db.exec("SET GLOBAL debug_verification_mode='verify_vectors'");
@@ -386,6 +401,10 @@ TEST_CASE("read surface: IS [NOT] NULL over dbsp_query matches SQL",
     REQUIRE_FALSE(actual->HasError());
     REQUIRE_FALSE(expected->HasError());
     REQUIRE(actual->RowCount() == expected->RowCount());
+    // Column count too: the loop below is bounded by `expected`, so a view
+    // returning FEWER columns would read out of range and a view returning
+    // MORE would go unnoticed.
+    REQUIRE(actual->ColumnCount() == expected->ColumnCount());
     for (size_t r = 0; r < expected->RowCount(); r++) {
       for (size_t c = 0; c < expected->ColumnCount(); c++) {
         REQUIRE(actual->GetValue(c, r).ToString() ==

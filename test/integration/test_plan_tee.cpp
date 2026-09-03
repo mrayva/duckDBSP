@@ -250,7 +250,11 @@ TEST_CASE("plan tee: non-repeatable INSERT sources stay O(delta)",
                "'SELECT id, v FROM tseq')");
     const uint64_t scans = m.scan_syncs();
     const uint64_t caps = m.captured_delta_syncs();
-    fx.db.exec("INSERT INTO tseq (v) VALUES (1)");
+    // 7, not 1: the row must be (id=1, v=7) so that a tee mapping the two
+    // INT columns in the wrong order produces (7, 1) and the comparison
+    // below fails. With v=1 the row is (1, 1) and a swapped mapping still
+    // compares equal — the assertion could not fail.
+    fx.db.exec("INSERT INTO tseq (v) VALUES (7)");
     REQUIRE(m.scan_syncs() == scans);
     REQUIRE(m.captured_delta_syncs() == caps + 1);
     auto res = fx.db.query("SELECT MAX(id), COUNT(*) FROM tseq");
