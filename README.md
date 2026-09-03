@@ -130,6 +130,27 @@ This will:
 Any change to DuckDB engine sources must land as an updated patch file in
 `patches/` in the same commit — a fresh clone builds only from the patches.
 
+**Hook-OFF fallback.** `DBSP_ENGINE_HOOK=OFF ./build.sh` skips the patch step
+and builds the extension against an unpatched engine; it then serves deltas
+from the capture stack instead of the commit-time callback, which is a
+supported configuration (it is what the PyPI-wheel setup runs). `build.sh`
+also falls back to hook-OFF automatically when no patch file exists for the
+pinned `DUCKDB_VERSION` (`build.sh:37-39`). Note that OFF only *skips*
+applying the patch — it does not revert one already applied to `duckdb/`;
+`git -C duckdb checkout -- .` first if a genuinely stock tree is wanted.
+
+### Python probe scripts
+
+`test/python/*.py` run the loadable extension on a real Python client and are
+**not** part of `ctest`. Each takes the extension path and prints `PASS`:
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' --with pyarrow \
+  python test/python/test_ddl_syntax.py build/dbsp.duckdb_extension
+```
+
+See `docs/TESTING.md`.
+
 ### Loading the Extension
 
 ```sql
@@ -247,8 +268,14 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - `CREATE MATERIALIZED VIEW name AS SELECT ...`
 - `CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...` - redefine a
   view, rebuilding only it and its transitive dependents
-- `DROP MATERIALIZED VIEW name [CASCADE]`
 - `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
+- Dropping a view is a FUNCTION, not DDL: `SELECT dbsp_drop_view('name')`
+  (aliases `dbsp_drop`) and `SELECT dbsp_drop_view_cascade('name')`
+  (`dbsp_drop_cascade`) to take the dependents with it. `DROP MATERIALIZED
+  VIEW` is claimed by DuckDB's own parser, which throws
+  `NotImplementedException` before any parser extension is consulted — on
+  1.5.4 and on 2.0 alike. The functions return a status string
+  (`'Dropped'`, or the reason) rather than raising, so callers must read it.
 
 **Query Operations:**
 - `SELECT * FROM table` / `SELECT columns FROM table`

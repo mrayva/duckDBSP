@@ -62,7 +62,12 @@ Rejected for now:
   and tolerates non-determinism. Nothing in design 1 blocks it later.
 
 **Design-2 feasibility spike (2026-07-15, `include/dbsp_plan_tee.hpp` +
-`test/integration/test_plan_tee.cpp`): VIABLE on pinned v1.5.4.** Proven:
+`test/integration/test_plan_tee.cpp`): VIABLE — proven on v1.5.4 and
+re-proven on v2.0.0-alpha39998.** The 2.0 migration re-ran the whole tee
+suite against the alpha engine; the mechanism holds, and partial-column
+INSERTs now tee too (2.0 resolves DEFAULT expressions BELOW the tee, so the
+rows the tee observes are the rows that land — see "INSERT defaults now
+resolve below the tee" in the CHANGELOG). Proven:
 `OptimizerExtension::Register` fires per statement; a
 `LogicalExtensionOperator` injected above a bound `LogicalDelete`'s child
 survives ColumnBindingResolver and physical planning; its
@@ -151,10 +156,14 @@ v1.5.4.
 
 ### Upstream check
 
-No changeset/CDC extension hook exists in DuckDB through the 1.5.x line.
+No changeset/CDC extension hook exists in DuckDB through the 1.5.x line,
+and none in the 2.0 alpha (`v2.0.0-alpha39998`) either.
 [Discussion #12408](https://github.com/duckdb/duckdb/discussions/12408)
-(CDC support) is open with no shipped API; release notes for 1.4/1.5 add
-none. Not coupling to an upgrade. Re-check on the next engine bump.
+(CDC support) is open with no shipped API. 2.0 does add
+`AFTER ... FOR EACH STATEMENT REFERENCING OLD TABLE / NEW TABLE` triggers,
+which are the first plausible in-engine replacement for the patch — a
+separate spike, benchmarked against the hook, not assumed. Re-check on the
+next engine bump.
 
 ## Whitelist (capturable shapes)
 

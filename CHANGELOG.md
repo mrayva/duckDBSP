@@ -65,6 +65,18 @@ detached teardown thread. Same family, same non-fix; it is a shutdown race,
 not a wrong answer, and it is independent of `DBSP_ENGINE_HOOK` (a plain
 `-c` with no DBSP writes never reproduced it in 5 runs).
 
+### `DROP MATERIALIZED VIEW` never reaches the extension
+
+DuckDB's own parser claims the statement and throws
+`NotImplementedException` before any parser extension is consulted, so the
+extension's `ParseDropMaterializedView` is dead code. Use the scalar
+`dbsp_drop_view('name')` / `dbsp_drop_view_cascade('name')`. **Not new in
+2.0** — measured identically on 1.5.4, which throws `Cannot drop this type
+yet` where 2.0 throws `Cannot drop MATERIALIZED VIEW yet`. Full entry, with
+the measurement and the `parser_override` route out:
+"`DROP MATERIALIZED VIEW` does not reach the extension (and never did)"
+below. Pinned by `test/python/test_ddl_syntax.py`.
+
 ## Engine-hook patch rebased onto v2.0.0-alpha39998 - Sep 2026
 
 The fork's whole reason to exist is one engine patch: a transaction-commit
@@ -123,7 +135,7 @@ kept at `patches/archive/`).
   `engine_hook` and `engine_hook_consumer`).
 - One test-side 2.0 fix: `DataTableInfo::GetTableName()` now returns an
   `Identifier`, whose conversion to `string` is deliberately explicit
-  (`common/identifier.hpp:26`), so the test reads it via
+  (`common/identifier.hpp:61`), so the test reads it via
   `GetIdentifierName()`.
 
 **`captured_delta_syncs` is not a hook-vs-capture discriminator.** Verifying
@@ -137,7 +149,7 @@ but is not exposed. Proving the hook fires today means either the C++
 differential suites or a debugger breakpoint on
 `UndoBuffer::StreamModifications`.
 
-## `DROP MATERIALIZED VIEW` is broken on 2.0, and a DDL test that finds it - Sep 2026
+## `DROP MATERIALIZED VIEW` does not reach the extension (and never did), and a DDL test that finds it - Sep 2026
 
 `include/dbsp_parser_extension.hpp` is the extension's SQL front door, and
 NumPad's only route into it (`calcengine/engine/mvcompile` rewrites
@@ -147,10 +159,10 @@ a token stream, so the extension now *reconstructs* the statement by joining
 token slices with single spaces — and nothing tested it.
 `test/python/test_ddl_syntax.py` now does.
 
-**What it found: `DROP MATERIALIZED VIEW` no longer reaches the extension.**
-DuckDB 2.0 added the statement to its OWN grammar
+**What it found: `DROP MATERIALIZED VIEW` does not reach the extension — and
+never did.** DuckDB 2.0 added the statement to its OWN grammar
 (`src/parser/peg/grammar/statements/drop.gram:32`,
-`MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'`), so the PEG parse now
+`MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'`), so the PEG parse
 SUCCEEDS and the core transformer throws before any parser extension is
 consulted:
 
@@ -163,23 +175,44 @@ CatalogType PEGTransformerFactory::TransformMaterializedViewEntry(PEGTransformer
 
 The parser extension only fires on a PEG *failure*, so
 `ParseDropMaterializedView` and the `drop_materialized_view` table function
-behind it are unreachable on 2.0 — including the `IF EXISTS` form. On 1.5.4
-both worked. `CREATE` and `REFRESH` are unaffected: 2.0's grammar does not
-claim those, so they still fall through to the extension.
+behind it are unreachable on 2.0 — including the `IF EXISTS` form.
 
-This is a live break for callers, not a theoretical one:
-`calcengine/session/mv_reattach.py:166` issues
-`DROP MATERIALIZED VIEW IF EXISTS <name>`. The scalar functions
-`dbsp_drop_view(name)` / `dbsp_drop_view_cascade(name)` are the working
-route. The test pins the failure deliberately — it asserts the
+**This is NOT new in 2.0.** An earlier revision of this entry said "on 1.5.4
+both worked"; that was assumed, not measured, and it is wrong. Measured on
+the 1.5.4 stack (`build_v1.5.4/dbsp.duckdb_extension` under `duckdb==1.5.4`,
+engine `v1.5.4` / `08e34c447b`), after a successful
+`CREATE MATERIALIZED VIEW v`:
+
+```
+DROP MATERIALIZED VIEW v           -> NotImplementedException: Not implemented Error: Cannot drop this type yet
+DROP MATERIALIZED VIEW IF EXISTS v -> NotImplementedException: Not implemented Error: Cannot drop this type yet
+SELECT dbsp_drop_view('v')         -> [('Dropped',)]
+```
+
+So DuckDB has owned this statement since at least 1.5.4 and the function form
+has always been the only working route — `docs/API.md` has said exactly that
+since 2026-07-05. What 2.0 changed is the mechanism (its own grammar rather
+than an unhandled catalog type) and the message. `CREATE` and `REFRESH` are
+unaffected: 2.0's grammar does not claim those, so they still fall through to
+the extension.
+
+It was a live break for callers all the same:
+`calcengine/session/mv_reattach.py:166` issued
+`DROP MATERIALIZED VIEW IF EXISTS <name>` and now calls
+`dbsp_drop_view(name)` (NumPad commit `f2572bcd`); `dbsp_drop_view_cascade`
+is the cascade form. The test pins the failure deliberately — it asserts the
 `NotImplementedException` and fails the moment the behaviour changes, so
-whoever is here next re-points the callers.
+whoever is here next re-points the callers. `ParserExtension::parser_override`
+(`duckdb/src/parser/parser.cpp:246-276`, opt-in via
+`allow_parser_override_extension`) is how the extension could reclaim the
+statement: it receives the RAW query text and runs before the PEG grammar.
 
 **What else the test pins** (all green, and reconstructed statements are
 compared against the same SQL run natively): a quoted mixed-case identifier,
 a string literal holding an escaped quote and runs of two spaces (the
 single-space join must not reach inside a token), `t.col` references
-rebuilt as `t . col`, a negative literal across the `-` / `5` token split,
+rebuilt as `t . col`, negative literals across the `-` / `1` and `-` / `10`
+token splits,
 `--` and block comments inside the SELECT, `||` concatenation, that the view
 keeps tracking writes afterwards, that `REFRESH` reports incremental
 maintenance, that the view survives the failed `DROP`, and that a
@@ -210,7 +243,7 @@ rebuilt token text turns the suite red.
   `DataChunk::SetChildCardinality`, which stamps each child vector's size
   via `FlatVector::SetSize` without touching the data just written.
 - The SAME defect was live at all 48 table-function output sites in
-  `src/dbsp_extension.cpp` and at `include/dbsp_plan_tee.hpp:123`; they are
+  `src/dbsp_extension.cpp` and at `include/dbsp_plan_tee.hpp:129`; they are
   converted in the same sweep. An earlier revision of this entry claimed
   they were "unaffected ... DuckDB's own pipeline normalises those". That
   claim was wrong and was based on one passing query. What actually

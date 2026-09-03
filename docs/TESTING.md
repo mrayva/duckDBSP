@@ -8,8 +8,12 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-All tests build in `test/build_test` (32 binaries registered with
-ctest):
+All tests build in `test/build_test`. ctest registers **45** entries with
+the default `-DDBSP_ENGINE_HOOK=OFF`-equivalent tree and **47** with
+`-DDBSP_ENGINE_HOOK=ON`: the two extra are `engine_hook` and
+`engine_hook_consumer`, which only compile against a patched engine
+(`test/CMakeLists.txt:86,106`). Two of the 45 are bench binaries registered
+as smoke entries (`planner_eval_smoke`, `window_bench`).
 
 ```bash
 cd test/build_test
@@ -17,6 +21,23 @@ cmake .. && make -j8
 ctest                       # full suite, ~15-45s
 ./test_planner_frontend     # the big differential suite on its own
 ```
+
+### Python scripts (`test/python/`)
+
+`test/python/*.py` are standalone probe scripts, **not wired into ctest** —
+they only run when someone runs them. Each takes the extension path as its
+one argument and prints `PASS` (exit 0) or fails loudly:
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' --with pyarrow \
+  python test/python/test_ddl_syntax.py build/dbsp.duckdb_extension
+```
+
+They exercise what only the loadable extension on a real Python client can
+reach: the SQL DDL front door (`test_ddl_syntax.py`), `dbsp_mv_tables`
+semantics, window frames, self-joins. Close the connection in any script you
+add — an open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha
+(CHANGELOG, "DuckDB 2.0 alpha issues").
 
 Benchmarks and the soak test build alongside but are not part of ctest:
 

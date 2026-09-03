@@ -50,7 +50,7 @@ Fork the pinned engine with **one surgical patch** — a commit-time
 modification callback — and make the extension consume it when present,
 falling back to the shipped stack when not.
 
-### Engine patch (branch `v1.5.4-dbsp`, single commit, ~300 lines)
+### Engine patch (`patches/v2.0.0-alpha39998-dbsp-txn-callback.patch`, ~370 lines)
 
 **New surface** (mirrors the existing `OptimizerExtension` registration
 pattern):
