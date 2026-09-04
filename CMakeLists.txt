@@ -43,18 +43,8 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
 )
 
-# SaaS-fork engine hook consumer. ON requires the patched submodule
-# (patches/v2.0.0-alpha39998-dbsp-txn-callback.patch applied to duckdb/). Pass
-# -DDBSP_ENGINE_HOOK=OFF to build without consuming the callback (the capture
-# stack does the work instead). NOTE: OFF only SKIPS build.sh's patch step — it
-# does NOT revert an already-applied patch, so "builds against a stock tree" is
-# true on a fresh clone and false in a worktree where the patch is applied.
-# Reset the submodule first (git -C duckdb checkout -- .) if a genuinely stock
-# engine is what you need.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
-if(DBSP_ENGINE_HOOK)
-    target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_ENGINE_HOOK)
-endif()
+# The DuckDB tree in duckdb/ is STOCK — the extension carries no engine patch.
+# Change capture comes from generated statement triggers (dbsp_trigger_source.hpp).
 
 message(STATUS "")
 message(STATUS "DBSP DuckDB Extension v${EXT_VERSION_DBSP}")
@@ -81,7 +71,4 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/benchmark_runner.cpp")
     target_link_libraries(benchmark_runner duckdb_static
                           duckdb_generated_extension_loader
                           core_functions_extension parquet_extension)
-    if(DBSP_ENGINE_HOOK)
-        target_compile_definitions(benchmark_runner PRIVATE DBSP_ENGINE_HOOK)
-    endif()
 endif()

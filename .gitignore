@@ -44,3 +44,7 @@ build_tsan/
 
 # Work-in-progress files
 dbsp_recursive.hpp
+
+# Owner rollback binary (v1.5.4 build) and local scratch
+build_v1.5.4/
+.scratch/

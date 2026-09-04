@@ -12,8 +12,7 @@ echo ""
 
 # Check if DuckDB source exists. Content check, not just the directory: a CI
 # checkout of this repo leaves duckdb/ as an EMPTY submodule dir, and git
-# commands run inside it silently resolve against THIS repo — the patch
-# reverse-check then false-positives and the build fails at configure.
+# commands run inside it silently resolve against THIS repo.
 # Alpha engines are pinned by COMMIT (a tag would drift with the branch).
 if [ ! -f "$SCRIPT_DIR/duckdb/CMakeLists.txt" ]; then
     echo "Fetching DuckDB ${DUCKDB_VERSION} (${DUCKDB_COMMIT})..."
@@ -23,31 +22,22 @@ if [ ! -f "$SCRIPT_DIR/duckdb/CMakeLists.txt" ]; then
     git -C "$SCRIPT_DIR/duckdb" checkout --detach FETCH_HEAD
 fi
 
-# Guard: duckdb/ must be its own git checkout (patch checks below would
-# otherwise run against the wrong repo).
+# Guard: duckdb/ must be its own git checkout (the version stamping and any
+# git query below would otherwise run against the wrong repo).
 DUCKDB_TOPLEVEL=$(git -C "$SCRIPT_DIR/duckdb" rev-parse --show-toplevel 2>/dev/null || true)
 if [ "$DUCKDB_TOPLEVEL" != "$SCRIPT_DIR/duckdb" ]; then
     echo "ERROR: $SCRIPT_DIR/duckdb is not a standalone DuckDB checkout (toplevel: ${DUCKDB_TOPLEVEL:-none})." >&2
     exit 1
 fi
 
-# Apply the engine patches (the patch files ARE the fork — stock DuckDB lacks
-# the txn-callback symbols the extension needs). Idempotent: skip patches the
-# tree already carries, fail loudly if one neither applies nor reverse-applies.
-if [ "${DBSP_ENGINE_HOOK:-ON}" = "ON" ]; then
-for patch in "$SCRIPT_DIR"/patches/*.patch; do
-    [ -e "$patch" ] || { echo "No engine patch for ${DUCKDB_VERSION} — building hook-OFF"; DBSP_ENGINE_HOOK=OFF; break; }
-    if git -C "$SCRIPT_DIR/duckdb" apply --check --reverse "$patch" 2>/dev/null; then
-        echo "Patch already applied: $(basename "$patch")"
-    elif git -C "$SCRIPT_DIR/duckdb" apply --check "$patch" 2>/dev/null; then
-        echo "Applying patch: $(basename "$patch")"
-        git -C "$SCRIPT_DIR/duckdb" apply "$patch"
-    else
-        echo "ERROR: $(basename "$patch") neither applies cleanly nor is already applied." >&2
-        echo "The duckdb/ tree has drifted from the patch — reconcile before building." >&2
-        exit 1
-    fi
-done
+# The engine tree is STOCK. There is no patch step: change capture comes from
+# generated statement triggers, which are plain SQL objects the stock engine
+# already supports. A dirty duckdb/ tree is therefore a mistake, not a build
+# input — say so rather than compiling something nobody can reproduce.
+if [ -n "$(git -C "$SCRIPT_DIR/duckdb" status --porcelain)" ]; then
+    echo "ERROR: $SCRIPT_DIR/duckdb has local modifications; this fork builds against a STOCK engine." >&2
+    echo "       Run: git -C \"$SCRIPT_DIR/duckdb\" checkout -- ." >&2
+    exit 1
 fi
 
 # Create build directory
@@ -71,7 +61,6 @@ DUCKDB_VERSION="$DUCKDB_VERSION" cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DDUCKDB_SOURCE_DIR="$SCRIPT_DIR/duckdb" \
     -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_VERSION" \
-    -DDBSP_ENGINE_HOOK="${DBSP_ENGINE_HOOK:-ON}" \
     "${CMAKE_EXTRA_ARGS[@]}"
 
 # Build (parallelism capped at 8 — higher has frozen this machine before)
