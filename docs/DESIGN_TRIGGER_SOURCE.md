@@ -378,7 +378,12 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 (its kill switch is gone; the scan arm is now reached through
 `dbsp_auto_sync(false)` + an explicit `dbsp_sync`).
 
-## Follow-ups
+## Concurrency notes, and what is still open
+
+Most of what follows is CLOSED — a design note kept because the reasoning is
+load-bearing, with the commit that closed it. Two items are genuinely open and
+say so: *an open transaction that loses its triggers* (a residual that has not
+been reproduced) and *`dbsp_untrack` does not exist* (an unexercised branch).
 
 - **An open transaction that loses its triggers.** `DROP t; CREATE t (same
   columns)` inside a transaction takes the bodies with the old table and leaves
@@ -440,7 +445,7 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   `dbsp_sync()`, or by a ROLLBACK's rebuild. `dbsp_view_state` is deliberately
   NOT gated: it reports row counts as DIAGNOSTICS, and a diagnostic that
   refuses while the state is broken is useless exactly when it is needed.
-  Pinned by `test/python/test_unseeded_read.py`.
+  Pinned by `test/python/test_unseeded_read.py`. (`da9164f`.)
 
   A reconcile that FAILS must not retire the debt. `sync_tables` returns false
   when a table it was asked about was not scanned, reports it through
@@ -449,16 +454,18 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   for the life of the connection, silently.
 
   This is the third defect of the same family in this work — the sweep's DDL,
-  the sweep's catalog-version read, and the seeding scan. **The law is a rule,
-  not an enforced invariant, and it is honoured for SEEDING only.** Two
-  internal-connection scans still run from `QueryBegin`, which fires inside
-  open user transactions: `rebuild_all_views` (`dbsp_cdc.hpp`) and
-  `materialize_all_deferred` → `materialize_deferred_locked`. Both REFRESH a
-  baseline that already exists rather than establishing one, and the commit
-  reconcile appears to cover the window they open — appears, because nothing
-  proves it and no test pins it. Anything new that opens an internal connection
-  for a data read has to answer the same question, and nothing will ask on its
-  behalf (see Follow-ups).
+  the sweep's catalog-version read, and the seeding scan. **The law is now
+  enforceable** rather than a rule in a comment: every helper that opens an
+  internal connection takes an explicit `InternalReadPolicy` and
+  `DBSP_STRICT_INTERNAL_QUERY=1` turns a `Forbidden` call inside an open user
+  transaction into a throw naming the site (see *The internal-connection law is
+  enforceable* below). The seeding scan is `Forbidden`; the two scans that run
+  from `QueryBegin` — `rebuild_all_views` and `materialize_all_deferred` →
+  `materialize_deferred_locked` — are whitelisted at their call sites, because
+  both REFRESH a baseline that already exists rather than establishing one. That
+  whitelist is a JUDGEMENT, not a proof: the commit reconcile appears to cover
+  the window they open, and nothing pins it. What has changed is that anything
+  NEW opening an internal connection has to answer the question in code.
 - **A baseline is only "seeded" once something has scanned it.** The public
   `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
   `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
@@ -512,7 +519,7 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   provisional, and the sweep's steady state is one atomic load per commit.
   Pinned both ways by `test/python/test_provisional_baseline.py`, which asserts
   six later edits cost **0** scans and **6** exact deltas in the solo case.
-  `dbsp_stats()` reports the live count as `provisional_tables`.
+  `dbsp_stats()` reports the live count as `provisional_tables`. (`578a79f`.)
 
   Residual, stated rather than hidden: a transaction that BEGINS during the
   seeding statement is not covered by "older than mine". Its writes to a
@@ -549,7 +556,7 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 
   Proved to bite: flipping the `duckdb_triggers()` whitelist to `Forbidden`
   turns the strict run red (44/45, `trigger_source` failing with the law's own
-  message); restoring it returns 45/45.
+  message); restoring it returns 45/45. (`009ec57`.)
 - **A failed reconcile scan is visible from SQL.** `dbsp_stats()` carries
   `reconcile_failures` (a count) and `last_reconcile_error` (the message, in a
   new third `detail` column). This is the one way a view is left stale with the
@@ -559,4 +566,4 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   `test/python/test_reconcile_telemetry.py` with round 5's own scenario — a
   view created inside an open transaction (seeding deferred, debt recorded),
   the source DROPped in the same transaction, and the COMMIT widening itself to
-  pay a debt with a scan that cannot run.
+  pay a debt with a scan that cannot run. (`396fac4`.)
