@@ -208,7 +208,7 @@ SELECT * FROM dbsp_stats();
 -- scan_syncs             2   scan-and-diff reconciles
 -- provisional_tables     0   baselines awaiting a concurrency watermark
 -- reconcile_failures     0   reconcile scans that did NOT run
--- last_reconcile_error   0   text of the last one, in the `detail` column
+-- last_reconcile_error  NULL text of the last one, in the `detail` column
 ```
 
 `dbsp_stats()` has three columns — `metric`, `value` (BIGINT) and `detail`

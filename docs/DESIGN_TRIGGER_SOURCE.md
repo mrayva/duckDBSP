@@ -381,9 +381,13 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 ## Concurrency notes, and what is still open
 
 Most of what follows is CLOSED — a design note kept because the reasoning is
-load-bearing, with the commit that closed it. Two items are genuinely open and
-say so: *an open transaction that loses its triggers* (a residual that has not
-been reproduced) and *`dbsp_untrack` does not exist* (an unexercised branch).
+load-bearing, with the commit that closed it. **Three** items are genuinely
+open and say so: *an open transaction that loses its triggers* (a residual that
+has not been reproduced); *`dbsp_untrack` does not exist* (an unexercised
+branch); and the two `QueryBegin` internal scans, whose `AllowedInTxn`
+whitelist is a judgement rather than a proof — the commit reconcile appears to
+cover the window they open and nothing pins it (see *the internal-connection
+law* below).
 
 - **An open transaction that loses its triggers.** `DROP t; CREATE t (same
   columns)` inside a transaction takes the bodies with the old table and leaves
@@ -442,9 +446,11 @@ been reproduced) and *`dbsp_untrack` does not exist* (an unexercised branch).
   transaction is open — the very read that left the baseline empty — and on the
   deferring connection that transaction is open by construction. The debt is
   paid where it can be: at that transaction's COMMIT, at an explicit
-  `dbsp_sync()`, or by a ROLLBACK's rebuild. `dbsp_view_state` is deliberately
-  NOT gated: it reports row counts as DIAGNOSTICS, and a diagnostic that
-  refuses while the state is broken is useless exactly when it is needed.
+  `dbsp_sync()`, or by a ROLLBACK's rebuild. `dbsp_view_state` is not gated,
+  and not because anyone weighed it up: it takes no view argument, so there is
+  no view for the gate to ask about. Its numbers are diagnostics anyway, and a
+  diagnostic that refuses while the state is broken is useless exactly when it
+  is needed.
   Pinned by `test/python/test_unseeded_read.py`. (`da9164f`.)
 
   A reconcile that FAILS must not retire the debt. `sync_tables` returns false
@@ -530,11 +536,15 @@ been reproduced) and *`dbsp_untrack` does not exist* (an unexercised branch).
   there, which is exactly the behaviour before this gate.
 - **The internal-connection law is enforceable.** Not an assertion inside
   `InternalQueryGuard` — that has 39 call sites, no `ClientContext` to ask, and
-  legitimate exceptions that would false-positive. Instead every helper that
-  opens an internal `duckdb::Connection` for a DATA read or DDL takes an
-  explicit `InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name:
-  `stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and the
-  sweep's DDL (`dbsp_trigger_source.hpp`). Under
+  legitimate exceptions that would false-positive. Instead every SITE that
+  opens an internal `duckdb::Connection` to read a USER table or to run DDL
+  declares an explicit `InternalReadPolicy{Forbidden, AllowedInTxn}` and a site
+  name. Not only the streaming helpers: the watermark reads (`live_watermark`,
+  `fold_fresh_baseline`, `save_checkpoint`, `checkpoint_valid`,
+  `register_arrangements`) are the same
+  committed-only-read-during-an-open-transaction shape and carry it too, and so
+  does every write to DBSP's own bookkeeping tables. `docs/TESTING.md` lists
+  every site with its policy. Under
   `DBSP_STRICT_INTERNAL_QUERY=1` a `Forbidden` call made while
   `user_transaction_open(context)` throws an `InternalException` naming the
   site; `ctest` runs a third time with it set, the way

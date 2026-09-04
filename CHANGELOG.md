@@ -1,5 +1,76 @@
 # Changelog
 
+## Fix round 1 — a provisional baseline is not readable either — 2026-09-04
+
+**The FIRST read after the deferring transaction's COMMIT returned a stale
+wrong answer, with no error.** The provisional repair runs from the commit
+hook, and a read's own commit hook fires AFTER the bind that served its rows —
+so with no statement in between, measured on both backends:
+
+```
+c1 COMMIT; FIRST read:  view=[(10.0,)]  sql=[(13.0,)]   WRONG
+           SECOND read: view=[(13.0,)]                  correct
+```
+
+`view_read_block` replaces `unseeded_source_of_view` and reports PROVISIONAL as
+well as UNSEEDED. A PROVISIONAL block is REPAIRABLE, so `EnsureViewReadable`
+tries the repair before refusing: when the reader holds no transaction of its
+own (every ordinary autocommit `SELECT * FROM dbsp_query(...)`) it runs
+`reconcile_ready_provisional` and answers correctly; when it cannot — the
+watermark has not cleared, or the reader is inside its own transaction — it
+refuses loudly. An UNSEEDED block is never repairable here (the missing rows are
+in another connection's uncommitted transaction) and always refuses.
+
+The test stepped over the window with `b.execute("SELECT 1")` before asserting,
+so it could not fail there. It now asserts on the FIRST read.
+
+**`LOAD` no longer downgrades an explicit `STRICT`.** `SET
+allow_parser_override_extension='STRICT'` followed by `LOAD` reported
+`FALLBACK` — measured. The value is read first and only `DEFAULT` is raised.
+
+**The internal-connection law now covers what the docs claimed.** Three helpers
+carried a policy while the docs said "every helper that opens an internal
+connection for a data read or DDL". Nine more sites carry it now: the watermark
+reads over USER tables (`live_watermark`, `fold_fresh_baseline`,
+`save_checkpoint`, `checkpoint_valid`, `register_arrangements` — the same
+committed-only-read-during-an-open-transaction shape) and every write to DBSP's
+own bookkeeping tables (`save_view_definitions`, `create_view`'s `_dbsp_views`
+upsert, `erase_persisted_view_row`, `erase_persisted_checkpoint_rows`).
+`docs/TESTING.md` now lists every site with its policy.
+
+**The strict run never reached the provisional scan.** `provisional_tables` was
+0 in every ctest case, so `reconcile_ready_provisional`'s own
+`sync_tables` was unexercised under `DBSP_STRICT_INTERNAL_QUERY=1`. A new case,
+`cdc: a provisional baseline retires under the strict internal-query switch`,
+goes provisional and commits an EXPLICIT transaction while the table is
+provisional-and-ready. It answers the open question by measurement: the
+ClientContext does NOT report the user's transaction as open inside
+`TransactionCommit` — the case passes with the policy set to `Forbidden`, so
+`Forbidden` is what the call site says. No whitelist, and the switch reports it
+if the engine ever changes that.
+
+**Byte-exactness failed silently for a dollar-quoted body containing `;`.**
+`dbsp_find_statement_end` knew `'`, `"` and comments but not `$$…$$`, so it
+stopped at the embedded `;`, declined, and fell back to token-normalised
+storage with nothing saying why (measured: `SELECT $$semi;colon$$ AS s , id
+FROM t`). The scanner now understands `$$…$$` and `$tag$…$tag$`, **and a
+decline on an otherwise-matching MATERIALIZED VIEW statement is now LOUD** —
+`dbsp_rewrite_mv_ddl` returns `NotOurs` / `Rewritten` / `Declined(reason)` and
+the override reports every `Declined` on stderr. A silent decline is how the
+`'''` escaping bug hid in the first place.
+
+**Minors.** View names are unquoted and validated in the scanner, so
+`"Quoted_Ok"` registers as `Quoted_Ok` and `"my view"` / `s1.qv` are refused
+with a reason naming what is wrong (before: the raw slice went through and the
+error read `Failed to create materialized view '"my view"'`).
+`last_reconcile_error`'s `value` column is NULL instead of repeating the
+`reconcile_failures` count. The override's `MATERIALIZED` sniff is an
+allocation-free case-insensitive scan instead of `StringUtil::Upper()` on every
+query string the database parses. `dbsp_view_state`'s "deliberately not gated"
+claim is reworded — it takes no view argument, so there is nothing for the gate
+to ask about. The design doc's lead said two open items while the body listed
+three.
+
 ## The DDL is parsed from RAW TEXT, and DROP works again — 2026-09-04
 
 `CREATE` / `DROP` / `REFRESH MATERIALIZED VIEW` are now recognised in
@@ -24,14 +95,26 @@ Two things follow:
   it. Running before the grammar takes it back. `dbsp_drop_view()` and
   `dbsp_drop()` are unchanged and still work.
 
+**Deviation from the brief, stated:** the brief said to record that the
+token-reconstruction path is GONE. It was KEPT instead, and deliberately — it
+is the only thing standing between the DDL and a database where
+`allow_parser_override_extension` is `DEFAULT`, which is DuckDB's own default
+and a value a user or another extension can set at any time. Deleting it would
+have made `CREATE MATERIALIZED VIEW` breakable by a `SET`. It is no longer how
+these statements are normally parsed, and it is covered as a fallback by
+`test/python/test_ddl_syntax.py`.
+
 **Loading the extension now raises `allow_parser_override_extension` to
-`FALLBACK`.** DuckDB's default is `DEFAULT`, which skips every
+`FALLBACK`, and never lowers it.** DuckDB's default is `DEFAULT`, which skips every
 `parser_override` callback, so without this the DDL above would never reach the
 extension. Stated plainly because it is a real side effect: the setting is
 global, so any OTHER parser-override extension in that database becomes active
 too. `FALLBACK` and never `STRICT`, so a query no override claims still reaches
-the core parser. A user who sets it back to `DEFAULT` keeps working DDL through
-the token path — same view, normalised stored text, no DROP.
+the core parser. The value is READ first and only `DEFAULT` is changed: an
+unconditional `SetOptionByName` silently downgraded a user's deliberate
+`STRICT` to `FALLBACK` (measured). A user who sets it back to `DEFAULT` keeps
+working DDL through the token path — same view, normalised stored text, no
+DROP.
 
 Two bugs surfaced by making the path reachable:
 
@@ -113,10 +196,12 @@ transaction is open.* Three defects of that family have shipped and been fixed
 here — the sweep's DDL, the sweep's catalog-version read, and the seeding scan —
 and nothing asked the question of the fourth: it was a rule in a comment.
 
-Every helper that opens an internal `duckdb::Connection` for a data read or DDL
-now takes an explicit `InternalReadPolicy{Forbidden, AllowedInTxn}` and a site
-name — `stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and
-the sweep's DDL (`dbsp_trigger_source.hpp`). Under
+Every SITE that opens an internal `duckdb::Connection` to read a USER table or
+to run DDL now declares an explicit `InternalReadPolicy{Forbidden,
+AllowedInTxn}` and a site name — the streaming helpers, the watermark reads
+(`live_watermark`, `fold_fresh_baseline`, `save_checkpoint`,
+`checkpoint_valid`, `register_arrangements`), the sweep's DDL, and every write
+to DBSP's own bookkeeping tables. `docs/TESTING.md` lists them all. Under
 `DBSP_STRICT_INTERNAL_QUERY=1` a `Forbidden` call made while
 `user_transaction_open(context)` throws an `InternalException` naming the site.
 `ctest` now runs a THIRD way with it set, alongside `DBSP_TEST_VERIFY_VECTORS`;
@@ -252,9 +337,10 @@ an internal connection while the reader's own transaction is open — the exact
 read that produced the empty baseline in the first place — and on the deferring
 connection that transaction is open by construction. The debt is still paid
 where it can be: at the deferring transaction's COMMIT, by `dbsp_sync()`, or by
-a ROLLBACK's rebuild. `dbsp_view_state()` is deliberately NOT gated: it reports
-row counts as diagnostics, and a diagnostic that refuses while the state is
-broken is useless exactly when it is needed.
+a ROLLBACK's rebuild. `dbsp_view_state()` is not gated, and not as a
+judgement call: it takes no view argument, so there is no view for the gate to
+ask about. Its numbers are diagnostics anyway, and a diagnostic that refuses
+while the state is broken is useless exactly when it is needed.
 
 Pinned by `test/python/test_unseeded_read.py` (both backends, both connections,
 both ways out of the window, and exactness through a later edit on each

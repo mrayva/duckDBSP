@@ -496,10 +496,10 @@ The refusal fires on every connection of the instance, not only the one
 holding the transaction: the debt is per-connection but the baseline is
 per-instance. It clears when the deferring transaction ends (its COMMIT widens
 itself to a scan-and-diff; its ROLLBACK asks for a rebuild from committed
-storage) or when someone runs `dbsp_sync()`. `dbsp_view_state()` is
-deliberately not gated — it reports row counts as diagnostics, and a
-diagnostic that refuses while the state is broken is useless exactly when it
-is needed.
+storage) or when someone runs `dbsp_sync()`. `dbsp_view_state()` is not
+gated: it takes no view argument, so there is no view for the gate to ask
+about. Its numbers are diagnostics anyway, and a diagnostic that refuses while
+the state is broken is useless exactly when it is needed.
 
 ---
 
@@ -886,7 +886,7 @@ SELECT * FROM dbsp_stats();
 -- trigger_rows          | 5218  |        -- row images they buffered
 -- provisional_tables    | 0     |        -- awaiting a concurrency watermark
 -- reconcile_failures    | 0     |        -- reconcile scans that did NOT run
--- last_reconcile_error  | 0     | NULL   -- text of the last one
+-- last_reconcile_error  | NULL  | NULL   -- text of the last one
 ```
 
 `trigger_syncs` is the proof of life: it stays 0 until a generated trigger body

@@ -84,13 +84,35 @@ have shipped and been fixed here — the sweep's DDL, the sweep's catalog-versio
 read, and the seeding scan — and until this switch nothing asked the question of
 the fourth.
 
-Mechanics (`dbsp_trigger_capability.hpp`): every helper that opens an internal
-connection for a data read or DDL takes an explicit
-`InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name —
-`stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and the
-sweep's DDL (`dbsp_trigger_source.hpp`). Under the switch a `Forbidden` call
-made while `user_transaction_open(context)` throws an `InternalException` naming
-the site. It is OFF by default deliberately: such a call is a bug the commit
+Mechanics (`dbsp_trigger_capability.hpp`): every site that opens an internal
+connection for a read of a USER table or for DDL declares an explicit
+`InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name. Under the switch
+a `Forbidden` call made while `user_transaction_open(context)` throws an
+`InternalException` naming the site.
+
+The covered sites, all of them:
+
+| Site | Policy |
+|---|---|
+| `stream_table_rows`, `stream_table_serialized` (`dbsp_cdc.hpp`) | the caller's |
+| `live_watermark` (`dbsp_cdc.hpp`) | the caller's |
+| `fold_fresh_baseline` watermark | Forbidden (seeding) |
+| `sync_table_internal` (the seeding scan) | Forbidden |
+| the trigger sweep's DDL (`dbsp_trigger_source.hpp`) | Forbidden |
+| the sweep's `duckdb_triggers()` presence read | AllowedInTxn |
+| `rebuild_all_views`, `materialize_deferred_locked` | AllowedInTxn |
+| `dbsp_sync()` / `dbsp_sync('t')` | AllowedInTxn |
+| the provisional reconcile at commit / at read | AllowedInTxn / Forbidden |
+| `save_checkpoint` (bookkeeping DDL + source watermarks) | AllowedInTxn |
+| `checkpoint_valid` (restore watermarks) | AllowedInTxn |
+| `register_arrangements` (sidecar watermark) | AllowedInTxn |
+| `save_view_definitions`, `create_view`'s `_dbsp_views` upsert, `erase_persisted_view_row`, `erase_persisted_checkpoint_rows` | AllowedInTxn |
+
+The `AllowedInTxn` entries split into two reasons, both stated at the call
+site: DDL/DML over DBSP's OWN bookkeeping tables (`_dbsp_views`, `_dbsp_ckpt*`),
+which never needs the user's uncommitted catalog; and watermarks that describe
+COMMITTED storage and are compared against committed storage later, beside
+circuit state that is likewise committed-only. It is OFF by default deliberately: such a call is a bug the commit
 reconcile usually papers over, and turning that paper-over into a crash in
 production would trade a wrong answer for an outage.
 
