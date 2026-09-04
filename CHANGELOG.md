@@ -77,6 +77,44 @@ the measurement and the `parser_override` route out:
 "`DROP MATERIALIZED VIEW` does not reach the extension (and never did)"
 below. Pinned by `test/python/test_ddl_syntax.py`.
 
+## Trigger-fed delta source behind `DBSP_DELTA_SOURCE` - Sep 2026
+
+- A third delta source, and the only one that runs on a **stock** engine.
+  DuckDB 2.0's statement-level `AFTER` triggers with transition tables are
+  expanded in the binder, so a trigger sees every write the binder sees — which
+  in 2.0 includes the Appender (`Appender::FlushInternal` now runs an
+  `INSERT ... SELECT`). `dbsp_track(t)` generates three triggers whose bodies
+  call a new vectorised, volatile scalar `dbsp_trigger_ingest(key, weight,
+  cols...)`; that scalar writes the row images into the **same** per-transaction
+  buffer the engine hook fills, so `TransactionCommit` applies both by one path
+  and `dbsp_cdc.hpp` is untouched.
+- `DBSP_DELTA_SOURCE` = `trigger` | `hook` | `capture`, read once at load; unset
+  keeps today's behaviour. An environment variable rather than a `SET`, because
+  a host that cannot run SQL before it opens the database still has to be able
+  to choose — and the mode has to be fixed before the hook registers and before
+  the first table is tracked. `dbsp_stats()` reports it as `delta_source_mode`
+  (0 default / 1 hook / 2 capture / 3 trigger) next to `trigger_syncs` and
+  `trigger_rows`, so it is verifiable from the host; `DBSP_TIMING=1` prints
+  `[dbsp-timing] trigger_ingest`.
+- In trigger mode the engine hook does not register and the capture stack
+  disarms, so no row is delivered twice. Pinned by a test that inserts once and
+  asserts a **sum**, not a row count — a doubled delivery is invisible to a row
+  count.
+- `MERGE INTO` on a tracked table becomes a hard engine error
+  (`bind_merge_into.cpp:226-233`). Pinned by a test rather than worked around:
+  it is the price of this source, and it must stay visible.
+- New suite `trigger_source` (`test/unit/test_trigger_source.cpp`), built
+  WITHOUT `DBSP_ENGINE_HOOK` on purpose. ctest 48/48 in default mode and under
+  `DBSP_TEST_VERIFY_VECTORS=1`; the new suite is 11 cases / 211 assertions.
+- Two of those tests failed at first for one reason, worth recording again: the
+  per-database install record was keyed on the raw `DatabaseInstance` address,
+  and DuckDB reuses freed addresses, so consecutive harnesses in one process
+  inherited a stale "already installed" list and ran with **no triggers at
+  all**. A close-time prune did not fix it (the teardown hook returns early in
+  tests). It now holds a weak reference and compares.
+- Design, coverage table, standing costs and the deletion plan for the capture
+  stack + the engine patch: `docs/DESIGN_TRIGGER_SOURCE.md`.
+
 ## `DBSP_TEST_VERIFY_VECTORS=1`: vector verification, suite-wide - Sep 2026
 
 - Follow-up to "`x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0"

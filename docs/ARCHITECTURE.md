@@ -431,12 +431,57 @@ sequential applies would overcount Δl⋈Δr and strand stale rows.
 The same rule holds one level up, at the commit boundary: a transaction
 that wrote SEVERAL tracked tables runs as ONE propagation pass
 (`propagate_changes_multi` — every commit path collects all table deltas
-first: engine-hook and write-capture via `apply_captured_deltas`, the
-scan fallback via `sync_tables`). Per-table passes would rewrite each
+first: engine-hook, trigger-source and write-capture all via
+`apply_captured_deltas`, the scan fallback via `sync_tables`). Per-table passes would rewrite each
 downstream view's single-generation `dbsp_changes` buffer (a view over
 both tables keeps only the last table's effects) and miss the join
 both-shared correction above. All views stepped in the pass share one
 delta generation.
+
+### Delta sources
+
+Three ways to learn what a committing transaction wrote. All three end at the
+same place — a per-transaction buffer, drained by `TransactionCommit` into
+`apply_captured_deltas` — so the CDC core has one ingest path, not three.
+`DBSP_DELTA_SOURCE` (read once at extension load) picks: `hook`, `capture`,
+`trigger`; unset keeps the built-in default. Exactly one is ever live, and
+each proves itself by DELIVERING before the others stand down.
+
+```
+    a user statement writes a tracked table
+                    │
+   ┌────────────────┼─────────────────────────────┐
+   │                │                             │
+   ▼                ▼                             ▼
+ capture stack    engine hook                trigger source
+ (stock engine)   (patched engine)           (stock engine)
+ predicts the     engine reports the         generated AFTER triggers
+ delta before     exact images inside        hand the images to a
+ the statement,   DuckTransaction::Commit    volatile extension scalar
+ then a commit                               during the statement
+ guard validates
+   │                │                             │
+   └────────────────┴─────────────────────────────┘
+                    │
+                    ▼
+     DBSPContextState per-transaction buffer
+        (rollback simply clears it)
+                    │
+                    ▼
+      TransactionCommit → apply_captured_deltas
+             (ONE pass, all tables)
+```
+
+- **capture stack** (`dbsp_write_capture.hpp` + `dbsp_plan_tee.hpp`) — the
+  original, extension-only. Predicts, then distrusts itself: a commit-time
+  guard re-verifies against committed storage and falls back to scan-and-diff.
+- **engine hook** (`dbsp_engine_hook.hpp`, `DBSP_ENGINE_HOOK` builds) — the
+  patched engine hands over each committing transaction's exact per-table old
+  and new images. Facts, so no guard.
+- **trigger source** (`dbsp_trigger_source.hpp`) — statement-level `AFTER`
+  triggers with transition tables, generated per tracked table. Also facts, and
+  on a **stock** engine; costs `MERGE INTO` on tracked tables. See
+  `docs/DESIGN_TRIGGER_SOURCE.md`.
 
 ### Incremental Aggregation Example
 
@@ -692,6 +737,8 @@ include/
 ├── dbsp_cdc.hpp                 # CDC manager, dependency graph
 ├── dbsp_context_state.hpp       # Auto-sync hooks + captured-delta paths
 ├── dbsp_write_capture.hpp       # UPDATE/DELETE capture vetting + SQL builder
+├── dbsp_engine_hook.hpp         # Patched-engine commit-callback consumer
+├── dbsp_trigger_source.hpp      # Trigger-fed delta source (stock engine)
 ├── dbsp_duckdb_types.hpp        # DuckDB-native Z-sets and views
 └── dbsp_plan_translator.hpp     # Planner frontend + circuit-IR optimizer
 ```

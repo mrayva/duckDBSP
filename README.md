@@ -139,6 +139,38 @@ pinned `DUCKDB_VERSION` (`build.sh:37-39`). Note that OFF only *skips*
 applying the patch — it does not revert one already applied to `duckdb/`;
 `git -C duckdb checkout -- .` first if a genuinely stock tree is wanted.
 
+### Choosing a delta source: `DBSP_DELTA_SOURCE`
+
+How the extension learns what a committing transaction wrote. Read **once**, at
+extension load — an environment variable rather than a `SET`, because the mode
+has to be fixed before the commit callback registers and before the first table
+is tracked, and a host that cannot run SQL before it opens the database still
+has to be able to choose.
+
+| Value | Source | Engine |
+|---|---|---|
+| unset | today's behaviour: the hook if the build and engine have it, else capture | either |
+| `hook` | patched engine's commit callback | patched |
+| `capture` | predictive capture stack + plan tee | stock or patched |
+| `trigger` | generated statement-level `AFTER` triggers | **stock** |
+
+`trigger` is the spike documented in `docs/DESIGN_TRIGGER_SOURCE.md`: exact
+deltas with no forked engine. Its price is that `MERGE INTO` becomes an error
+on any tracked table, and that the triggers plus a small `dbsp_trigger_sink`
+table are visible in the user's catalog. Not the default.
+
+Verify which mode a process actually got — mis-set variables are otherwise
+invisible:
+
+```sql
+SELECT * FROM dbsp_stats();
+-- delta_source_mode  3      (0 default / 1 hook / 2 capture / 3 trigger)
+-- trigger_syncs      4      trigger-body ingests served
+-- trigger_rows       5      row images buffered
+```
+
+With `DBSP_TIMING=1` the trigger path prints `[dbsp-timing] trigger_ingest`.
+
 ### Python probe scripts
 
 `test/python/*.py` run the loadable extension on a real Python client and are

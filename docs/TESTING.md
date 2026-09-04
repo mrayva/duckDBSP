@@ -8,11 +8,11 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-All tests build in `test/build_test`. ctest registers **45** entries with
-the default `-DDBSP_ENGINE_HOOK=OFF`-equivalent tree and **47** with
+All tests build in `test/build_test`. ctest registers **46** entries with
+the default `-DDBSP_ENGINE_HOOK=OFF`-equivalent tree and **48** with
 `-DDBSP_ENGINE_HOOK=ON`: the two extra are `engine_hook` and
 `engine_hook_consumer`, which only compile against a patched engine
-(`test/CMakeLists.txt:86,106`). Two of the 45 are bench binaries registered
+(`test/CMakeLists.txt`). Two of the 46 are bench binaries registered
 as smoke entries (`planner_eval_smoke`, `window_bench`).
 
 ```bash
@@ -63,6 +63,32 @@ means CI runs the same suite twice with no second test registration. Both runs
 are expected green; a failure only under the switch is a real latent bug, not
 a test-harness artifact. `test/python/*.py` are not covered — they open their
 own connections and are not in ctest anyway.
+
+### `trigger_source` — the trigger delta source
+
+`test_trigger_source` (`test/unit/test_trigger_source.cpp`, registered as an
+integration test because it needs the extension) arms
+`DBSP_DELTA_SOURCE=trigger` **process-wide** from a static initializer, before
+any harness opens a database — the mode is read once and cached, so it cannot
+be set later. That is why it is its own binary: no other test may run in that
+mode, and this one may not run in any other.
+
+It is deliberately built **without** `DBSP_ENGINE_HOOK`. The claim the suite
+exists to check is that trigger-fed deltas need no patched engine, so nothing
+in it may be served by the engine callback.
+
+```bash
+cd test/build_test
+./test_trigger_source                      # 11 cases
+DBSP_DELTA_SOURCE=trigger ./test_...       # redundant: the binary sets it
+```
+
+It ports the engine-hook differential oracle (old images −1, new +1,
+insert-then-delete nets to zero, update chains, rollback, multi-table commits)
+and adds the paths specific to this source: the C++ `Appender`, `COPY FROM`, a
+double-count guard that asserts a **sum** rather than a row count, and a pin on
+`MERGE INTO` being rejected outright on a tracked table. See
+`docs/DESIGN_TRIGGER_SOURCE.md`.
 
 ### Python scripts (`test/python/`)
 
