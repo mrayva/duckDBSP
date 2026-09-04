@@ -7,6 +7,9 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/function/table_function.hpp"
 
+#include <cstring>
+#include <iostream>
+
 namespace dbsp_native {
 
 using namespace duckdb;
@@ -313,6 +316,25 @@ inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *inf
 // the same view — only the stored text is normalised. That is why BOTH paths
 // exist and neither is deleted.
 
+// Case-insensitive substring search that allocates nothing. `needle` must
+// already be upper-case.
+inline bool dbsp_contains_ci(const string &haystack, const char *needle) {
+    const size_t n = strlen(needle);
+    if (haystack.size() < n) {
+        return false;
+    }
+    for (size_t i = 0; i + n <= haystack.size(); i++) {
+        size_t j = 0;
+        while (j < n && StringUtil::CharacterToUpper(haystack[i + j]) == needle[j]) {
+            j++;
+        }
+        if (j == n) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when `kw` appears at `pos` case-insensitively AND is followed by a
 // non-identifier character (so "CREATED" does not match "CREATE").
 inline bool dbsp_keyword_at(const string &q, size_t pos, const char *kw) {
@@ -387,15 +409,49 @@ inline size_t dbsp_skip_identifier(const string &q, size_t pos) {
     }
 }
 
+// If a dollar-quote opens at `pos` ($$ or $tag$), return its full opening
+// tag; otherwise "". A tag is letters, digits and underscores, not starting
+// with a digit — DuckDB follows PostgreSQL here.
+inline string dbsp_dollar_tag_at(const string &q, size_t pos) {
+    if (pos >= q.size() || q[pos] != '$') {
+        return "";
+    }
+    size_t i = pos + 1;
+    while (i < q.size() && (std::isalnum(static_cast<unsigned char>(q[i])) ||
+                            q[i] == '_')) {
+        i++;
+    }
+    if (i >= q.size() || q[i] != '$') {
+        return "";
+    }
+    if (i > pos + 1 && std::isdigit(static_cast<unsigned char>(q[pos + 1]))) {
+        return ""; // a tag may not start with a digit
+    }
+    return q.substr(pos, i - pos + 1);
+}
+
 // Index of the first statement-terminating `;` at or after `pos`, skipping
-// string literals, quoted identifiers and comments; q.size() when there is
-// none. Needed because "the rest of the text is the SELECT" is only true up to
-// a terminator a user wrote.
+// string literals, quoted identifiers, DOLLAR-QUOTED bodies and comments;
+// q.size() when there is none. Needed because "the rest of the text is the
+// SELECT" is only true up to a terminator a user wrote.
+//
+// Dollar quoting is not decoration: `SELECT $$semi;colon$$ AS s` stopped at
+// the embedded `;`, the rewrite was declined, and the statement fell back to
+// the token path with normalised text and nothing saying why (measured:
+// stored `SELECT $$semi;colon$$ AS s , id FROM t`).
 inline size_t dbsp_find_statement_end(const string &q, size_t pos) {
     while (pos < q.size()) {
         const char c = q[pos];
         if (c == ';') {
             return pos;
+        }
+        const string tag = dbsp_dollar_tag_at(q, pos);
+        if (!tag.empty()) {
+            const size_t close = q.find(tag, pos + tag.size());
+            // An unterminated dollar quote is a syntax error the core parser
+            // will report; treat the rest as body rather than guessing.
+            pos = (close == string::npos) ? q.size() : close + tag.size();
+            continue;
         }
         if (c == '\'' || c == '"') {
             const char quote = c;
@@ -446,12 +502,80 @@ inline string dbsp_trimmed(const string &s) {
     StringUtil::Trim(out);
     return out;
 }
+// A view name as the extension stores it. `create_view` keys views by a PLAIN
+// identifier, so a quoted name is unquoted here and a qualified one is
+// refused: without this the raw slice was handed on and the failure read
+// `Failed to create materialized view '"my view"': Invalid view name` — the
+// quotes in the message being the only clue that the DDL, not the user, put
+// them there.
+inline bool dbsp_normalize_view_name(const string &raw, string &out,
+                                     string &reason) {
+    out.clear();
+    if (raw.empty()) {
+        reason = "the view name is empty";
+        return false;
+    }
+    if (raw[0] == '"') {
+        if (raw.size() < 2 || raw.back() != '"') {
+            reason = "the quoted view name " + raw + " is not closed";
+            return false;
+        }
+        for (size_t i = 1; i + 1 < raw.size(); i++) {
+            if (raw[i] == '"' && i + 2 < raw.size() && raw[i + 1] == '"') {
+                out += '"';
+                i++;
+                continue;
+            }
+            if (raw[i] == '"') {
+                reason = "the view name " + raw + " is more than one quoted "
+                                                 "identifier (qualified names "
+                                                 "are not supported)";
+                return false;
+            }
+            out += raw[i];
+        }
+    } else {
+        out = raw;
+    }
+    if (out.find('.') != string::npos) {
+        reason = "the view name " + raw +
+                 " is qualified; materialized views are registered by a plain "
+                 "name, so write it unqualified";
+        return false;
+    }
+    if (!(std::isalpha(static_cast<unsigned char>(out[0])) || out[0] == '_')) {
+        reason = "the view name " + raw +
+                 " must start with a letter or an underscore";
+        return false;
+    }
+    for (char c : out) {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+            reason = "the view name " + raw +
+                     " contains a character that is not a letter, a digit or "
+                     "an underscore";
+            return false;
+        }
+    }
+    return true;
+}
+
+// What `dbsp_rewrite_mv_ddl` made of a query.
+enum class MvDdlMatch {
+    NotOurs,   // no MATERIALIZED VIEW statement here; stay silent
+    Rewritten, // `out` holds the equivalent call
+    Declined,  // it IS one of ours and could not be rewritten; `reason` says why
+};
 
 // Rewrite one MATERIALIZED VIEW DDL statement into the equivalent call on the
-// extension's own functions. Returns false when `query` is not one of ours (or
-// is one of ours followed by another statement — see below), which makes the
-// override decline and hands the query to the core parser.
-inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
+// extension's own functions.
+//
+// The NotOurs / Declined split exists because a silent decline is how a
+// defect hides: an escaping bug once made every rewrite unparseable, the
+// override declined, the statement fell back to the token path, and the only
+// symptom was that stored SQL stayed normalised. A Declined result is reported
+// by the caller.
+inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
+                                      string &reason) {
     size_t pos = dbsp_skip_ws_comments(query, 0);
 
     // Everything below is a single statement. A trailing statement is DECLINED
@@ -463,10 +587,28 @@ inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
         const size_t end = dbsp_find_statement_end(query, body_start);
         if (end < query.size() &&
             dbsp_skip_ws_comments(query, end + 1) < query.size()) {
-            return false; // more statements follow
+            reason = "more than one statement in the input";
+            return false;
         }
         body = dbsp_trimmed(query.substr(body_start, end - body_start));
-        return !body.empty();
+        if (body.empty()) {
+            reason = "the SELECT body is empty";
+            return false;
+        }
+        return true;
+    };
+
+    // Name scan + normalisation, shared by all three statements.
+    auto take_name = [&](string &name) -> bool {
+        const size_t name_start = pos;
+        const size_t name_end = dbsp_skip_identifier(query, pos);
+        if (name_end == name_start) {
+            reason = "no view name after MATERIALIZED VIEW";
+            return false;
+        }
+        const string raw = query.substr(name_start, name_end - name_start);
+        pos = dbsp_skip_ws_comments(query, name_end);
+        return dbsp_normalize_view_name(raw, name, reason);
     };
 
     if (dbsp_keyword_at(query, pos, "CREATE")) {
@@ -475,18 +617,19 @@ inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
         if (dbsp_keyword_at(query, pos, "OR")) {
             const size_t after_or = dbsp_skip_ws_comments(query, pos + 2);
             if (!dbsp_keyword_at(query, after_or, "REPLACE")) {
-                return false;
+                return MvDdlMatch::NotOurs;
             }
             or_replace = true;
             pos = dbsp_skip_ws_comments(query, after_or + 7);
         }
         if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 12);
         if (!dbsp_keyword_at(query, pos, "VIEW")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
+        // Past here it IS a CREATE MATERIALIZED VIEW: every exit is a Decline.
         pos = dbsp_skip_ws_comments(query, pos + 4);
         if (dbsp_keyword_at(query, pos, "IF")) {
             // IF NOT EXISTS is accepted and ignored, as it always has been on
@@ -494,60 +637,58 @@ inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
             // redefinition rather than an error.
             size_t p = dbsp_skip_ws_comments(query, pos + 2);
             if (!dbsp_keyword_at(query, p, "NOT")) {
-                return false;
+                reason = "expected IF NOT EXISTS";
+                return MvDdlMatch::Declined;
             }
             p = dbsp_skip_ws_comments(query, p + 3);
             if (!dbsp_keyword_at(query, p, "EXISTS")) {
-                return false;
+                reason = "expected IF NOT EXISTS";
+                return MvDdlMatch::Declined;
             }
             pos = dbsp_skip_ws_comments(query, p + 6);
         }
-        const size_t name_start = pos;
-        const size_t name_end = dbsp_skip_identifier(query, pos);
-        if (name_end == name_start) {
-            return false;
+        string name;
+        if (!take_name(name)) {
+            return MvDdlMatch::Declined;
         }
-        const string name = query.substr(name_start, name_end - name_start);
-        pos = dbsp_skip_ws_comments(query, name_end);
         if (!dbsp_keyword_at(query, pos, "AS")) {
-            return false;
+            reason = "expected AS after the view name";
+            return MvDdlMatch::Declined;
         }
         string body;
         if (!single_statement(pos + 2, body)) {
-            return false;
+            return MvDdlMatch::Declined;
         }
         out = "SELECT * FROM dbsp_create_materialized_view(" +
               dbsp_sql_literal(name) + ", " + dbsp_sql_literal(body) + ", " +
               (or_replace ? "true" : "false") + ")";
-        return true;
+        return MvDdlMatch::Rewritten;
     }
 
     if (dbsp_keyword_at(query, pos, "DROP")) {
         pos = dbsp_skip_ws_comments(query, pos + 4);
         if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 12);
         if (!dbsp_keyword_at(query, pos, "VIEW")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 4);
         bool if_exists = false;
         if (dbsp_keyword_at(query, pos, "IF")) {
             const size_t p = dbsp_skip_ws_comments(query, pos + 2);
             if (!dbsp_keyword_at(query, p, "EXISTS")) {
-                return false;
+                reason = "expected IF EXISTS";
+                return MvDdlMatch::Declined;
             }
             if_exists = true;
             pos = dbsp_skip_ws_comments(query, p + 6);
         }
-        const size_t name_start = pos;
-        const size_t name_end = dbsp_skip_identifier(query, pos);
-        if (name_end == name_start) {
-            return false;
+        string name;
+        if (!take_name(name)) {
+            return MvDdlMatch::Declined;
         }
-        const string name = query.substr(name_start, name_end - name_start);
-        pos = dbsp_skip_ws_comments(query, name_end);
         bool cascade = false;
         if (dbsp_keyword_at(query, pos, "CASCADE")) {
             cascade = true;
@@ -559,43 +700,42 @@ inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
             pos = dbsp_skip_ws_comments(query, pos + 1);
         }
         if (pos < query.size()) {
-            return false; // trailing junk or another statement
+            reason = "trailing text after the DROP statement";
+            return MvDdlMatch::Declined;
         }
         out = "SELECT * FROM dbsp_drop_materialized_view(" +
               dbsp_sql_literal(name) + ", " + (cascade ? "true" : "false") +
               ", " + (if_exists ? "true" : "false") + ")";
-        return true;
+        return MvDdlMatch::Rewritten;
     }
 
     if (dbsp_keyword_at(query, pos, "REFRESH")) {
         pos = dbsp_skip_ws_comments(query, pos + 7);
         if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 12);
         if (!dbsp_keyword_at(query, pos, "VIEW")) {
-            return false;
+            return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 4);
-        const size_t name_start = pos;
-        const size_t name_end = dbsp_skip_identifier(query, pos);
-        if (name_end == name_start) {
-            return false;
+        string name;
+        if (!take_name(name)) {
+            return MvDdlMatch::Declined;
         }
-        const string name = query.substr(name_start, name_end - name_start);
-        pos = dbsp_skip_ws_comments(query, name_end);
         if (pos < query.size() && query[pos] == ';') {
             pos = dbsp_skip_ws_comments(query, pos + 1);
         }
         if (pos < query.size()) {
-            return false;
+            reason = "trailing text after the REFRESH statement";
+            return MvDdlMatch::Declined;
         }
         out = "SELECT * FROM dbsp_refresh_materialized_view(" +
               dbsp_sql_literal(name) + ")";
-        return true;
+        return MvDdlMatch::Rewritten;
     }
 
-    return false;
+    return MvDdlMatch::NotOurs;
 }
 
 inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
@@ -603,11 +743,26 @@ inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
                                                      ParserOptions &options) {
     // Cheap gate: every statement this override claims contains the word
     // MATERIALIZED, and this callback runs on EVERY query in the database.
-    if (StringUtil::Upper(query).find("MATERIALIZED") == string::npos) {
+    // Scanned in place — StringUtil::Upper() allocated a copy of every query
+    // string the database ever parsed just to look for one word.
+    if (!dbsp_contains_ci(query, "MATERIALIZED")) {
         return ParserOverrideResult();
     }
     string rewritten;
-    if (!dbsp_rewrite_mv_ddl(query, rewritten)) {
+    string reason;
+    const auto match = dbsp_rewrite_mv_ddl(query, rewritten, reason);
+    if (match == MvDdlMatch::NotOurs) {
+        return ParserOverrideResult();
+    }
+    if (match == MvDdlMatch::Declined) {
+        // LOUD. Declining hands the statement to the core parser, which either
+        // errors (the useful case) or lets the token path take it with
+        // normalised SQL text — and the second outcome is indistinguishable
+        // from success unless someone inspects dbsp_views(). Say why here.
+        std::cerr << "DBSP: MATERIALIZED VIEW DDL not taken by the raw-text "
+                     "parser (" << reason
+                  << "); falling back to the core parser. The stored SQL, if "
+                     "the statement succeeds at all, will be normalised.\n";
         return ParserOverrideResult();
     }
     try {
@@ -620,6 +775,8 @@ inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
         parser.ParseQuery(rewritten);
         return ParserOverrideResult(std::move(parser.statements));
     } catch (std::exception &e) {
+        std::cerr << "DBSP: MATERIALIZED VIEW DDL rewrite failed to parse ("
+                  << e.what() << "); falling back to the core parser\n";
         return ParserOverrideResult(e);
     }
 }

@@ -2843,8 +2843,18 @@ static void LoadInternal(ExtensionLoader &loader) {
   // the parse_function path still parses the same statements, it only
   // normalises the stored SQL text and cannot reach DROP.
   try {
-    config.SetOptionByName("allow_parser_override_extension",
-                           Value("FALLBACK"));
+    // RAISE only, never lower. Reading it first matters: a user who has
+    // deliberately set STRICT (every override error surfaces instead of
+    // falling through to the core parser) had it silently downgraded to
+    // FALLBACK by LOAD — measured, `SET ...='STRICT'` then LOAD reported
+    // FALLBACK. Only DEFAULT, which skips override callbacks altogether and
+    // would leave this extension's DDL unreachable, is changed.
+    const auto current =
+        Settings::Get<AllowParserOverrideExtensionSetting>(config);
+    if (current == AllowParserOverride::DEFAULT_OVERRIDE) {
+      config.SetOptionByName("allow_parser_override_extension",
+                             Value("FALLBACK"));
+    }
   } catch (const std::exception &e) {
     // A build or embedding without that setting keeps the token path, which is
     // functional. Say so rather than failing the LOAD.

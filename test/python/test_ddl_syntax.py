@@ -208,6 +208,48 @@ try:
     assert mv2 == 0, "mv2 was created despite the error"
     print("ok: multi-statement input errors loudly, nothing half-applied", flush=True)
 
+    # --- dollar-quoted bodies keep their bytes ---------------------------------
+    # The statement-end scanner has to know $$...$$ and $tag$...$tag$, or an
+    # embedded `;` looks like a terminator: the rewrite was declined and the
+    # statement fell back to the token path, storing
+    # `SELECT $$semi;colon$$ AS s , id FROM t` with nothing saying why.
+    for body in (
+        "SELECT $$semi;colon$$ AS s, t.tag FROM t",
+        "SELECT $tag$one;two$tag$ AS s, t.tag FROM t",
+        "SELECT $$plain$$ AS s, t.tag FROM t",
+    ):
+        name = "dq%d" % abs(hash(body) % 100000)
+        conn.execute(f"CREATE MATERIALIZED VIEW {name} AS {body}")
+        stored = conn.execute(
+            f"SELECT sql FROM dbsp_views() WHERE view_name = '{name}'"
+        ).fetchone()[0]
+        assert stored == body, f"dollar-quoted body normalised:\n  got  {stored!r}\n  want {body!r}"
+        got = sorted(conn.execute(f"SELECT * FROM dbsp_query('{name}')").fetchall())
+        want_dq = sorted(conn.execute(body).fetchall())
+        assert got == want_dq, f"{name}: {got} != {want_dq}"
+        conn.execute(f"DROP MATERIALIZED VIEW {name}")
+    print("ok: dollar-quoted bodies stay byte-exact", flush=True)
+
+    # --- view names are unquoted and validated ---------------------------------
+    # The raw slice used to be handed on, so the failure read
+    # `Failed to create materialized view '"my view"': Invalid view name` —
+    # the quotes in the message being the only clue where they came from.
+    conn.execute('CREATE MATERIALIZED VIEW "Quoted_Ok" AS SELECT tag FROM t')
+    names = [r[0] for r in conn.execute("SELECT view_name FROM dbsp_views()").fetchall()]
+    assert "Quoted_Ok" in names, f"a quoted name was not unquoted: {names}"
+    conn.execute('DROP MATERIALIZED VIEW "Quoted_Ok"')
+    for bad in ('CREATE MATERIALIZED VIEW "my view" AS SELECT tag FROM t',
+                "CREATE MATERIALIZED VIEW s1.qv AS SELECT tag FROM t"):
+        try:
+            conn.execute(bad)
+            raise AssertionError(f"accepted a name it cannot register: {bad}")
+        except duckdb.Error:
+            pass  # loud, and the decline is reported on stderr
+    left = [r[0] for r in conn.execute("SELECT view_name FROM dbsp_views()").fetchall()]
+    assert not any(n in ("my view", "qv", "s1.qv") for n in left), left
+    print("ok: view names are unquoted, and unregisterable ones are refused",
+          flush=True)
+
     # --- the token path is still a working fallback ----------------------------
     # parser_override callbacks are skipped when allow_parser_override_extension
     # is DEFAULT, which is DuckDB's own default -- the extension raises it to
@@ -236,5 +278,28 @@ try:
           flush=True)
 finally:
     conn.close()
+
+# --- LOAD raises the override setting, but never LOWERS it -------------------
+# Measured before the guard: `SET allow_parser_override_extension='STRICT'`
+# then LOAD reported FALLBACK. STRICT is a deliberate choice (an override's
+# error surfaces instead of falling through to the core parser) and silently
+# downgrading it is a behaviour change nobody asked for. Only DEFAULT — which
+# skips override callbacks altogether and would leave this extension's DDL
+# unreachable — is raised.
+for preset, want in (("DEFAULT", "FALLBACK"),
+                     ("FALLBACK", "FALLBACK"),
+                     ("STRICT", "STRICT")):
+    probe = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+    try:
+        probe.execute(f"SET allow_parser_override_extension='{preset}'")
+        probe.execute(f"LOAD '{EXT}'")
+        got = probe.execute(
+            "SELECT current_setting('allow_parser_override_extension')"
+        ).fetchone()[0]
+        assert got == want, f"LOAD turned {preset} into {got}, want {want}"
+    finally:
+        probe.close()
+print("ok: LOAD raises DEFAULT to FALLBACK and leaves FALLBACK/STRICT alone",
+      flush=True)
 
 print("PASS", flush=True)
