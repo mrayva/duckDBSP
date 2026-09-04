@@ -1306,12 +1306,15 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
 
   SECTION("B commits inside the window, then A commits") {
     // Does NOT discriminate in this harness: with the apply-path gate removed
-    // it still passes, because a statement-less commit lands between A's write
-    // and its create and its pessimistic sync_all seeds the table by accident
-    // (DBSP_DEBUG_SYNC: know_all=0 touched=0 stmt_kind=0). The Python client
-    // does not emit that commit and this shape WAS wrong there, so the guard
-    // for it is test/python/test_create_view_seeding.py. Kept because the
-    // accident is not a guarantee.
+    // it still passes. Measured cause: this section is the FIRST case in the
+    // process to reach a dbsp_auto_sync(true) commit, so
+    // trigger_source_active() is still false and that commit takes the
+    // pessimistic sync_all, which seeds the baseline by accident — the gate
+    // is never consulted for whichever shape runs first. Later cases in the
+    // same process are genuinely unseeded and do discriminate. Run in
+    // isolation (-c) the first section is vacuous; the Python file
+    // test/python/test_create_view_seeding.py is order-independent and is
+    // the guard.
     DuckDBTestHarness db; // connection A
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     tracked_but_unseeded(db);
@@ -1387,7 +1390,8 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   }
 
   SECTION("A abandons its transaction; B keeps writing") {
-    // Also non-discriminating here, for the same reason as the first section;
+    // Also non-discriminating here, for the same reason as the first section
+    // above (first case in the process to reach a pessimistic-seeding commit);
     // guarded file-backed in test/python/test_create_view_seeding.py.
     DuckDBTestHarness db;
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});

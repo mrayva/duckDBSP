@@ -422,6 +422,13 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   Self-healing at the deferring connection's commit, and still a wrong answer
   with no error while it lasted.
 
+  That closes the APPLY path only: never applied onto, on any connection. A
+  PURE READ of the view during the deferral window — a connection holding
+  `BEGIN; dbsp_create_view(...)` open, before its own commit reaches the gate
+  above — still returns the unseeded value on that connection and on any
+  other connection, healing only when the deferring transaction ends. See
+  Follow-ups.
+
   A reconcile that FAILS must not retire the debt. `sync_tables` returns false
   when a table it was asked about was not scanned, reports it through
   `record_error_best_effort` and on stderr, and the commit clears the flag only
@@ -482,3 +489,16 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   whitelisted in code with its reason at the call site rather than in a
   comment. Run `ctest` a third time with it set, the way
   `DBSP_TEST_VERIFY_VECTORS` is run today.
+- **A pure read during the deferral window still observes the unseeded
+  baseline.** The apply-path gate closes the case where a delta is applied
+  onto an unseeded baseline, on any connection — it does not touch a plain
+  `SELECT` from the view. While connection A holds `BEGIN;
+  dbsp_create_view(...)` open, a `dbsp_query` of that view on A or on any
+  other connection returns the unseeded value (`NULL` vs SQL `10.0`), healing
+  only when A's transaction ends. Candidate fix: `dbsp_query` refuses, or
+  errors loudly, when the view's source baseline is unseeded. Not reachable
+  from NumPad, which never creates a view inside an open transaction
+  (measured: 25 seedings, all `user_txn_open=0`).
+- **A failed reconcile scan is reported only on stderr and via
+  `last_error_`.** There is no `dbsp_stats()` metric or `dbsp_last_error()`
+  surfacing it to a caller. Minor: add a `reconcile_failures` counter.

@@ -1,6 +1,6 @@
 # Changelog
 
-## An unseeded baseline is never served, to any connection — 2026-09-04
+## An unseeded baseline is never applied onto, on any connection — 2026-09-04
 
 **Third and last correction to deferred seeding.** The debt recorded by
 `seed_baseline` is per-CONNECTION; the baseline it refers to is per-INSTANCE.
@@ -25,6 +25,16 @@ which reconciles that table by scan at that same commit — the mechanism the
 `failed` list was already built for. Any connection's commit does this, whether
 it is in autocommit or in an explicit transaction of its own; the scan runs at
 commit time and sees committed state.
+
+That is the APPLY path only: never applied onto, on any connection; a read
+during the deferral window can still observe the unseeded baseline until the
+deferring transaction ends. A PURE READ of the view — no write of its own, so
+no commit to trigger the gate — while connection A still holds `BEGIN;
+dbsp_create_view(...)` open returns the unseeded value (`NULL` vs SQL `10.0`)
+on connection A and on any other connection, and only heals when A's
+transaction ends. Not reachable from NumPad, which never creates a view inside
+an open transaction (measured: 25 seedings, all `user_txn_open=0`). Open item;
+see `docs/DESIGN_TRIGGER_SOURCE.md` Follow-ups.
 
 **And a failed reconcile no longer retires the debt in silence.** It was
 cleared at the top of `TransactionCommit`, before the scan that pays it, and

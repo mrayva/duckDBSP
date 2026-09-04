@@ -4913,6 +4913,10 @@ public:
   // validated the delta against the committed table (count guard).
   // `context` enables lazy-baseline materialization (D3c); without it a
   // deferred manager rejects the fast path (caller falls back to sync).
+  // No caller in this repo (singular form) — the unseeded-baseline gate
+  // just below is therefore unexercised. The live, tested path is the
+  // plural apply_captured_deltas() below (~line 4987 for its own copy of
+  // this gate).
   bool apply_captured_delta(const std::string &table_name,
                             const DuckDBZSet &delta,
                             duckdb::ClientContext *context = nullptr) {
