@@ -3848,6 +3848,7 @@ public:
     bool all_ok = worker_errors.empty();
     for (const auto &msg : worker_errors) {
       record_error_best_effort("DBSP: " + msg);
+      note_reconcile_failure("DBSP: " + msg);
       std::cerr << "DBSP: " << msg << "\n";
     }
     for (size_t i = 0; i < table_names.size(); i++) {
@@ -3858,10 +3859,25 @@ public:
                                 "'; its baseline is unchanged. Last error: " +
                                 scan_error;
         record_error_best_effort(msg);
+        note_reconcile_failure(msg);
         std::cerr << msg << "\n";
       }
     }
     return all_ok;
+  }
+
+  // How many reconcile scans have failed, and what the last one said.
+  //
+  // A failed reconcile is the one way a view can be left stale with the
+  // manager knowing it: `sync_table_scan_and_consume` reports failure by
+  // RETURNING, so nothing throws out to the caller and the only trace used to
+  // be a stderr line, which a host embedding the extension never sees.
+  // `dbsp_stats()` publishes both as `reconcile_failures` and
+  // `last_reconcile_error`.
+  uint64_t reconcile_failures() const { return reconcile_failures_.load(); }
+  std::string last_reconcile_error() const {
+    std::lock_guard<std::mutex> g(reconcile_error_mutex_);
+    return last_reconcile_error_;
   }
 
   // Enable/disable baseline spilling (Phase K1). Existing tables migrate
@@ -5876,6 +5892,13 @@ private:
   //
   // Returns false only when a scan that SHOULD have run failed; the caller
   // must not replay an unseeded baseline as though it were table content.
+  // Record one failed reconcile scan. See reconcile_failures().
+  void note_reconcile_failure(const std::string &message) {
+    reconcile_failures_++;
+    std::lock_guard<std::mutex> g(reconcile_error_mutex_);
+    last_reconcile_error_ = message;
+  }
+
   // Caller holds struct_mutex_ and view_mutex_ shared. See
   // unseeded_source_of_view().
   std::string unseeded_source_locked(const std::string &name,
@@ -6778,6 +6801,13 @@ private:
   // Tables currently PROVISIONAL. The commit hook's sweep loads this and
   // returns when it is zero, which is every commit of an ordinary session.
   std::atomic<uint64_t> provisional_count_{0};
+  // See reconcile_failures(). Its own mutex, not struct_mutex_: the reporting
+  // loop in sync_tables runs with no manager lock held on purpose, and
+  // record_error_best_effort's exclusive struct_mutex_ next to it is already
+  // the delicate part of that sequence.
+  std::atomic<uint64_t> reconcile_failures_{0};
+  mutable std::mutex reconcile_error_mutex_;
+  std::string last_reconcile_error_;
   std::atomic<uint64_t> scan_syncs_{0};
   // Advances on every propagated baseline mutation and on full rebuilds.
   std::atomic<uint64_t> commit_seq_{0};

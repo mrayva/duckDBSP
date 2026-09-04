@@ -836,16 +836,21 @@ SELECT * FROM dbsp_lazy_restore();       -- Query status
 Sync-path observability counters, for monitoring which ingestion path
 serves a workload:
 
+Three columns: `metric`, `value` (BIGINT), `detail` (VARCHAR, NULL on every
+numeric row).
+
 ```sql
 SELECT * FROM dbsp_stats();
--- metric                | value
--- captured_delta_syncs  | 1042   -- exact table deltas applied (no scan)
--- scan_syncs            | 3      -- scan-and-diff fallbacks
--- commit_seq            | 1045   -- monotonic baseline mutations
--- tracked_tables        | 4
--- trigger_syncs         | 1310   -- trigger-body ingest calls served
--- trigger_rows          | 5218   -- row images they buffered
--- provisional_tables    | 0      -- baselines awaiting a concurrency watermark
+-- metric                | value | detail
+-- captured_delta_syncs  | 1042  |        -- exact table deltas applied (no scan)
+-- scan_syncs            | 3     |        -- scan-and-diff fallbacks
+-- commit_seq            | 1045  |        -- monotonic baseline mutations
+-- tracked_tables        | 4     |
+-- trigger_syncs         | 1310  |        -- trigger-body ingest calls served
+-- trigger_rows          | 5218  |        -- row images they buffered
+-- provisional_tables    | 0     |        -- awaiting a concurrency watermark
+-- reconcile_failures    | 0     |        -- reconcile scans that did NOT run
+-- last_reconcile_error  | 0     | NULL   -- text of the last one
 ```
 
 `trigger_syncs` is the proof of life: it stays 0 until a generated trigger body
@@ -862,6 +867,15 @@ transaction alive at seed time has ended, at which point one scan retires it.
 It is 0 in an ordinary single-writer session. A value that never falls means a
 connection is sitting on an open transaction; every commit is paying a scan of
 those tables until it ends.
+
+`reconcile_failures` counts reconcile scans that did NOT run, and
+`last_reconcile_error` carries the text of the last one in `detail`. This is the
+one way a view is left stale with the manager knowing it: the scan reports
+failure by RETURNING, not by throwing, so nothing propagates out of the commit
+hook and the only other trace is a stderr line an embedding host never sees.
+A non-zero `reconcile_failures` means at least one baseline is unchanged when it
+should have been rescanned — read `last_reconcile_error`, fix the cause (a
+dropped source is the usual one) and run `dbsp_sync()`.
 
 ### dbsp_parallel(enable)
 

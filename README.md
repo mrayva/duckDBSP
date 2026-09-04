@@ -191,7 +191,12 @@ SELECT * FROM dbsp_stats();
 -- captured_delta_syncs   4   table deltas applied exactly (no scan)
 -- scan_syncs             2   scan-and-diff reconciles
 -- provisional_tables     0   baselines awaiting a concurrency watermark
+-- reconcile_failures     0   reconcile scans that did NOT run
+-- last_reconcile_error   0   text of the last one, in the `detail` column
 ```
+
+`dbsp_stats()` has three columns — `metric`, `value` (BIGINT) and `detail`
+(VARCHAR, NULL on every numeric row).
 
 With `DBSP_TIMING=1` the trigger path prints `[dbsp-timing] trigger_ingest`.
 

@@ -54,7 +54,10 @@ def connect(path):
 
 
 def stats(con):
-    return dict(con.execute("SELECT * FROM dbsp_stats()").fetchall())
+    # dbsp_stats() has THREE columns: metric, value, detail. Only
+    # last_reconcile_error uses detail; every other row is NULL there.
+    return {name: value for name, value, _ in
+            con.execute("SELECT * FROM dbsp_stats()").fetchall()}
 
 
 # Every connection is closed in a finally: the 2.0 alpha SIGSEGVs at

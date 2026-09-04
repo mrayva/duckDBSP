@@ -1105,8 +1105,20 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
 // dbsp_stats - Sync-path observability counters
 // ============================================================================
 
+// Three columns: metric, value, detail. `detail` exists for the one thing a
+// counter cannot carry — the TEXT of the last failed reconcile. A failed
+// reconcile is the one way a view is left stale with the manager knowing it,
+// and until this row its only trace was a stderr line, which a host embedding
+// the extension never sees. It is NULL on every numeric row.
+struct StatsMetric {
+  string name;
+  int64_t value;
+  string detail;      // empty -> NULL
+  bool has_detail = false;
+};
+
 struct StatsBindData : public TableFunctionData {
-  vector<pair<string, int64_t>> metrics;
+  vector<StatsMetric> metrics;
   idx_t current = 0;
 };
 
@@ -1147,11 +1159,23 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
       // connection sitting on an open transaction.
       {"provisional_tables",
        NumericCast<int64_t>(manager.provisional_tables())},
+      // Reconcile scans that did NOT run. sync_table_scan_and_consume reports
+      // failure by RETURNING, so nothing throws out to the caller: a stale
+      // baseline with an error nobody sees was the whole hazard. The text of
+      // the last one rides the `detail` column.
+      {"reconcile_failures",
+       NumericCast<int64_t>(manager.reconcile_failures())},
   };
+  const string last_reconcile = manager.last_reconcile_error();
+  data->metrics.push_back({"last_reconcile_error",
+                           NumericCast<int64_t>(manager.reconcile_failures()),
+                           last_reconcile, !last_reconcile.empty()});
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("metric");
   return_types.push_back(LogicalType::BIGINT);
   names.push_back("value");
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("detail");
   return std::move(data);
 }
 
@@ -1160,9 +1184,11 @@ void StatsFunc(ClientContext &context, TableFunctionInput &input,
   auto &data = input.bind_data->CastNoConst<StatsBindData>();
   idx_t count = 0;
   while (data.current < data.metrics.size() && count < STANDARD_VECTOR_SIZE) {
-    output.SetValue(0, count, Value(data.metrics[data.current].first));
-    output.SetValue(1, count,
-                    Value::BIGINT(data.metrics[data.current].second));
+    const auto &m = data.metrics[data.current];
+    output.SetValue(0, count, Value(m.name));
+    output.SetValue(1, count, Value::BIGINT(m.value));
+    output.SetValue(2, count,
+                    m.has_detail ? Value(m.detail) : Value(LogicalType::VARCHAR));
     data.current++;
     count++;
   }

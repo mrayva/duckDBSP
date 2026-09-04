@@ -160,6 +160,15 @@ whole claim of that source and something no in-tree binary can demonstrate. It
 also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
 suffice) and that an attached catalog holding a triggered table still detaches.
 
+`test_reconcile_telemetry.py` pins the one failure a caller could not see: a
+reconcile scan that did not run. It reproduces round 5's scenario — a view
+created inside an open transaction, the source DROPped in that same
+transaction, and the COMMIT widening itself to pay a debt with a scan that
+cannot run — and asserts `dbsp_stats()` reports `reconcile_failures` and the
+message in `last_reconcile_error`. Note that `dbsp_stats()` has THREE columns
+(`metric`, `value`, `detail`); a helper that does `dict(fetchall())` on it will
+raise.
+
 `test_provisional_baseline.py` is the concurrency sibling: connection A holds
 `BEGIN; INSERT` on an UNTRACKED table while connection B tracks it and seeds
 from committed state. It asserts the reproduction heals (both backends, and
@@ -178,7 +187,7 @@ by the deferred rows cannot hide as a constant offset.
 
 **Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
 `test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
-to the delta source. 28 of the 29 scripts exit 0.
+to the delta source. 29 of the 30 scripts exit 0.
 
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown

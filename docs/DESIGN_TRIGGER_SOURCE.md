@@ -532,6 +532,13 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   whitelisted in code with its reason at the call site rather than in a
   comment. Run `ctest` a third time with it set, the way
   `DBSP_TEST_VERIFY_VECTORS` is run today.
-- **A failed reconcile scan is reported only on stderr and via
-  `last_error_`.** There is no `dbsp_stats()` metric or `dbsp_last_error()`
-  surfacing it to a caller. Minor: add a `reconcile_failures` counter.
+- **A failed reconcile scan is visible from SQL.** `dbsp_stats()` carries
+  `reconcile_failures` (a count) and `last_reconcile_error` (the message, in a
+  new third `detail` column). This is the one way a view is left stale with the
+  manager knowing it: the scan reports failure by RETURNING, not by throwing,
+  so nothing propagates out of the commit hook and the only other trace is a
+  stderr line an embedding host never sees. Pinned by
+  `test/python/test_reconcile_telemetry.py` with round 5's own scenario — a
+  view created inside an open transaction (seeding deferred, debt recorded),
+  the source DROPped in the same transaction, and the COMMIT widening itself to
+  pay a debt with a scan that cannot run.

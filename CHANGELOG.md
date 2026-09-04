@@ -1,5 +1,36 @@
 # Changelog
 
+## A failed reconcile is visible from SQL — 2026-09-04
+
+`sync_table_scan_and_consume` reports failure by RETURNING `nullopt`, not by
+throwing, so nothing propagates out of the commit hook. A view left stale by a
+failed reconcile was announced on stderr and in `last_error_`, neither of which
+a host embedding the extension sees. `dbsp_stats()` now carries
+`reconcile_failures` (a count) and `last_reconcile_error` (the message).
+
+`dbsp_stats()` therefore has **three** columns: `metric`, `value` (BIGINT) and
+`detail` (VARCHAR, NULL on every numeric row) — a counter cannot carry the text
+and the text is the useful half. Consumers that unpacked two columns need
+updating; NumPad reads `dbsp_stats()` nowhere (grepped: `calcengine/`, `api/`,
+`tests/` — no hits).
+
+The scenario, from the transition's round 5: a view is created inside an open
+transaction (which defers the seeding scan and records the debt), the same
+transaction DROPs the source, and the COMMIT widens itself to pay the debt with
+a scan that cannot run. Before, `dbsp_stats()` returned seven two-column rows
+and said nothing:
+
+```
+[('captured_delta_syncs', 0), ('scan_syncs', 2), ('commit_seq', 1),
+ ('tracked_tables', 1), ('trigger_syncs', 0), ('trigger_rows', 0),
+ ('provisional_tables', 0)]
+```
+
+After: `reconcile_failures 1` and `last_reconcile_error` = `DBSP: reconcile scan
+did not run for 'memory.main.t'; its baseline is unchanged. Last error: … Table
+with name t does not exist!`. Pinned by
+`test/python/test_reconcile_telemetry.py` on both backends.
+
 ## A baseline seeded beside an open transaction is PROVISIONAL — 2026-09-04
 
 The seeding scan reads COMMITTED storage. If another connection already holds a
