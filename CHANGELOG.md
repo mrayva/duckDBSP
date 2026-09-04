@@ -1,5 +1,60 @@
 # Changelog
 
+## An unseeded baseline is never served, to any connection — 2026-09-04
+
+**Third and last correction to deferred seeding.** The debt recorded by
+`seed_baseline` is per-CONNECTION; the baseline it refers to is per-INSTANCE.
+So while connection A held the transaction that deferred the seed, connection
+B's commits took the trigger-fed fast path and applied their exact deltas onto
+A's still-EMPTY baseline, and B read the deltas alone:
+
+```
+B write 1   view 1.0    sql 11.0
+B write 2   view 2.0    sql 12.0
+B write 3   view 3.0    sql 13.0     -- correct again at A's commit
+```
+
+Transient and self-healing, and still a view returning a wrong answer with no
+error, which is the one thing the design does not allow.
+
+The fix is on the APPLY path, where the per-instance signal already lived and
+was read by nobody but `create_view`: `apply_captured_delta` and
+`apply_captured_deltas` now refuse an exact delta onto a table whose
+`TrackedTable::baseline_seeded()` is false and hand it back to the commit,
+which reconciles that table by scan at that same commit — the mechanism the
+`failed` list was already built for. Any connection's commit does this, whether
+it is in autocommit or in an explicit transaction of its own; the scan runs at
+commit time and sees committed state.
+
+**And a failed reconcile no longer retires the debt in silence.** It was
+cleared at the top of `TransactionCommit`, before the scan that pays it, and
+that scan can fail — the source was dropped, a deferred materialization threw —
+without throwing, so one failure left the baseline empty for the life of the
+connection with nothing owed and nothing said. Now:
+
+- `sync_tables` (and `sync_all`) return whether every named table was really
+  scanned. A table that was skipped or whose scan failed is reported through
+  `record_error_best_effort` AND on stderr, naming the table and the underlying
+  error.
+- the parallel arm uses `future::get()` rather than `wait()`, so an exception
+  from the worker's lock acquisition can no longer vanish into the future's
+  destructor.
+- the commit clears the deferred-seeding flag only on a sync that reports
+  success.
+
+Still open, and NOT the same shape: a table tracked while ANOTHER connection
+holds a PRE-TRACKING write open is missed permanently (`10.0` against `13.0`).
+There the baseline is seeded correctly and it is the other connection's earlier
+write that nothing accounts for. Re-measured after this change and unchanged;
+recorded in `docs/DESIGN_TRIGGER_SOURCE.md` Follow-ups.
+
+Net over the whole transition: **−2,813 lines** across 45 files
+(`git diff --shortstat 7549a02..HEAD`: +3,397 / −6,210, taken with this commit
+itself in the range).
+
+Suite: `ctest` 45/45, `test_trigger_source` 33 cases / 915 assertions,
+`test_dml_shapes` 10 cases / 352 assertions.
+
 ## A deferred baseline is reconciled on every commit path — 2026-09-04
 
 **Completes the entry below, which fixed the wrong answer on one commit path
@@ -52,12 +107,8 @@ Also in this round:
   permanently, and a concrete `DBSP_STRICT_INTERNAL_QUERY=1` proposal for
   enforcing the law.
 
-Net over the whole transition after this round: **−3,252 lines** across
-45 files (`git diff --shortstat 7549a02..HEAD`: +2,951 / −6,203, taken
-with this commit itself in the range).
-
-Suite: `ctest` 45/45, `test_trigger_source` 31 cases / 783 assertions,
-`test_dml_shapes` 10 cases / 352 assertions.
+The transition-wide `git diff --shortstat` is quoted in the newest entry at the
+top of this file.
 
 ## Baselines are never seeded from a stale read — 2026-09-04
 

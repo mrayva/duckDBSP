@@ -307,14 +307,16 @@ table may be parallel, so more than one thread can be inside
 
 ## Measurements
 
-Correctness, on this tree (`ninja` build, `-j8`, stock engine
-`v2.0.0-alpha39998 / a00803f768`):
+Correctness, measured 2026-09-04 on this tree (`ninja` build, `-j8`, stock
+engine `v2.0.0-alpha39998 / a00803f768`). Wall times are one run each on a
+laptop and drift by tens of percent between runs; they are here to say the
+suite is minutes, not hours:
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 81.5 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.4 s |
-| `test_trigger_source` alone | **31 cases, 783 assertions** |
+| `ctest -j4` | **45/45 passed**, 78.9 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.1 s |
+| `test_trigger_source` alone | **33 cases, 915 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
@@ -354,8 +356,8 @@ one, and the other two were deleted:
 | capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
 | capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-Net over the whole transition: **−3,252 lines** across 45 files
-(`git diff --shortstat 7549a02..HEAD`: +2,951 / −6,203, taken with this
+Net over the whole transition: **−2,813 lines** across 45 files
+(`git diff --shortstat 7549a02..HEAD`: +3,397 / −6,210, taken with this
 commit itself in the range — a SHA cannot be quoted here without going stale
 the moment it is written), and the fork stopped being a fork of DuckDB — stock engine, stock
 PyPI wheel, a CI that can build against a public one.
@@ -408,6 +410,24 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   The flag is sticky for the same reason: a commit with auto-sync OFF
   reconciles nothing, so it has to leave the debt standing.
 
+  The debt is per-CONNECTION but the baseline is per-INSTANCE, so the
+  connection holding the deferral is not the only one that can walk into an
+  empty baseline. **The apply path is where that is caught**: both
+  `apply_captured_delta` and `apply_captured_deltas` refuse to apply an exact
+  delta to a table whose `TrackedTable::baseline_seeded()` is false, and hand
+  it back to the commit, which reconciles that table by scan at that same
+  commit. Without it, another connection's commits applied their deltas onto
+  the empty baseline and read the deltas alone for the length of the window —
+  `view 1.0 / sql 11.0`, `2.0 / 12.0`, `3.0 / 13.0` over three commits.
+  Self-healing at the deferring connection's commit, and still a wrong answer
+  with no error while it lasted.
+
+  A reconcile that FAILS must not retire the debt. `sync_tables` returns false
+  when a table it was asked about was not scanned, reports it through
+  `record_error_best_effort` and on stderr, and the commit clears the flag only
+  on success — clearing it first meant one failed scan left the baseline empty
+  for the life of the connection, silently.
+
   This is the third defect of the same family in this work — the sweep's DDL,
   the sweep's catalog-version read, and the seeding scan. **The law is a rule,
   not an enforced invariant, and it is honoured for SEEDING only.** Two
@@ -429,7 +449,13 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.
 - **A table tracked while ANOTHER connection holds a write open is missed —
-  permanently.** Not fixed; it needs its own unit. The shape, measured:
+  permanently.** Still open; it needs its own unit. It is NOT the
+  cross-connection defect the apply-path gate closed, and the two look alike:
+  there, the baseline was UNSEEDED and another connection's delta was applied
+  onto nothing; here, the baseline is seeded correctly and it is the other
+  connection's PRE-TRACKING write that no one ever accounts for. Re-measured
+  after the gate landed (`.scratch/r5_followup_i.py`): still `10.0` against
+  `13.0`, then `14.0` against `17.0`. The shape, measured:
   connection 1 runs `BEGIN; INSERT` on an UNTRACKED table and leaves the
   transaction open; connection 2 tracks the table (or creates a view over it)
   and seeds the baseline from committed state — correctly, since connection 2
