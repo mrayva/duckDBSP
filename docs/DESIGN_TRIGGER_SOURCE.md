@@ -147,7 +147,7 @@ all of them work normally in default and capture mode.
 | `ALTER TABLE ... RENAME COLUMN` | same dependency error |
 | `ALTER TABLE ... ALTER COLUMN ... TYPE` | same dependency error |
 | `ALTER TABLE ... RENAME TO` | same dependency error |
-| `ALTER TABLE ... ADD COLUMN` | **allowed** — and handled: the sweep regenerates the bodies (below) |
+| `ALTER TABLE ... ADD COLUMN` | **allowed**, and handled — the sweep notices via the catalog version and regenerates the bodies; done inside a transaction, that transaction's commit reconciles by scan and the regeneration happens after it ends (below) |
 | `INSERT ... ON CONFLICT DO NOTHING` | allowed |
 | `DROP TABLE` | allowed; takes the triggers with it, and a recreate + re-track reinstalls them |
 
@@ -173,25 +173,49 @@ tracked table's schema makes every installed body stale. Most such statements
 the engine refuses outright (above); `ADD COLUMN` does not, and `DROP TABLE`
 silently takes the triggers away.
 
-Neither moves the tracked-table **count**, which is what the cheap steady-state
-check compares — so the first version of this sweep missed both, and both
-produced wrong answers with no scan to catch them: a view read 5.0 where SQL
-read 12.0 after an `ADD COLUMN`, and a dropped-and-recreated table stayed
-tracked but permanently triggerless.
+Neither moves the tracked-table **count**, which is the cheapest steady-state
+check available — so a count-only sweep missed both, and both produced wrong
+answers with no scan to catch them: a view read 5.0 where SQL read 12.0 after an
+`ADD COLUMN`, and a dropped-and-recreated table stayed tracked but permanently
+triggerless.
 
-The sweep therefore keys its install record on a **column fingerprint** (name
-and type of every column, in order) taken from the LIVE catalog — not from the
-manager's cached schema, which is what the bodies were generated from and so
-could never disagree with itself — and additionally verifies against
-`duckdb_triggers()` that all three triggers are still there. A full reconcile
-runs when the tracked-table count changes, and whenever the previous statement
-began with `ALTER`, `DROP`, `CREATE`, `ATTACH` or `DETACH`. That keyword sniff
-is deliberately over-inclusive: a false positive costs one catalog query, a
-false negative costs silent wrong answers.
+**What tells the sweep to look.** `Catalog::GetCatalogVersion(context)` — the
+same signal prepared statements use to invalidate themselves. It moves on any
+committed catalog change, and while a transaction holds uncommitted catalog
+changes of its own it returns a value above `TRANSACTION_START`. That second
+property is the load-bearing one: it makes a transaction's own in-flight
+`ALTER` visible to the sweep. The version is cached per catalog holding tracked
+tables and compared at every `QueryBegin`, alongside the tracked-table count and
+an explicit `recheck` flag. An earlier version of this sweep sniffed the leading
+keyword of the statement text instead; that could not see DDL arriving any other
+way, and could not see an open transaction's own changes at all.
 
-Regeneration lands the same way a first install does — `CREATE OR REPLACE`,
-with the regenerating transaction marked so its commit reconciles by scan,
-which is also what re-reads the table at its new width.
+**What it compares.** A **column fingerprint** — name and type of every column,
+in order — taken from the LIVE catalog through `resolve_table_entry`, which is a
+plain catalog lookup on the caller's own context and runs no SQL. Comparing the
+manager's cached schema instead would be comparing the bodies' input with
+itself. When a fingerprint moves, or when `duckdb_triggers()` shows a table has
+lost its triggers, the bodies are regenerated with `CREATE OR REPLACE`.
+
+**Where the DDL runs, and where it must not.** Regeneration runs on an internal
+connection, which by construction cannot see another transaction's uncommitted
+catalog changes. Running it while the user holds a transaction open therefore
+fails by construction — measured, it threw
+`Binder Error: Referenced column "note" not found` **out of the user's own
+COMMIT**, and a `CREATE TABLE` + `dbsp_track` in one transaction wedged the
+connection so completely that its `ROLLBACK` and even `SELECT 1` threw
+`Catalog Error: Table with name u does not exist!` until it was closed.
+
+So the sweep **defers**: while a user transaction is open it does no DDL at all.
+It marks that transaction's delta untrusted — the commit discards whatever the
+stale bodies buffered and reconciles by scan instead — leaves `recheck` armed,
+and regenerates at the first statement after the transaction ends. The same
+applies to a `dbsp_track` issued inside a transaction: the triggers appear once
+it commits, and if it rolls back the table is simply recorded as absent.
+
+`recheck` is cleared **only** on a reconcile that succeeded. Clearing it up
+front, as the first version did, meant any throw disarmed the one thing that
+would have retried.
 
 ### Other standing costs
 

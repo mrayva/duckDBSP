@@ -117,6 +117,26 @@ below. Pinned by `test/python/test_ddl_syntax.py`.
   inherited a stale "already installed" list and ran with **no triggers at
   all**. A close-time prune did not fix it (the teardown hook returns early in
   tests). It now holds a weak reference and compares.
+- Keeping the generated bodies in step with their tables took two goes. A body
+  encodes its column list literally, and neither `ALTER TABLE ... ADD COLUMN`
+  nor `DROP TABLE` + recreate moves the tracked-table count, so a count-only
+  sweep left stale bodies producing wrong answers with no scan behind them.
+  Keying on a live column fingerprint fixed the autocommit case; DDL inside an
+  explicit transaction still failed, because the sweep read the caller's
+  catalog but ran its `CREATE OR REPLACE TRIGGER` on an internal connection
+  that cannot see uncommitted catalog changes — which threw out of the user's
+  own COMMIT, and wedged a connection that had created and tracked a table in
+  one transaction (every later statement, including `ROLLBACK` and `SELECT 1`,
+  raised until it was closed). The sweep is now gated on
+  `Catalog::GetCatalogVersion` (which also exposes a transaction's own
+  uncommitted changes), runs no DDL at all while a user transaction is open —
+  that transaction's commit reconciles by scan instead — and clears its
+  recheck flag only on a reconcile that succeeded.
+- The sink drain was gated on the MODE, while the sink is filled by persisted
+  trigger bodies that keep running in every mode: a database tracked once in
+  trigger mode grew its `dbsp_trigger_sink` without bound on a later
+  non-trigger build. The drain now discovers sinks from `duckdb_triggers()`
+  and runs regardless of mode; `DBSP_TRIGGER_SINK_DRAIN` sets the interval.
 - Design, coverage table, standing costs and the deletion plan for the capture
   stack + the engine patch: `docs/DESIGN_TRIGGER_SOURCE.md`.
 

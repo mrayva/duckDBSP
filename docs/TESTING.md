@@ -79,7 +79,7 @@ in it may be served by the engine callback.
 
 ```bash
 cd test/build_test
-./test_trigger_source                      # 11 cases
+./test_trigger_source                      # 20 cases
 DBSP_DELTA_SOURCE=trigger ./test_...       # redundant: the binary sets it
 ```
 
@@ -91,14 +91,19 @@ trigger coexisting on a tracked table, a double-count guard that asserts a
 **sum** rather than a row count, `ALTER TABLE ... ADD COLUMN` regenerating the
 bodies, `DROP TABLE` + recreate reinstalling them, and pins on every statement
 the engine refuses on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`,
-`INSERT OR REPLACE`, `ALTER TABLE ... RENAME COLUMN`). 18 cases. See
-`docs/DESIGN_TRIGGER_SOURCE.md`.
+`INSERT OR REPLACE`, `ALTER TABLE ... RENAME COLUMN`), and DDL inside an explicit transaction —
+`ADD COLUMN` with and without a write in the same transaction, an `ALTER` that
+rolls back, and `CREATE TABLE` + `dbsp_track` in one transaction committed and
+rolled back. 20 cases. See `docs/DESIGN_TRIGGER_SOURCE.md`.
 
-One thing it cannot cover: a database created in trigger mode and then reopened
-WITHOUT the variable, where the persisted trigger bodies must deliver nothing.
-The mode is process-wide, so that check lives in
+Two things it cannot cover, both needing a process where the mode is NOT
+trigger: a database created in trigger mode and then reopened without the
+variable must have its persisted bodies deliver nothing, and its
+`dbsp_trigger_sink` must still be drained (the bodies keep writing a row per
+statement whatever the mode). The mode is process-wide, so both checks live in
 `test/python/test_trigger_source.py`, which forks a child interpreter with the
-variable removed.
+variable removed and `DBSP_TRIGGER_SINK_DRAIN` lowered so the bound is
+observable.
 
 ### Python scripts (`test/python/`)
 
