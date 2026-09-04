@@ -130,6 +130,23 @@ public:
     tracked_in_txn_.push_back(key);
   }
 
+  // The CDC core could not establish this table's baseline right now, because
+  // reading committed state on an internal connection while this transaction
+  // is open would miss its uncommitted rows (CDCManager::seed_baseline). Fold
+  // the table into this transaction's sync scope so the commit reconciles it
+  // by scan; the resulting delta is (committed content − empty baseline),
+  // which propagates into any view built over it.
+  void note_needs_reconcile(const std::string &key) {
+    capture_.touched.insert(key);
+    capture_.saw_statements = true;
+  }
+
+  // Some baseline in this transaction is deliberately unseeded. A COMMIT
+  // reconciles it (note_needs_reconcile above); a ROLLBACK has no commit to do
+  // that, and the views built over it would stand on an empty baseline
+  // forever — so ask for a rebuild from committed storage instead.
+  void note_unseeded_baseline() { unseeded_baseline_ = true; }
+
   void QueryBegin(duckdb::ClientContext &context) override {
     if (internal_query_depth > 0) {
       return;
@@ -239,6 +256,7 @@ public:
     }
     capture_ = {};
     tracked_in_txn_.clear();
+    unseeded_baseline_ = false;
   }
 
   void QueryEnd(duckdb::ClientContext &context,
@@ -283,6 +301,7 @@ public:
     }
 
     tracked_in_txn_.clear(); // committed: the tracking intent stands
+    unseeded_baseline_ = false; // the sync below establishes it
 
     auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
@@ -412,6 +431,13 @@ public:
       return;
     }
     capture_ = {}; // rolled back: buffered rows never happened
+    // A baseline left unseeded for this transaction has no commit to
+    // reconcile it now. Rebuild every view from committed storage at the next
+    // statement rather than leave one standing on an empty baseline.
+    if (unseeded_baseline_) {
+      unseeded_baseline_ = false;
+      get_cdc_manager(context).request_rebuild();
+    }
     // The tracked-table set is process state, not transactional state — so a
     // dbsp_track inside this transaction has to be undone by hand. Without
     // this, a rolled-back CREATE TABLE u + dbsp_track('u') left u tracked
@@ -483,6 +509,8 @@ private:
   TxnCapture capture_;
   // Keys dbsp_track ADDED under the in-flight transaction (note_table_tracked)
   std::vector<std::string> tracked_in_txn_;
+  // See note_unseeded_baseline().
+  bool unseeded_baseline_ = false;
   // Trigger bodies run on execution threads, and an aggregate over a large
   // transition table may be parallel, so more than one thread can be inside
   // buffer_trigger_delta at once. Guards trigger_deltas only.

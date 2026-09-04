@@ -533,22 +533,6 @@ inline bool statement_detaches(const std::string &query) {
   return duckdb::StringUtil::Lower(query.substr(first, 6)) == "detach";
 }
 
-/// True while the USER holds an explicit transaction open. Autocommit
-/// statements also have an active transaction by the time QueryBegin runs
-/// (BeginQueryInternal starts it first), so the auto-commit flag is the half
-/// that actually distinguishes them.
-///
-/// It matters because the reconcile's DDL runs on a separate internal
-/// connection, which by construction CANNOT see the user's uncommitted
-/// catalog changes. Running it anyway is what produced
-/// `Binder Error: Referenced column "note" not found` out of the user's own
-/// COMMIT, and `Catalog Error: Table with name u does not exist!` out of every
-/// statement — including ROLLBACK — after a CREATE + track in one transaction.
-inline bool user_transaction_open(duckdb::ClientContext &context) {
-  return context.transaction.HasActiveTransaction() &&
-         !context.transaction.IsAutoCommit();
-}
-
 /// The catalog's current version, or false when the catalog does not support
 /// versioning (a non-DuckDB attached catalog). A catalog that answers false is
 /// never RECORDED (see the end of install_pending_triggers), so it is skipped

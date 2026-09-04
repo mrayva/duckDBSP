@@ -54,6 +54,29 @@
 
 namespace dbsp_native {
 
+// Callbacks the extension installs at load so the CDC core can talk to the
+// per-connection transaction state (DBSPContextState) without depending on its
+// header — that header includes THIS one, so the edge only goes one way.
+//
+// Empty when the core is used without the extension (the in-tree benchmarks
+// and unit tests), which is why every call site checks before invoking.
+struct TxnBookkeeping {
+  // "This transaction's picture of `key` is incomplete — reconcile it by
+  // scanning at commit." Used when a baseline could not be established now
+  // because reading committed state would be wrong (see seed_baseline).
+  std::function<void(duckdb::ClientContext &, const std::string &)>
+      needs_reconcile;
+  // "This transaction left a baseline unseeded." If it ROLLS BACK there is no
+  // commit to reconcile, so views built over that baseline must be rebuilt
+  // from committed storage instead.
+  std::function<void(duckdb::ClientContext &)> unseeded_on_rollback;
+};
+
+inline TxnBookkeeping &txn_bookkeeping() {
+  static TxnBookkeeping cb;
+  return cb;
+}
+
 // D-lazy: number of views realize_pending_view[_locked] has actually
 // decoded (a stash found and processed), across every CDCManager in the
 // process. Test-observable counter (g_* convention, see
@@ -2129,32 +2152,46 @@ public:
                   << "': a source table changed since save -- rebuilding "
                      "by replay\n";
       }
-      if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
-        if (cold && lazy) {
-          // D-lazy: stash the already-read blobs undecoded instead of
-          // calling restore_view_state eagerly -- realize_pending_view[_
-          // locked] decodes them on first need. stash_pending_view cannot
-          // itself fail the way the eager decode below can (it copies
-          // bytes, it doesn't parse them), so there is no per-view decline
-          // branch here: a corrupt stash surfaces later, at realize time.
-          stash_pending_view(name, ckpt);
-          ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
-          ckpt_restored++;
-          pending_now_count++;
-          loaded++;
-        } else if (cold && !restore_view_state(name, ckpt)) {
-          // Corrupt/mismatched blob: rebuild this view the normal way
-          drop_view(name);
-          if (create_view(context, name, view_sql)) {
-            loaded++;
-          }
-        } else {
-          if (cold) {
+      // Per-view try/catch: the loop's contract is "continue on individual
+      // failures (e.g. a source table was dropped)", and create_view can now
+      // THROW rather than return false — a source in a database too old to
+      // carry the change-capture triggers, or a seeding scan that failed.
+      // Without this, one such view aborted the whole restore mid-loop and
+      // took every later view with it.
+      try {
+        if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
+          if (cold && lazy) {
+            // D-lazy: stash the already-read blobs undecoded instead of
+            // calling restore_view_state eagerly -- realize_pending_view[_
+            // locked] decodes them on first need. stash_pending_view cannot
+            // itself fail the way the eager decode below can (it copies
+            // bytes, it doesn't parse them), so there is no per-view decline
+            // branch here: a corrupt stash surfaces later, at realize time.
+            stash_pending_view(name, ckpt);
             ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
             ckpt_restored++;
+            pending_now_count++;
+            loaded++;
+          } else if (cold && !restore_view_state(name, ckpt)) {
+            // Corrupt/mismatched blob: rebuild this view the normal way
+            drop_view(name);
+            if (create_view(context, name, view_sql)) {
+              loaded++;
+            }
+          } else {
+            if (cold) {
+              ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
+              ckpt_restored++;
+            }
+            loaded++;
           }
-          loaded++;
         }
+      } catch (const std::exception &e) {
+        record_error_best_effort("DBSP: view '" + name +
+                                 "' could not be restored: " + e.what());
+      } catch (...) {
+        record_error_best_effort("DBSP: view '" + name +
+                                 "' could not be restored (unknown error)");
       }
       // Continue on individual failures (e.g. a source table was dropped)
     }
@@ -2211,6 +2248,11 @@ public:
   // view state cannot be reconciled incrementally. QueryBegin calls
   // rebuild_all_views at the next statement boundary.
   bool rebuild_pending() const { return rebuild_pending_.load(); }
+
+  // Ask for every view to be rebuilt from committed storage at the next
+  // statement boundary. The escape hatch for "this cannot be reconciled
+  // incrementally" — see seed_baseline's rollback path.
+  void request_rebuild() { rebuild_pending_ = true; }
 
   // Materialize every deferred baseline NOW, from pre-write storage.
   // Called by QueryBegin before a write statement executes: once the
@@ -2712,9 +2754,14 @@ public:
           // track_table_internal does for auto-tracked sources: scan, then
           // discard the pending changes, because the replay below IS the
           // initialization and the delta must not be applied twice.
-          if (!tracked_tables_.at(source)->baseline_seeded()) {
-            sync_table_internal(context, source);
-            tracked_tables_.at(source)->consume_changes();
+          if (!tracked_tables_.at(source)->baseline_seeded() &&
+              !seed_baseline(context, source)) {
+            // A seeding scan that FAILED must not fall through to the replay:
+            // that would build the view over the empty baseline, which is the
+            // exact defect this branch exists to prevent.
+            throw std::runtime_error(
+                "Failed to establish the baseline of source '" + source +
+                "' for view '" + view_name + "': " + last_error_);
           }
           // Stream the baseline in bounded chunks: deltas are additive,
           // so N smaller applies equal one big one — and spill mode never
@@ -5542,6 +5589,54 @@ private:
     }
   }
 
+  // Establish `table_name`'s baseline so it equals the table content a view
+  // replayed over it would have to agree with.
+  //
+  // The scan runs on an INTERNAL connection (stream_table_rows opens its own),
+  // which by construction cannot see an open user transaction's uncommitted
+  // rows. Trusting it there produced a permanently wrong view: measured with
+  // `BEGIN; INSERT INTO t VALUES (2, 3.0); CREATE MATERIALIZED VIEW tv AS
+  // SELECT SUM(v) FROM t; COMMIT` the view read 3.0 where SQL read 13.0, and
+  // it never healed (7.0 against 17.0 after the next edit). It is the same law
+  // the trigger sweep already keeps: never read committed-only state on an
+  // internal connection while the user holds a transaction open.
+  //
+  // So inside a user transaction the baseline is deliberately left UNSEEDED
+  // and the transaction's commit reconciles the table by scan — at which
+  // point the scan-and-diff delta is (committed content − empty baseline),
+  // which propagates into the view and makes it exact from that commit on. A
+  // rollback has no commit to do that, so it asks for a view rebuild instead.
+  //
+  // Returns false only when a scan that SHOULD have run failed; the caller
+  // must not replay an unseeded baseline as though it were table content.
+  bool seed_baseline(duckdb::ClientContext &context,
+                     const std::string &table_name) {
+    if (std::getenv("DBSP_DEBUG_SEED")) {
+      std::cerr << "[dbsp] seed_baseline " << table_name
+                << " user_txn_open=" << user_transaction_open(context) << "\n";
+    }
+    if (user_transaction_open(context)) {
+      if (txn_bookkeeping().needs_reconcile) {
+        txn_bookkeeping().needs_reconcile(context, table_name);
+      }
+      if (txn_bookkeeping().unseeded_on_rollback) {
+        txn_bookkeeping().unseeded_on_rollback(context);
+      }
+      return true;
+    }
+    if (!sync_table_internal(context, table_name)) {
+      return false;
+    }
+    // CRITICAL: clear the pending changes the initial sync produced. The
+    // caller either initialized a view from this state already, or is about to
+    // replay it — applying them again would double-count.
+    auto it = tracked_tables_.find(table_name);
+    if (it != tracked_tables_.end()) {
+      it->second->consume_changes();
+    }
+    return true;
+  }
+
   bool track_table_internal(duckdb::ClientContext &context,
                             const std::string &table_ref) {
     // Called with struct_mutex_ exclusively held.
@@ -5602,11 +5697,13 @@ private:
       }
     }
 
-    sync_table_internal(context, table_name);
-    // CRITICAL: Clear pending changes from initial sync so they don't get
-    // propagated as deltas to views that were already initialized with this
-    // state in CDCManager::create_view
-    tracked_tables_[table_name]->consume_changes();
+    if (!seed_baseline(context, table_name)) {
+      last_error_ = "Failed to seed the baseline of '" + table_name + "'";
+      tracked_tables_.erase(table_name);
+      table_schemas_.erase(table_name);
+      table_locks_.erase(table_name);
+      return false;
+    }
     return true;
   }
 

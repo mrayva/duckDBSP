@@ -2479,6 +2479,25 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
 
+  // Let the CDC core reach the per-connection transaction state. It cannot
+  // include dbsp_context_state.hpp (that header includes dbsp_cdc.hpp), so the
+  // two callbacks are installed here, where both types are visible.
+  dbsp_native::txn_bookkeeping().needs_reconcile = [](ClientContext &ctx,
+                                                      const string &key) {
+    auto st = ctx.registered_state->Get<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+    if (st) {
+      st->note_needs_reconcile(key);
+    }
+  };
+  dbsp_native::txn_bookkeeping().unseeded_on_rollback = [](ClientContext &ctx) {
+    auto st = ctx.registered_state->Get<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+    if (st) {
+      st->note_unseeded_baseline();
+    }
+  };
+
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
                            TrackBind);

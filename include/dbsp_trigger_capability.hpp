@@ -13,6 +13,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
 
 #include <string>
 
@@ -100,6 +101,23 @@ inline void require_trigger_capable_catalog(duckdb::ClientContext &context,
       "then move the '<old>.duckdb.dbsp_spill' directory alongside the new "
       "file. The table has NOT been tracked.",
       key, version);
+}
+
+/// True while the USER holds an explicit transaction open. Autocommit
+/// statements also have an active transaction by the time QueryBegin runs
+/// (BeginQueryInternal starts it first), so the auto-commit flag is the half
+/// that actually distinguishes them.
+///
+/// It matters because the reconcile's DDL runs on a separate internal
+/// connection, which by construction CANNOT see the user's uncommitted
+/// catalog changes. Running it anyway is what produced
+/// `Binder Error: Referenced column "note" not found` out of the user's own
+/// COMMIT, and `Catalog Error: Table with name u does not exist!` out of every
+/// statement — including ROLLBACK — after a CREATE + track in one
+/// transaction.
+inline bool user_transaction_open(duckdb::ClientContext &context) {
+  return context.transaction.HasActiveTransaction() &&
+         !context.transaction.IsAutoCommit();
 }
 
 } // namespace dbsp_native

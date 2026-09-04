@@ -670,9 +670,6 @@ public:
   int64_t deferred_weight() const { return deferred_weight_; }
   const std::string &deferred_hash() const { return deferred_hash_; }
 
-  // Install the rows fed through begin_rebuild()/add_scanned_row() as the
-  // baseline WITHOUT diffing against the previous one (there is none: the
-  // table was deferred). Clears the deferred flag.
   // Has this baseline ever been established from committed storage?
   //
   // FALSE means "empty because nothing has scanned it yet", which is NOT the
@@ -684,6 +681,9 @@ public:
   // a view over nothing and returns a permanently wrong answer with no error.
   bool baseline_seeded() const { return baseline_seeded_; }
 
+  // Install the rows fed through begin_rebuild()/add_scanned_row() as the
+  // baseline WITHOUT diffing against the previous one (there is none: the
+  // table was deferred). Clears the deferred flag.
   void install_rebuild() {
     baseline_seeded_ = true;
     if (spill_) {
