@@ -312,9 +312,9 @@ Correctness, on this tree (`ninja` build, `-j8`, stock engine
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 57.4 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.5 s |
-| `test_trigger_source` alone | **29 cases, 642 assertions** |
+| `ctest -j4` | **45/45 passed**, 81.5 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.4 s |
+| `test_trigger_source` alone | **31 cases, 783 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
@@ -354,8 +354,8 @@ one, and the other two were deleted:
 | capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
 | capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-Net over the whole transition: **−3,702 lines** across 44 files
-(`git diff --shortstat 7549a02..HEAD`: +2,495 / −6,197, taken with this
+Net over the whole transition: **−3,252 lines** across 45 files
+(`git diff --shortstat 7549a02..HEAD`: +2,951 / −6,203, taken with this
 commit itself in the range — a SHA cannot be quoted here without going stale
 the moment it is written), and the fork stopped being a fork of DuckDB — stock engine, stock
 PyPI wheel, a CI that can build against a public one.
@@ -397,11 +397,28 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 - **Never seed a baseline from a read the user's transaction cannot see.** The
   seeding scan opens its own connection, so inside an open user transaction it
   misses their uncommitted rows. `CDCManager::seed_baseline` leaves the
-  baseline unseeded there and lets the commit reconcile it by scan (a rollback
-  asks for a view rebuild instead). This is the third defect of the same
-  family in this work — the sweep's DDL, the sweep's catalog-version read, and
-  now the seeding scan. Anything the extension does on an internal connection
-  has to answer the same question first.
+  baseline unseeded there and records the debt on the connection
+  (`note_unseeded_baseline`); the next commit under auto-sync widens itself to
+  a full scan-and-diff to pay it, an explicit `dbsp_sync()` pays it too, and a
+  rollback asks for a view rebuild from committed storage instead. The
+  widening — rather than a note in the transaction's sync SCOPE — is
+  load-bearing: `TransactionCommit` has two branches, and the trigger-fed one
+  applies its buffered deltas and returns without reading that scope, so a
+  scope note was silently discarded on exactly the commits the triggers fed.
+  The flag is sticky for the same reason: a commit with auto-sync OFF
+  reconciles nothing, so it has to leave the debt standing.
+
+  This is the third defect of the same family in this work — the sweep's DDL,
+  the sweep's catalog-version read, and the seeding scan. **The law is a rule,
+  not an enforced invariant, and it is honoured for SEEDING only.** Two
+  internal-connection scans still run from `QueryBegin`, which fires inside
+  open user transactions: `rebuild_all_views` (`dbsp_cdc.hpp`) and
+  `materialize_all_deferred` → `materialize_deferred_locked`. Both REFRESH a
+  baseline that already exists rather than establishing one, and the commit
+  reconcile appears to cover the window they open — appears, because nothing
+  proves it and no test pins it. Anything new that opens an internal connection
+  for a data read has to answer the same question, and nothing will ask on its
+  behalf (see Follow-ups).
 - **A baseline is only "seeded" once something has scanned it.** The public
   `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
   `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
@@ -411,3 +428,31 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 - **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.
+- **A table tracked while ANOTHER connection holds a write open is missed —
+  permanently.** Not fixed; it needs its own unit. The shape, measured:
+  connection 1 runs `BEGIN; INSERT` on an UNTRACKED table and leaves the
+  transaction open; connection 2 tracks the table (or creates a view over it)
+  and seeds the baseline from committed state — correctly, since connection 2
+  has no transaction of its own and cannot see connection 1's rows; connection
+  1 then commits. No trigger fired for that INSERT (there were no triggers when
+  it ran) and connection 1's own `touched` never named the table, so the delta
+  never happens: the view reads `10.0` against SQL `13.0`, then `14.0` against
+  `17.0`, and never heals. It is pre-existing and it is invisible to
+  `DBSP_DEBUG_SEED`, which is per-context and reports `user_txn_open=0` for
+  connection 2 — the honest answer to the wrong question. This matters to any
+  host that keeps concurrent connections against one database while an
+  authority connection holds explicit `BEGIN`s, which is how NumPad runs.
+  Candidate fixes, neither costed: a newly seeded table forces one
+  scan-reconcile at the next commit on EVERY connection of the instance; or
+  seeding waits until the instance has no open write transactions.
+- **Nothing enforces the internal-connection law.** The concrete proposal is
+  NOT an assertion inside `InternalQueryGuard` — it has 39 call sites, no
+  `ClientContext` to ask, and three legitimate exceptions that would
+  false-positive. It is a `DBSP_STRICT_INTERNAL_QUERY=1` runtime check at the
+  three helpers that open an internal `duckdb::Connection` for a DATA read —
+  `stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and the
+  sweep's DDL (`dbsp_trigger_source.hpp`) — each taking an explicit
+  `InternalReadPolicy{Forbidden, AllowedInTxn}` argument, so every exception is
+  whitelisted in code with its reason at the call site rather than in a
+  comment. Run `ctest` a third time with it set, the way
+  `DBSP_TEST_VERIFY_VECTORS` is run today.

@@ -1,5 +1,64 @@
 # Changelog
 
+## A deferred baseline is reconciled on every commit path — 2026-09-04
+
+**Completes the entry below, which fixed the wrong answer on one commit path
+and left it on the others.** Deferred seeding recorded the table in the
+transaction's sync SCOPE. `TransactionCommit` has two branches, and the
+trigger-fed one — the one taken whenever the transaction also WROTE a tracked
+table — applies its buffered deltas and returns without ever reading that
+scope. So on those commits the reconcile was discarded in silence:
+
+```sql
+-- t tracked with an unseeded baseline, its triggers installed
+BEGIN; INSERT INTO t VALUES (2, 3.0);
+CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t; COMMIT;
+-- view 3.0, plain SQL 13.0; after the next edit 7.0 against 17.0
+```
+
+The repair is now a WIDENING (`unknown_writes`), which is the one flag both
+commit branches honour, and it is carried on connection state rather than on
+the transaction. That second half fixes the other hole: a commit with
+**auto-sync off** reconciles nothing, and it used to clear the deferred-seeding
+state anyway — so `dbsp_auto_sync(false); BEGIN; INSERT; dbsp_create_view;
+COMMIT` left the view on its empty baseline for the life of the connection
+(`4.0` against `17.0` once auto-sync came back on). The debt now survives every
+commit that does not pay it, and is settled by the first commit under auto-sync
+or by an explicit `dbsp_sync()`. `TxnBookkeeping` is down to the one callback
+this needs.
+
+Cost: a transaction that defers a seeding pays one full scan-and-diff at its
+commit instead of a scoped one. It is paid once per deferral, and a workload
+that never creates a view inside an open transaction never pays it.
+
+Also in this round:
+
+- **Better error for `CREATE TABLE` + `CREATE MATERIALIZED VIEW` in one
+  transaction.** It cannot work — the plan is extracted on an internal
+  connection that cannot see the uncommitted catalog — and failing is correct,
+  but the engine's `Table with name t does not exist! Did you mean "g1.t"?`
+  reads like a typo. When the name resolves on the CALLER's context, the error
+  now says the source table is not yet committed and to commit the
+  `CREATE TABLE` first. A genuinely missing table keeps the engine's message.
+- Two stale comments on `commit_seq_` corrected: it is the delta generation
+  stamped on each view's delta buffer (`view_delta_generation_`), not a guard
+  for the deleted write-capture stack, and one of them still pointed at
+  `docs/DESIGN_WRITE_CAPTURE.md`, which no longer exists.
+- `docs/DESIGN_TRIGGER_SOURCE.md` now says plainly that the
+  internal-connection law is enforced for SEEDING only — `rebuild_all_views`
+  and `materialize_all_deferred` still scan on internal connections from
+  `QueryBegin` — and records two follow-ups: a cross-connection hole where a
+  table tracked while another connection holds a write open is missed
+  permanently, and a concrete `DBSP_STRICT_INTERNAL_QUERY=1` proposal for
+  enforcing the law.
+
+Net over the whole transition after this round: **−3,252 lines** across
+45 files (`git diff --shortstat 7549a02..HEAD`: +2,951 / −6,203, taken
+with this commit itself in the range).
+
+Suite: `ctest` 45/45, `test_trigger_source` 31 cases / 783 assertions,
+`test_dml_shapes` 10 cases / 352 assertions.
+
 ## Baselines are never seeded from a stale read — 2026-09-04
 
 **Fixes a second silent wrong answer, on an idiom NumPad's own code shape uses**
@@ -126,7 +185,7 @@ wheel, and a CI that can build against a public one.
   so a zero-row write evaluates it zero times and "fired, nothing changed" is
   indistinguishable from "did not fire".
 
-**Deleted** (`git diff --shortstat 7549a02..HEAD`, this commit included: 44 files, +2,495 / −6,197, net −3,702)
+**Deleted** (line counts as removed; the transition-wide `git diff --shortstat 7549a02..HEAD` is quoted in the newest entry at the top of this file)
 
 | File | Lines |
 |---|---:|
