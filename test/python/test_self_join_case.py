@@ -181,6 +181,11 @@ if actual != expected:
 else:
     print("ok: staged distinct-tables CASE matches", flush=True)
 circ3.close()
+# `circ2`/`circ3` were already closed above; `stock` and `circ` were not, and an
+# open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha (exit 139
+# AFTER the PASS line — CHANGELOG, "DuckDB 2.0 alpha issues").
+circ.close()
+stock.close()
 
 if failed:
     print("FAIL", flush=True)

@@ -81,4 +81,10 @@ for name, expr in CASES.items():
     got, want = view(name), truth(expr)
     assert got == want, f"{name} after delete: {got} != {want}"
 
+# Close before the interpreter exits: the 2.0 alpha SIGSEGVs (exit 139) when an
+# instance holding DBSP views is destroyed during static destruction, and this
+# script printed PASS and then died for exactly that reason (CHANGELOG, "DuckDB
+# 2.0 alpha issues").
+conn.close()
+
 print("PASS", flush=True)

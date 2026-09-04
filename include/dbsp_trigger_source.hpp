@@ -36,7 +36,10 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <algorithm>
@@ -524,6 +527,72 @@ inline bool triggers_present(
   return true;
 }
 
+/// Can this catalog hold the change-capture triggers at all?
+///
+/// `CREATE TRIGGER` needs storage version v2.0.0 or higher — the engine's own
+/// test is duckdb/src/planner/binder/statement/bind_create.cpp:680-692, and
+/// this mirrors it exactly (in-memory and temporary databases are exempt
+/// there, so they are exempt here). On false, `version_out` carries the
+/// version the file actually has, for the error message.
+///
+/// It is mirrored rather than left to the engine because of WHERE the engine's
+/// error lands: the install runs from the sweep, i.e. from the QueryBegin of
+/// some LATER statement, so `dbsp_track` on a v1.0.0 file used to SUCCEED and
+/// every statement afterwards — reads included — threw
+/// `Binder Error: CREATE TRIGGER is only supported for storage versions
+/// v2.0.0 and higher` with the table left tracked and the connection wedged.
+inline bool catalog_supports_triggers(duckdb::ClientContext &context,
+                                      const std::string &catalog_name,
+                                      std::string &version_out) {
+  try {
+    auto &catalog =
+        duckdb::Catalog::GetCatalog(context, duckdb::Identifier(catalog_name));
+    auto &attached = catalog.GetAttached();
+    if (attached.IsTemporary() || !attached.HasStorageManager()) {
+      return true;
+    }
+    auto &storage = attached.GetStorageManager();
+    if (storage.InMemory() || !storage.HasStorageVersion()) {
+      return true;
+    }
+    if (storage.GetStorageVersion() >= duckdb::StorageVersion::V2_0_0) {
+      return true;
+    }
+    version_out =
+        duckdb::GetStorageVersionName(storage.GetStorageVersion(), true);
+    return false;
+  } catch (...) {
+    // Not a DuckDB catalog, detached mid-flight, or an API that moved: say
+    // nothing and let the engine's own refusal speak.
+    return true;
+  }
+}
+
+/// Throw ONE readable error, naming the migration, if `key` lives in a
+/// database too old to carry the triggers. Callers use this BEFORE tracking or
+/// installing, so the refusal arrives at the statement that asked for it.
+inline void require_trigger_capable_catalog(duckdb::ClientContext &context,
+                                            const std::string &key) {
+  std::string catalog, schema_name, table;
+  if (!split_table_key(key, catalog, schema_name, table)) {
+    return;
+  }
+  std::string version;
+  if (catalog_supports_triggers(context, catalog, version)) {
+    return;
+  }
+  throw duckdb::InvalidInputException(
+      "DBSP cannot track '%s': its database is at storage version %s, and the "
+      "change-capture triggers require v2.0.0 or higher. Rewrite the file "
+      "first:\n"
+      "  ATTACH '<old>.duckdb' AS src (READ_ONLY);\n"
+      "  ATTACH '<new>.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');\n"
+      "  COPY FROM DATABASE src TO dst;\n"
+      "then move the '<old>.duckdb.dbsp_spill' directory alongside the new "
+      "file. The table has NOT been tracked.",
+      key, version);
+}
+
 /// True for a statement the sweep must keep its hands off entirely.
 ///
 /// Reading a catalog's version (catalog_version_of, below) calls
@@ -691,6 +760,11 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
           key);
     }
     catalogs.insert(catalog);
+    // A table can reach the tracked set by routes other than dbsp_track
+    // (view-source auto-tracking, a checkpoint restore). Refuse here too, with
+    // the same readable error, rather than letting the DDL below fail with the
+    // engine's message on every statement.
+    require_trigger_capable_catalog(context, key);
     TableSchema live;
     if (!live_table_columns(context, key, live)) {
       // Tracked but not in the catalog from here: dropped, or created inside a
@@ -706,11 +780,23 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       if (st.missing.count(key)) {
         back_from_missing.push_back(key);
       }
-      auto it = st.installed.find(key);
-      if (it != st.installed.end() && it->second == fp) {
-        continue; // this process installed exactly these bodies
-      }
     }
+    // EVERY tracked table goes to the catalog check, including one this
+    // process believes it already installed at this exact fingerprint.
+    //
+    // Trusting `st.installed` here was a hole with no floor: a table can LOSE
+    // its triggers without its fingerprint or the tracked-table count moving
+    // at all. `DROP TABLE t; CREATE TABLE t (same columns)` inside one
+    // transaction takes the bodies with the old table and puts back a
+    // same-shaped one; a user can `DROP TRIGGER` a single body by hand. Both
+    // left the table permanently triggerless in that process — every later
+    // write to it paid a scoped scan forever, and nothing ever looked again.
+    // Measured: `scan_syncs +1, captured_delta_syncs +0` on every write, view
+    // still exact, no error anywhere.
+    //
+    // The check is not free but it is not on the hot path either: it only runs
+    // once the gate above has already said something moved, and it is ONE
+    // `duckdb_triggers()` read for all keys at once.
     unproven.push_back({key, table, std::move(live), fp});
   }
 
@@ -723,10 +809,15 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   // transaction untrusted, making the FIRST WRITE AFTER EVERY REOPEN a full
   // scan-and-diff of every tracked table.
   //
-  // The read is safe where the DDL is not: it takes its own snapshot instead
-  // of trying to see the user's uncommitted catalog changes. It is paid only
-  // when this process's install record disagrees with the tracked set — once
-  // per database in the steady state.
+  // The read is safe where the DDL is not, which is why it sits ABOVE the
+  // "defer while the user's transaction is open" check rather than below it:
+  // this is a plain SELECT on an internal connection, so it takes its OWN
+  // snapshot instead of trying to see (or fight with) the user's uncommitted
+  // catalog changes. That is deliberate. Only the DDL further down has to wait
+  // for the user's transaction to end.
+  //
+  // Cost: one internal connection and one query per sweep that gets past the
+  // gate. In the steady state the gate is shut and this never runs.
   if (!unproven.empty()) {
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
@@ -788,6 +879,19 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   // and the caller is told DEFERRED, so this transaction's commit reconciles
   // by scan and the next statement installs. Correct answer, no user-visible
   // failure, and still no silence. Every other DDL error still throws.
+  //
+  // HOW the conflict is recognised: a substring match on "write-write
+  // conflict" in the exception text. That is a dependency on an engine
+  // MESSAGE, and it is deliberate — DuckDB raises this as a plain
+  // TransactionException with no distinguishing type or error code, so there
+  // is nothing else to match on. If the wording ever changes, the failure is
+  // LOUD rather than silent: the match stops working, the `throw` below
+  // re-raises, and it surfaces on the user's statement exactly as it did
+  // before this guard existed. Re-check on an engine bump.
+  //
+  // The guard spans EVERY statement this block runs — the duckdb_triggers()
+  // read, the installs and the drops — because they share one internal
+  // transaction and any of them can lose the same race.
   bool changed = false;
   if (!to_install.empty() || !to_drop.empty()) {
     InternalQueryGuard guard;
@@ -798,23 +902,6 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     // name: CREATE OR REPLACE would leave it in place, and it would go on
     // delivering rows of the wrong width alongside the new one.
     std::unordered_map<std::string, std::vector<std::string>> existing;
-    {
-      auto r = con.Query(
-          "SELECT database_name, schema_name, table_name, trigger_name "
-          "FROM duckdb_triggers() "
-          "WHERE trigger_name LIKE 'dbsp\\_trg\\_%' ESCAPE '\\'");
-      if (r->HasError()) {
-        throw duckdb::InvalidInputException(
-            "DBSP trigger source: could not read duckdb_triggers(): %s",
-            r->GetError());
-      }
-      for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
-        existing[r->GetValue(0, i).ToString() + "." +
-                 r->GetValue(1, i).ToString() + "." +
-                 r->GetValue(2, i).ToString()]
-            .push_back(r->GetValue(3, i).ToString());
-      }
-    }
 
     std::unordered_set<std::string> made_sinks;
     auto install_one = [&](const Pending &p) {
@@ -866,8 +953,21 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     };
 
     try {
+      existing = read_dbsp_triggers(con);
       for (const auto &p : to_install) {
         install_one(p);
+        changed = true;
+      }
+      for (const auto &key : to_drop) {
+        auto it = existing.find(key);
+        if (it != existing.end()) {
+          for (const auto &sql : trigger_drop_ddl_for(key, it->second)) {
+            con.Query(sql); // best effort: the table may already be gone
+          }
+        }
+        std::lock_guard<std::mutex> g(st.mutex);
+        st.installed.erase(key);
+        st.missing.erase(key);
         changed = true;
       }
     } catch (const std::exception &e) {
@@ -877,18 +977,6 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       }
       st.recheck.store(true, std::memory_order_relaxed);
       return ReconcileResult::DEFERRED;
-    }
-    for (const auto &key : to_drop) {
-      auto it = existing.find(key);
-      if (it != existing.end()) {
-        for (const auto &sql : trigger_drop_ddl_for(key, it->second)) {
-          con.Query(sql); // best effort: the table itself may already be gone
-        }
-      }
-      std::lock_guard<std::mutex> g(st.mutex);
-      st.installed.erase(key);
-      st.missing.erase(key);
-      changed = true;
     }
   }
 

@@ -725,3 +725,157 @@ TEST_CASE("trigger source: an empty install record re-uses the catalog's bodies"
   db.exec("INSERT INTO t VALUES (2, 7.0)");
   REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
 }
+
+TEST_CASE("trigger source: bodies lost without a fingerprint change come back",
+          "[trigger_source]") {
+  // A table can LOSE its triggers while its column fingerprint and the
+  // tracked-table count both stand still. The sweep used to short-circuit on
+  // its own install record in exactly that case and never look at the catalog
+  // again, so the table stayed triggerless for the life of the process: every
+  // later write to it paid a scoped scan, forever, with the view still exact
+  // and no error anywhere — the silent-staleness outcome this source is not
+  // allowed to have.
+
+  SECTION("DROP + CREATE of the same shape inside one transaction") {
+    // DROP TABLE takes the bodies with it. Re-creating the SAME columns in the
+    // same transaction leaves the fingerprint identical and the tracked count
+    // unmoved, so nothing but the catalog itself can tell.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 5.0)"});
+    db.exec("SELECT * FROM dbsp_track('t')");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("INSERT INTO t VALUES (2, 7.0)"); // arms the triggers
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec("DROP TABLE t");
+    db.exec("CREATE TABLE t (id INTEGER, v DOUBLE)");
+    db.exec("COMMIT");
+    db.exec("SELECT 1"); // the sweep's first look after the transaction ended
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+    // and the next write is served by an exact delta, not a scan
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    const auto scans = db.manager().scan_syncs();
+    const auto caps = db.manager().captured_delta_syncs();
+    db.exec("INSERT INTO t VALUES (3, 11.0)");
+    REQUIRE(db.manager().scan_syncs() == scans);
+    REQUIRE(db.manager().captured_delta_syncs() == caps + 1);
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("a single body dropped by hand is restored") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {});
+    db.exec("SELECT * FROM dbsp_track('t')");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("INSERT INTO t VALUES (1, 5.0)");
+    auto names = db.query("SELECT trigger_name FROM duckdb_triggers() "
+                          "WHERE trigger_name LIKE '%\\_del' ESCAPE '\\'");
+    REQUIRE(names->RowCount() == 1);
+    db.exec("DROP TRIGGER " + names->GetValue(0, 0).ToString() + " ON t");
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 2);
+
+    db.exec("SELECT 1"); // the sweep sees the catalog version moved
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+    const auto scans = db.manager().scan_syncs();
+    db.exec("DELETE FROM t WHERE id = 1");
+    REQUIRE(db.manager().scan_syncs() == scans);
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+}
+
+TEST_CASE("trigger source: tracking refuses a pre-v2.0.0 database, loudly",
+          "[trigger_source]") {
+  // CREATE TRIGGER needs storage version v2.0.0 or higher. Without a precheck
+  // the refusal arrived from the SWEEP, i.e. at the QueryBegin of some later
+  // statement — so dbsp_track SUCCEEDED, the table stayed in the tracked set,
+  // and every statement on the connection afterwards (reads included) threw
+  // the engine's message until the connection was closed.
+  DuckDBTestHarness db;
+  const std::string path =
+      std::string(std::tmpnam(nullptr)) + "_dbsp_v1.duckdb";
+  db.exec("ATTACH '" + path + "' AS old (STORAGE_VERSION 'v1.0.0')");
+  db.exec("CREATE TABLE old.t (id INTEGER, v DOUBLE)");
+  db.exec("INSERT INTO old.t VALUES (1, 5.0)");
+
+  auto res = db.query("SELECT * FROM dbsp_track('old.t')");
+  REQUIRE(res->HasError());
+  const std::string err = res->GetError();
+  INFO(err);
+  // ONE readable error that names the version it found and the way out.
+  REQUIRE(err.find("storage version") != std::string::npos);
+  REQUIRE(err.find("v1.0.0") != std::string::npos);
+  REQUIRE(err.find("STORAGE_VERSION 'v2.0.0'") != std::string::npos);
+  REQUIRE(err.find("COPY FROM DATABASE") != std::string::npos);
+  REQUIRE(err.find("dbsp_spill") != std::string::npos);
+
+  // The table must NOT be tracked, and the connection must still be usable —
+  // that pair is the whole point of prechecking instead of letting the sweep
+  // throw later.
+  REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_tables() "
+                        "WHERE table_name LIKE '%.t'") == 0);
+  REQUIRE(sql_count(db, "SELECT 1") == 1);
+  REQUIRE(sql_count(db, "SELECT count(*) FROM old.t") == 1);
+
+  // A v2.0.0 catalog on the same connection still tracks normally.
+  db.createTable("fresh", "id INTEGER, v DOUBLE", {"(1, 3.0)"});
+  db.exec("SELECT * FROM dbsp_track('fresh')");
+  db.exec("SELECT * FROM dbsp_sync('fresh')");
+  db.exec(
+      "SELECT * FROM dbsp_create_view('tf', 'SELECT SUM(v) AS s FROM fresh')");
+  db.exec("INSERT INTO fresh VALUES (2, 4.0)");
+  REQUIRE(view_sum(db, "tf") == sql_sum(db, "SELECT SUM(v) FROM fresh"));
+  // The explicit dbsp_sync above is not decoration. On a connection that has
+  // had ANY dbsp_track fail, a later dbsp_create_view does not seed its
+  // baseline from the table — measured with `dbsp_track('no_such_table')`,
+  // the oldest failure path there is, so this is not the precheck's doing.
+  // Recorded rather than worked around silently.
+
+  db.exec("DETACH old");
+  std::remove(path.c_str());
+}
+
+TEST_CASE("trigger source: a racing sink CREATE does not fail the statement",
+          "[trigger_source]") {
+  // The sweep's DDL runs on an INTERNAL connection, in its own transaction,
+  // concurrently with whatever the user's connections are doing — and
+  // `CREATE TABLE IF NOT EXISTS` is not atomic against a concurrent creator of
+  // the same entry. Measured in NumPad: building several materialized views in
+  // a row on a worker thread, the sweep's sink CREATE lost that race and
+  // DuckDB's `Catalog write-write conflict on create with "Schema main Table
+  // dbsp_trigger_sink"` came out of the USER's statement.
+  //
+  // The race is made deterministic here by holding an uncommitted creator of
+  // that exact entry open on a second connection while the sweep runs.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 5.0)"});
+
+  duckdb::Connection blocker(db.instance());
+  REQUIRE_FALSE(blocker.Query("BEGIN TRANSACTION")->HasError());
+  REQUIRE_FALSE(
+      blocker.Query("CREATE TABLE dbsp_trigger_sink (v BIGINT)")->HasError());
+
+  db.exec("SELECT * FROM dbsp_track('t')");
+  // This statement's QueryBegin is where the sweep tries to create the sink.
+  // It must survive: a conflict is a DEFERRAL (recheck stays armed, the commit
+  // reconciles by scan), never an error on the user's statement.
+  auto res = db.query("SELECT 42");
+  INFO("sweep under a racing creator: "
+       << (res->HasError() ? res->GetError() : std::string("ok")));
+  REQUIRE_FALSE(res->HasError());
+  REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == 42);
+
+  // Deferred, not abandoned: once the blocker lets go, the next statement
+  // installs and the source works.
+  REQUIRE_FALSE(blocker.Query("ROLLBACK")->HasError());
+  db.exec("SELECT 1");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+  db.exec("SELECT * FROM dbsp_sync('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (2, 7.0)");
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+}

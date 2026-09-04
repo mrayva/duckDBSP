@@ -153,9 +153,24 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
   // Which key this call would ADD, read before the call because track_table is
   // idempotent. A rollback must only drop tracking intent that this
   // transaction actually created (see DBSPContextState::TransactionRollback).
-  string newly_tracked = CanonicalTableRef(context, data.table_name);
-  if (newly_tracked.empty() || manager.is_table_tracked(newly_tracked)) {
-    newly_tracked.clear();
+  //
+  // Resolved explicitly rather than through CanonicalTableRef: that helper
+  // passes an UNRESOLVABLE reference through unchanged, and a raw parse-time
+  // string is never a tracked key — the rollback's untrack_table would then be
+  // a silent no-op against a name nothing holds. No resolution, no
+  // bookkeeping; track_table below reports the "not found" error itself.
+  string newly_tracked;
+  if (auto entry = dbsp_native::resolve_table_entry(context, data.table_name)) {
+    const string key = dbsp_native::canonical_table_key(*entry);
+    // Storage-version precheck, BEFORE the table joins the tracked set. The
+    // triggers are installed by a LATER statement's sweep, so without this a
+    // dbsp_track on a pre-v2.0.0 database SUCCEEDED and every statement after
+    // it — reads included — threw the engine's CREATE TRIGGER refusal, with
+    // the table left tracked and the connection effectively wedged.
+    dbsp_native::require_trigger_capable_catalog(context, key);
+    if (!manager.is_table_tracked(key)) {
+      newly_tracked = key;
+    }
   }
   bool ok = manager.track_table(context, data.table_name);
 
@@ -1179,9 +1194,10 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
     return;
   }
   // DBSP's own helper connections: never self-ingest. Thread-local, so it
-  // only covers work executed on the issuing thread — and trigger bodies run on WORKER threads, so a multi-chunk body
-  // can have some chunks see depth 0. Dropping those silently would leave a
-  // PARTIAL delta; poisoning makes the commit reconcile by scan instead.
+  // only covers work executed on the issuing thread — and trigger bodies run
+  // on WORKER threads, so a multi-chunk body can have some chunks see depth 0.
+  // Dropping those silently would leave a PARTIAL delta; poisoning makes the
+  // commit reconcile by scan instead.
   //
   // Every early exit below poisons for the same reason: this function is the
   // only thing that knows the rows existed, so "return without buffering" is

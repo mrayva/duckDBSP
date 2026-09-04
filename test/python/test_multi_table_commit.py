@@ -93,4 +93,13 @@ assert got_vj == [(3, 30.0, 1)], f"both-sides insert delta wrong: {got_vj}"
 res = dict(conn.execute("SELECT k, p FROM dbsp_query('vj') ORDER BY k").fetchall())
 assert res == {1: 300.0, 2: 140.0, 3: 30.0}, f"vj result wrong: {res}"
 
+# Close, then drain the detached teardown thread: an interpreter that exits
+# with a DBSP connection open — or under a teardown still running — segfaults
+# intermittently on this alpha (CHANGELOG, "DuckDB 2.0 alpha issues").
+conn.close()
+drain = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+drain.execute(f"LOAD '{EXT}'")
+drain.execute("SELECT * FROM dbsp_wait_teardown()")
+drain.close()
+
 print("PASS", flush=True)

@@ -72,4 +72,17 @@ after = {
 }["mv_join"]
 assert after > before, f"state bytes must grow with data: {before} -> {after}"
 
+# Close before the interpreter exits: the 2.0 alpha SIGSEGVs (exit 139) when an
+# instance holding DBSP views is destroyed during static destruction, and this
+# script printed PASS and then died for exactly that reason (CHANGELOG, "DuckDB
+# 2.0 alpha issues").
+conn.close()
+# close() returns while a DETACHED teardown thread may still be running, and an
+# interpreter that exits under it segfaults intermittently on this alpha (1 run
+# in 5 with only the close). dbsp_wait_teardown drains those threads.
+drain = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+drain.execute(f"LOAD '{EXT}'")
+drain.execute("SELECT * FROM dbsp_wait_teardown()")
+drain.close()
+
 print("PASS")

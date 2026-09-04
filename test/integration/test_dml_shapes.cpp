@@ -234,7 +234,7 @@ TEST_CASE("dml shapes: non-repeatable INSERT sources stay O(delta)",
     REQUIRE(m.captured_delta_syncs() == caps + 1);
     fx.check();
   }
-    SECTION("sequence DEFAULT, sequence still advances once") {
+  SECTION("sequence DEFAULT, sequence still advances once") {
     // A DEFAULT nextval() column is the sharpest non-repeatable source there
     // is: anything that re-derives the inserted row by re-running the source
     // would advance the sequence a SECOND time and store a value the table
