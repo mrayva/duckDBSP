@@ -316,7 +316,7 @@ suite is minutes, not hours:
 |---|---|
 | `ctest -j4` | **45/45 passed**, 78.9 s |
 | `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.1 s |
-| `test_trigger_source` alone | **33 cases, 959 assertions** |
+| `test_trigger_source` alone | **34 cases, 980 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
