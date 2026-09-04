@@ -2481,16 +2481,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
   // Let the CDC core reach the per-connection transaction state. It cannot
   // include dbsp_context_state.hpp (that header includes dbsp_cdc.hpp), so the
-  // two callbacks are installed here, where both types are visible.
-  dbsp_native::txn_bookkeeping().needs_reconcile = [](ClientContext &ctx,
-                                                      const string &key) {
-    auto st = ctx.registered_state->Get<dbsp_native::DBSPContextState>(
-        "dbsp_cdc_state");
-    if (st) {
-      st->note_needs_reconcile(key);
-    }
-  };
-  dbsp_native::txn_bookkeeping().unseeded_on_rollback = [](ClientContext &ctx) {
+  // callback is installed here, where both types are visible.
+  dbsp_native::txn_bookkeeping().baseline_unseeded = [](ClientContext &ctx) {
     auto st = ctx.registered_state->Get<dbsp_native::DBSPContextState>(
         "dbsp_cdc_state");
     if (st) {

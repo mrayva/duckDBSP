@@ -1089,3 +1089,171 @@ TEST_CASE(
                         "WHERE view_name = 'tv'") == 0);
   REQUIRE(sql_count(db, "SELECT 1") == 1);
 }
+
+TEST_CASE("cdc: a deferred baseline is reconciled on EVERY commit path",
+          "[trigger_source][create_view]") {
+  // seed_baseline defers inside an open user transaction and asks the
+  // connection to reconcile later. Recording the table in the transaction's
+  // sync SCOPE was not enough: TransactionCommit has two branches, and the
+  // trigger-fed one applies its buffered deltas and returns without ever
+  // reading that scope. A commit that the triggers fed therefore DISCARDED the
+  // reconcile — measured before the fix, the view read 3.0 against SQL 13.0
+  // and then 7.0 against 17.0, never healing. The repair is a widening
+  // (unknown_writes), which is the one flag both branches honour, carried on
+  // connection state so it also survives a commit that reconciles nothing.
+
+  // Puts `t` in the state that exposed it: tracked, triggers installed, and
+  // its baseline still EMPTY, with auto-sync on for the caller.
+  auto tracked_but_unseeded = [](DuckDBTestHarness &db) {
+    db.exec("SELECT * FROM dbsp_auto_sync(false)");
+    db.exec("BEGIN TRANSACTION");
+    db.exec("SELECT * FROM dbsp_track('t')"); // seeding deferred: txn is open
+    db.exec("COMMIT");                        // auto-sync off: no reconcile
+    db.exec("SELECT 1");                      // statement boundary: triggers
+    db.exec("SELECT * FROM dbsp_auto_sync(true)");
+    REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_tables()") == 1);
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+  };
+
+  SECTION("the reconciling commit is trigger-fed, dbsp_create_view") {
+    // NOT the discriminating section in this harness: with the fix reverted it
+    // still passes, because a statement-less commit lands between the INSERT
+    // and the create here and its pessimistic sync_all seeds the table by
+    // accident (DBSP_DEBUG_SYNC: know_all=0 touched=0 stmt_kind=0 tracked=1).
+    // The Python client does not produce that commit, and this exact shape was
+    // measured wrong there — test/python/test_create_view_seeding.py is where
+    // this ordering fails without the fix. Kept because the accident is not a
+    // guarantee.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)"); // the triggers feed this commit
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (3, 4.0)"); // and no constant offset
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("the reconciling commit is trigger-fed, CREATE MATERIALIZED VIEW") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec("CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) AS s FROM t");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (3, 4.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("the view is created BEFORE the write in the same transaction") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    db.exec("BEGIN TRANSACTION");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (3, 4.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("a commit with auto-sync OFF still owes the reconcile") {
+    // The commit that reconciles nothing must not throw the debt away. Before
+    // the fix it cleared the deferred-seeding state before its early return,
+    // so turning auto-sync back on and writing left the view on its empty
+    // baseline for good: 4.0 against SQL 17.0.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("SELECT * FROM dbsp_auto_sync(false)");
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT");
+    db.exec("SELECT * FROM dbsp_auto_sync(true)");
+    db.exec("INSERT INTO t VALUES (3, 4.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (4, 5.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("an explicit dbsp_sync repairs it while auto-sync stays off") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("SELECT * FROM dbsp_auto_sync(false)");
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT");
+    db.exec("SELECT * FROM dbsp_sync()");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("the debt is paid ONCE: later commits keep the fast path") {
+    // The widening is a full scan-and-diff, so a flag that never cleared would
+    // turn every subsequent commit on this connection into a sync_all.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT"); // pays the reconcile
+    const auto scans = db.manager().scan_syncs();
+    db.exec("INSERT INTO t VALUES (3, 4.0)");
+    db.exec("INSERT INTO t VALUES (4, 5.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(db.manager().scan_syncs() == scans);
+  }
+}
+
+TEST_CASE("cdc: an uncommitted source table is named as such, not 'missing'",
+          "[trigger_source][create_view]") {
+  // CREATE TABLE and CREATE MATERIALIZED VIEW over it in ONE transaction
+  // cannot work: the plan is extracted on an internal connection that cannot
+  // see the caller's uncommitted catalog. Failing is correct — the complaint
+  // is the WORDING, which was the engine's `Table with name t does not exist!
+  // Did you mean "g1.t"?` and reads like a typo.
+  SECTION("the source exists only in the caller's open transaction") {
+    DuckDBTestHarness db;
+    db.exec("BEGIN TRANSACTION");
+    db.exec("CREATE TABLE t (id INTEGER, v DOUBLE)");
+    db.exec("INSERT INTO t VALUES (1, 10.0)");
+    auto res = db.query("CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t");
+    REQUIRE(res->HasError());
+    REQUIRE(res->GetError().find("not yet committed") != std::string::npos);
+    db.exec("ROLLBACK");
+    REQUIRE(sql_count(db, "SELECT 1") == 1);
+  }
+
+  SECTION("a genuinely missing source keeps the engine's own message") {
+    DuckDBTestHarness db;
+    db.exec("BEGIN TRANSACTION");
+    auto res = db.query("CREATE MATERIALIZED VIEW zz AS "
+                        "SELECT 1 AS s FROM no_such_table");
+    REQUIRE(res->HasError());
+    REQUIRE(res->GetError().find("not yet committed") == std::string::npos);
+    REQUIRE(res->GetError().find("no_such_table") != std::string::npos);
+    db.exec("ROLLBACK");
+    REQUIRE(sql_count(db, "SELECT 1") == 1);
+  }
+
+  SECTION("committing the CREATE TABLE first is what works") {
+    DuckDBTestHarness db;
+    db.exec("BEGIN TRANSACTION");
+    db.exec("CREATE TABLE t (id INTEGER, v DOUBLE)");
+    db.exec("INSERT INTO t VALUES (1, 10.0)");
+    db.exec("COMMIT");
+    db.exec("CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) AS s FROM t");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+}

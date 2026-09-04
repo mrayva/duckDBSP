@@ -61,15 +61,14 @@ namespace dbsp_native {
 // Empty when the core is used without the extension (the in-tree benchmarks
 // and unit tests), which is why every call site checks before invoking.
 struct TxnBookkeeping {
-  // "This transaction's picture of `key` is incomplete — reconcile it by
-  // scanning at commit." Used when a baseline could not be established now
-  // because reading committed state would be wrong (see seed_baseline).
-  std::function<void(duckdb::ClientContext &, const std::string &)>
-      needs_reconcile;
-  // "This transaction left a baseline unseeded." If it ROLLS BACK there is no
-  // commit to reconcile, so views built over that baseline must be rebuilt
-  // from committed storage instead.
-  std::function<void(duckdb::ClientContext &)> unseeded_on_rollback;
+  // "A baseline was deliberately left unseeded on this connection." It could
+  // not be established now because reading committed state on an internal
+  // connection would have missed the open transaction's uncommitted rows (see
+  // seed_baseline). The connection state remembers it until something repairs
+  // it: a COMMIT under auto-sync widens itself to a full scan-and-diff, and a
+  // ROLLBACK — which has no commit to reconcile — rebuilds every view from
+  // committed storage instead.
+  std::function<void(duckdb::ClientContext &)> baseline_unseeded;
 };
 
 inline TxnBookkeeping &txn_bookkeeping() {
@@ -2291,7 +2290,13 @@ public:
     if (!rebuild_pending_.exchange(false)) {
       return;
     }
-    commit_seq_++; // baselines change wholesale: invalidate in-flight captures
+    // Advance the delta generation before the views are recreated below: each
+    // recreate stamps view_delta_generation_ with commit_seq_, so without this
+    // the rebuilt buffers would carry the same generation as the pre-rebuild
+    // ones and a dbsp_changes consumer could not tell them apart. (It is no
+    // longer about invalidating in-flight write captures — that stack is
+    // gone.)
+    commit_seq_++;
     // Refresh every tracked baseline from committed storage first: after
     // an out-of-band divergence the in-memory baseline is not trustworthy
     // (e.g. a trailing notify double-applied against a scan that already
@@ -5602,10 +5607,17 @@ private:
   // internal connection while the user holds a transaction open.
   //
   // So inside a user transaction the baseline is deliberately left UNSEEDED
-  // and the transaction's commit reconciles the table by scan — at which
-  // point the scan-and-diff delta is (committed content − empty baseline),
-  // which propagates into the view and makes it exact from that commit on. A
-  // rollback has no commit to do that, so it asks for a view rebuild instead.
+  // and the connection is told to reconcile it later (baseline_unseeded). The
+  // repair is NOT free-standing: it happens at the next COMMIT that runs with
+  // AUTO-SYNC ON, which widens itself to a full scan-and-diff — the delta is
+  // then (committed content − empty baseline) and propagates into the view,
+  // making it exact from that commit on. A rollback has no commit to do that,
+  // so it asks for a view rebuild from committed storage instead.
+  //
+  // With auto-sync OFF nothing reconciles on its own: the caller must run an
+  // explicit dbsp_sync(), or turn auto-sync back on and commit once. The flag
+  // survives every intervening commit until a reconcile actually runs, so no
+  // ordering of those makes the view stay wrong.
   //
   // Returns false only when a scan that SHOULD have run failed; the caller
   // must not replay an unseeded baseline as though it were table content.
@@ -5616,11 +5628,8 @@ private:
                 << " user_txn_open=" << user_transaction_open(context) << "\n";
     }
     if (user_transaction_open(context)) {
-      if (txn_bookkeeping().needs_reconcile) {
-        txn_bookkeeping().needs_reconcile(context, table_name);
-      }
-      if (txn_bookkeeping().unseeded_on_rollback) {
-        txn_bookkeeping().unseeded_on_rollback(context);
+      if (txn_bookkeeping().baseline_unseeded) {
+        txn_bookkeeping().baseline_unseeded(context);
       }
       return true;
     }
@@ -5949,10 +5958,13 @@ private:
     }
     if (sources.empty())
       return;
-    // Every baseline mutation lands here; write-capture commit guards
-    // compare against this to detect interleaved commits (see
-    // docs/DESIGN_WRITE_CAPTURE.md). One bump per PASS: all views stepped
-    // below share this pass's delta generation.
+    // Every baseline mutation lands here, and commit_seq_ is the delta
+    // generation stamped on each view's single-generation delta buffer
+    // (view_delta_generation_) so a dbsp_changes consumer can skip a stale
+    // one. One bump per PASS: all views stepped below share this pass's
+    // generation. (It also backs dbsp_stats()'s commit_seq. The write-capture
+    // commit guards it was originally written for are gone, along with their
+    // design doc.)
     commit_seq_++;
     dirty_since_save_ = true;
 

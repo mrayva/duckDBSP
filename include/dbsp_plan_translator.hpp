@@ -59,6 +59,7 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_checkpoint.hpp"
 #include "dbsp_qualified_name.hpp"
+#include "dbsp_trigger_capability.hpp"
 #include "dbsp_flat_packed.hpp"
 #include "dbsp_packed_row.hpp"
 #include "dbsp_window_view.hpp"
@@ -5870,6 +5871,41 @@ private:
   NativeMaterializedView *ordered_view_ = nullptr;
 };
 
+// A bind failure on the plan-extraction connection has one cause that the
+// engine's own wording sends the reader looking in the wrong place: the source
+// table exists, but only inside the CALLER's uncommitted transaction, and the
+// internal connection the plan is extracted on cannot see it. That is what
+//   BEGIN; CREATE TABLE t (...);
+//   CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t;
+// produces, as `Table with name t does not exist! Did you mean "g1.t"?` —
+// which reads like a typo. Failing here is the right outcome (loud, and the
+// same every time); only the explanation improves. The test is the one the
+// message claims: the name resolves on the caller's own context, so it is a
+// visibility problem and not a missing table.
+inline std::string
+explain_bind_error(duckdb::ClientContext &context, const std::string &what) {
+  const std::string prefix = "planner frontend: ";
+  const std::string marker = "Table with name ";
+  const auto pos = what.find(marker);
+  if (pos == std::string::npos || !user_transaction_open(context)) {
+    return prefix + what;
+  }
+  const auto start = pos + marker.size();
+  const auto end = what.find(" does not exist", start);
+  if (end == std::string::npos) {
+    return prefix + what;
+  }
+  const std::string name = what.substr(start, end - start);
+  if (!resolve_table_entry(context, name)) {
+    return prefix + what; // genuinely missing: the engine's message is right
+  }
+  return prefix + "source table '" + name +
+         "' is not yet committed — an open transaction's CREATE TABLE is "
+         "invisible to the connection that plans the view. COMMIT the CREATE "
+         "TABLE before creating a materialized view over it. (" +
+         what + ")";
+}
+
 class PlanTranslator {
 public:
   struct Result {
@@ -5920,7 +5956,7 @@ public:
           duckdb::Value::BOOLEAN(false));
       keep_alive->plan = keep_alive->connection->ExtractPlan(sql);
     } catch (const std::exception &e) {
-      return {nullptr, std::string("planner frontend: ") + e.what()};
+      return {nullptr, explain_bind_error(context, e.what())};
     }
 
     Walker walker;

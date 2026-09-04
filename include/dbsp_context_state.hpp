@@ -130,21 +130,17 @@ public:
     tracked_in_txn_.push_back(key);
   }
 
-  // The CDC core could not establish this table's baseline right now, because
+  // The CDC core could not establish some table's baseline right now, because
   // reading committed state on an internal connection while this transaction
-  // is open would miss its uncommitted rows (CDCManager::seed_baseline). Fold
-  // the table into this transaction's sync scope so the commit reconciles it
-  // by scan; the resulting delta is (committed content − empty baseline),
-  // which propagates into any view built over it.
-  void note_needs_reconcile(const std::string &key) {
-    capture_.touched.insert(key);
-    capture_.saw_statements = true;
-  }
-
-  // Some baseline in this transaction is deliberately unseeded. A COMMIT
-  // reconciles it (note_needs_reconcile above); a ROLLBACK has no commit to do
-  // that, and the views built over it would stand on an empty baseline
-  // forever — so ask for a rebuild from committed storage instead.
+  // is open would miss its uncommitted rows (CDCManager::seed_baseline). The
+  // baseline is EMPTY until something scans, and any view built over it is
+  // wrong until then, so this flag is STICKY: it is not cleared at a
+  // transaction boundary, only when a reconcile actually runs.
+  //
+  // TransactionCommit under auto-sync widens itself to a full scan-and-diff
+  // for it; TransactionRollback, which has no commit to reconcile, asks for a
+  // rebuild of every view from committed storage. A commit with auto-sync OFF
+  // reconciles nothing, so it leaves the flag alone.
   void note_unseeded_baseline() { unseeded_baseline_ = true; }
 
   void QueryBegin(duckdb::ClientContext &context) override {
@@ -256,7 +252,8 @@ public:
     }
     capture_ = {};
     tracked_in_txn_.clear();
-    unseeded_baseline_ = false;
+    // unseeded_baseline_ is NOT cleared here: an empty baseline outlives the
+    // transaction that left it that way, and only a reconcile repairs it.
   }
 
   void QueryEnd(duckdb::ClientContext &context,
@@ -301,12 +298,37 @@ public:
     }
 
     tracked_in_txn_.clear(); // committed: the tracking intent stands
-    unseeded_baseline_ = false; // the sync below establishes it
 
     auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
+      // unseeded_baseline_ is deliberately LEFT SET: this commit reconciles
+      // nothing, so the baseline is still empty. Clearing it here made the
+      // deferred seeding vanish — the view stood on an empty baseline for the
+      // rest of the connection's life (measured: 4.0 against SQL 17.0 after
+      // auto-sync was turned back on). An explicit dbsp_sync(), or the first
+      // commit once auto-sync is back on, is what repairs it.
       capture_ = {};
       return;
+    }
+
+    // A baseline left unseeded (seed_baseline could not scan inside an open
+    // user transaction) is reconciled HERE, by widening this commit to a full
+    // scan-and-diff. It has to be a WIDENING and not a note in
+    // capture_.touched: the trigger-fed fast path below applies its buffered
+    // deltas and returns without ever reading `touched`, so a trigger-fed
+    // commit discarded the reconcile silently and the view read 3.0 against
+    // SQL 13.0 forever. unknown_writes is the one flag BOTH commit branches
+    // honour. saw_statements keeps the "nothing fed, no statement seen" early
+    // return below from skipping the sync.
+    //
+    // The scan is unconditional once the flag is set, so an explicit
+    // dbsp_sync() that already repaired the baseline costs one extra
+    // no-difference scan here. That is the price of not plumbing sync
+    // observation back into the connection state; it is paid once.
+    if (unseeded_baseline_) {
+      unseeded_baseline_ = false;
+      capture_.unknown_writes = true;
+      capture_.saw_statements = true;
     }
 
     // Auto-persist checkpoint interval (dbsp_autopersist_interval): fires a
@@ -431,9 +453,10 @@ public:
       return;
     }
     capture_ = {}; // rolled back: buffered rows never happened
-    // A baseline left unseeded for this transaction has no commit to
-    // reconcile it now. Rebuild every view from committed storage at the next
-    // statement rather than leave one standing on an empty baseline.
+    // An unseeded baseline has no commit to reconcile it now. Rebuild instead:
+    // rebuild_all_views refreshes EVERY tracked baseline from committed
+    // storage before it replays the views, so it is a stronger repair than the
+    // commit's scan-and-diff and the flag is cleared here too.
     if (unseeded_baseline_) {
       unseeded_baseline_ = false;
       get_cdc_manager(context).request_rebuild();

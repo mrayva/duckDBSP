@@ -105,5 +105,120 @@ with tempfile.TemporaryDirectory() as tmp:
                 where = "before" if first else "after"
                 run_case(f"{mode}/{pname}_{where}_create", path, prelude, first)
 
+
+# ---------------------------------------------------------------------------
+# Part 2: the DEFERRED seeding path — a baseline that could not be scanned
+# because the caller held a transaction open.
+#
+# seed_baseline leaves it empty and asks the connection to reconcile later.
+# That debt has to survive BOTH commit branches: the trigger-fed fast path
+# applies its buffered deltas and returns without consulting the transaction's
+# sync scope, so recording the table there alone was silently discarded —
+# measured view 3.0 against SQL 13.0, then 7.0 against 17.0, never healing.
+# And a commit with auto-sync OFF reconciles nothing, so it must not throw the
+# debt away either — measured view 4.0 against SQL 17.0 once auto-sync came
+# back on.
+#
+# C++ sibling: `cdc: a deferred baseline is reconciled on EVERY commit path`.
+# ---------------------------------------------------------------------------
+
+
+def deferred_case(label, path, create_form, write_first):
+    """Track `t` inside a transaction (seeding deferred, nothing reconciles it),
+    let the sweep install the triggers, then create a view in a transaction the
+    triggers DO feed."""
+    con = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        con.execute(f"LOAD '{EXT}'")
+        con.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        con.execute("INSERT INTO t VALUES (1, 10.0)")
+        con.execute("SELECT * FROM dbsp_auto_sync(false)").fetchall()
+        con.execute("BEGIN TRANSACTION")
+        con.execute("SELECT * FROM dbsp_track('t')").fetchall()
+        con.execute("COMMIT")
+        con.execute("SELECT 1").fetchall()  # statement boundary: triggers go in
+        con.execute("SELECT * FROM dbsp_auto_sync(true)").fetchall()
+        tracked = con.execute("SELECT * FROM dbsp_tables()").fetchall()
+        assert tracked, f"{label}: nothing tracked"
+
+        create = (
+            "CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) AS s FROM t"
+            if create_form == "ddl"
+            else "SELECT * FROM dbsp_create_view('tv','SELECT SUM(v) AS s FROM t')"
+        )
+        con.execute("BEGIN TRANSACTION")
+        if write_first:
+            con.execute("INSERT INTO t VALUES (2, 3.0)")
+            con.execute(create).fetchall()
+        else:
+            con.execute(create).fetchall()
+            con.execute("INSERT INTO t VALUES (2, 3.0)")
+        con.execute("COMMIT")
+
+        def both():
+            v = con.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+            s = con.execute("SELECT SUM(v) FROM t").fetchall()
+            return v, s
+
+        v, s = both()
+        assert v == s, f"{label}: view {v} != SQL {s} (reconcile discarded)"
+        con.execute("INSERT INTO t VALUES (3, 4.0)")  # no constant offset
+        v, s = both()
+        assert v == s, f"{label} after edit: view {v} != SQL {s}"
+        print(f"ok: {label} — view matches SQL ({v})", flush=True)
+    finally:
+        con.close()
+
+
+def auto_sync_off_case(label, path, repair):
+    """Defer the seeding with auto-sync OFF, so the commit reconciles nothing,
+    then repair either by an explicit dbsp_sync() or by turning auto-sync back
+    on and committing once."""
+    con = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        con.execute(f"LOAD '{EXT}'")
+        con.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        con.execute("INSERT INTO t VALUES (1, 10.0)")
+        con.execute("SELECT * FROM dbsp_auto_sync(false)").fetchall()
+        con.execute("BEGIN TRANSACTION")
+        con.execute("INSERT INTO t VALUES (2, 3.0)")
+        con.execute(
+            "SELECT * FROM dbsp_create_view('tv','SELECT SUM(v) AS s FROM t')"
+        ).fetchall()
+        con.execute("COMMIT")
+        if repair == "sync":
+            con.execute("SELECT * FROM dbsp_sync()").fetchall()
+        else:
+            con.execute("SELECT * FROM dbsp_auto_sync(true)").fetchall()
+            con.execute("INSERT INTO t VALUES (3, 4.0)")
+        v = con.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+        s = con.execute("SELECT SUM(v) FROM t").fetchall()
+        assert v == s, f"{label}: view {v} != SQL {s} (deferred state dropped)"
+        print(f"ok: {label} — view matches SQL ({v})", flush=True)
+    finally:
+        con.close()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    n = 0
+    for mode in ("file", "memory"):
+        for form in ("ddl", "function"):
+            for write_first in (True, False):
+                n += 1
+                path = (":memory:" if mode == "memory"
+                        else os.path.join(tmp, f"d_{n}.duckdb"))
+                order = "write_first" if write_first else "create_first"
+                deferred_case(f"{mode}/{form}_{order}", path, form, write_first)
+        for repair in ("sync", "auto_sync_back_on"):
+            n += 1
+            path = (":memory:" if mode == "memory"
+                    else os.path.join(tmp, f"d_{n}.duckdb"))
+            auto_sync_off_case(f"{mode}/auto_sync_off_{repair}", path, repair)
+
+drain = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+drain.execute(f"LOAD '{EXT}'")
+drain.execute("SELECT * FROM dbsp_wait_teardown()").fetchall()
+drain.close()
+
 signal.alarm(0)
 print("PASS", flush=True)
