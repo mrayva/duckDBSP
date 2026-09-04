@@ -36,7 +36,7 @@ wheel, and a CI that can build against a public one.
   so a zero-row write evaluates it zero times and "fired, nothing changed" is
   indistinguishable from "did not fire".
 
-**Deleted** (`git diff --shortstat 7549a02..HEAD`: 37 files, +1,377 / −6,124, net −4,747)
+**Deleted** (`git diff --shortstat 7549a02..HEAD`: 41 files, +1,751 / −6,137, net −4,386)
 
 | File | Lines |
 |---|---:|
@@ -55,7 +55,7 @@ wheel, and a CI that can build against a public one.
 | `docs/DESIGN_WRITE_CAPTURE.md` | 316 |
 | `docs/UPSTREAM_PROPOSAL.md` | 92 |
 
-`include/dbsp_context_state.hpp` went from 1,321 to ~560 lines. The
+`include/dbsp_context_state.hpp` went from 1,316 to 651 lines. The
 `ParserExtension` for `CREATE MATERIALIZED VIEW` stays — it is DDL, not
 capture. `duckdb/` was reverted to stock `a00803f7687ca3d7188d417216e288c5c4b22b58`.
 
@@ -86,10 +86,10 @@ capture. `duckdb/` was reverted to stock `a00803f7687ca3d7188d417216e288c5c4b22b
 
 **Test suite**
 
-- ctest: **45 entries, 45/45 green**, 59.4 s plain and 55.5 s under
+- ctest: **45 entries, 45/45 green**, 72.5 s plain and 54.9 s under
   `DBSP_TEST_VERIFY_VECTORS=1`. (Was 48 with the hook build: −`engine_hook`,
   −`engine_hook_consumer`, −`write_capture`; `plan_tee` was renamed.)
-- `test_trigger_source`: **22 cases, 416 assertions**.
+- `test_trigger_source`: **25 cases, 495 assertions**.
 - `test_plan_tee.cpp` → `test_dml_shapes.cpp` (**10 cases, 352 assertions**):
   the same DML shapes, now asserted through the trigger path.
 - `test_auto_cdc.cpp` kept every case whose subject was the answer rather than

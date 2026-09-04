@@ -77,7 +77,7 @@ self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source       # 22 cases, 416 assertions
+./test_trigger_source       # 25 cases, 495 assertions
 ```
 
 Beyond the oracle it pins the paths specific to this source: the C++
@@ -93,9 +93,16 @@ re-issuing the DDL.
 
 It also pins what tracking a table COSTS it — the statements the engine refuses
 on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`, `INSERT OR
-REPLACE`, `ALTER TABLE ... RENAME COLUMN`). Those are product constraints now,
-so they are asserted rather than discovered. See
-`docs/DESIGN_TRIGGER_SOURCE.md`.
+REPLACE`, `ALTER TABLE ... RENAME COLUMN`), and that tracking is REFUSED
+outright on a database below storage version v2.0.0, with an error naming the
+migration. Those are product constraints now, so they are asserted rather than
+discovered. See `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+Three more cases exist because the sweep runs concurrently — with the user, and
+with its own past. Bodies lost WITHOUT a fingerprint change (an
+in-transaction `DROP`+`CREATE` of the same shape, and a hand-dropped body) must
+come back on the next sweep; and a racing creator of `dbsp_trigger_sink`, held
+open on a second connection, must not fail the user's statement.
 
 ### `dml_shapes` — shapes a delta source can get wrong
 
@@ -133,14 +140,15 @@ whole claim of that source and something no in-tree binary can demonstrate. It
 also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
 suffice) and that an attached catalog holding a triggered table still detaches.
 
-**Known reds, measured 2026-09-03 on `v2.0.0-alpha39998`:**
+**Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
+`test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
+to the delta source. 25 of the 26 scripts exit 0.
 
-- `test_mv_tables.py` — `disable must stop mirroring`. Pre-existing; unrelated
-  to the delta source.
-- `test_nth_value_frames.py`, `test_self_join_case.py`, `test_view_state.py`
-  print `PASS` and then exit 139. That is the alpha's interpreter-exit SIGSEGV
-  (CHANGELOG, "DuckDB 2.0 alpha issues"); which scripts hit it varies run to
-  run, and the fix is for the script to close its connection.
+The exit-139 scripts were never an engine problem to live with: they left a
+DBSP connection open at interpreter exit, or exited while a detached teardown
+thread was still running. `close()` fixed two outright; two more needed
+`close()` plus a `dbsp_wait_teardown()` drain on a fresh connection, which is
+the pattern to copy. Close what you open.
 
 Benchmarks and the soak test build alongside but are not part of ctest:
 

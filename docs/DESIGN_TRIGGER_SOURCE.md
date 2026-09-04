@@ -308,9 +308,9 @@ Correctness, on this tree (`ninja` build, `-j8`, stock engine
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 59.4 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.5 s |
-| `test_trigger_source` alone | **22 cases, 416 assertions** |
+| `ctest -j4` | **45/45 passed**, 72.5 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 54.9 s |
+| `test_trigger_source` alone | **25 cases, 495 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
@@ -350,10 +350,10 @@ one, and the other two were deleted:
 | capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
 | capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-Net over the whole transition: **−4,747 lines** across 37 files
-(`git diff --shortstat 7549a02..HEAD`: +1,377 / −6,124), and the fork stopped
-being a fork of DuckDB — stock engine, stock PyPI wheel, a CI that can build
-against a public one.
+Net over the whole transition: **−4,386 lines** across 41 files
+(`git diff --shortstat 7549a02..HEAD`: +1,751 / −6,137, measured at
+`428db53`), and the fork stopped being a fork of DuckDB — stock engine, stock
+PyPI wheel, a CI that can build against a public one.
 
 What was NOT deleted: the scan-and-diff reconcile (`sync_tables` / `sync_all`),
 which is the safety net behind every route out of "I do not know what this
@@ -373,16 +373,22 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 
 ## Follow-ups
 
-- **An open transaction that loses its triggers.** Inside a transaction,
-  `DROP t; CREATE t (same columns); dbsp_track('t')` is not detected until
-  commit, because the `duckdb_triggers()` check needs SQL that cannot run
-  there. Correctness falls back to `sync_tables(touched)`. The residual: a
-  write that leaves `saw_statements` false inside such a transaction would take
-  the "nothing fed, no statement seen, so nothing was written" early return
-  with no scan. Not reproduced — every write path measured here runs as a
-  statement, so the combination looks unreachable — and forcing a scan on every
-  transaction that saw a trigger install was rejected because it would make
-  each `dbsp_track` cost a full `sync_all`.
+- **An open transaction that loses its triggers.** `DROP t; CREATE t (same
+  columns)` inside a transaction takes the bodies with the old table and leaves
+  a same-shaped one behind: the fingerprint and the tracked count both stand
+  still, so only the catalog can tell. It is detected at the first sweep AFTER
+  the transaction ends, which is when the `duckdb_triggers()` read can run
+  (an earlier version of this note said "not detected until commit"; before the
+  sweep stopped short-circuiting on its own install record it was never
+  detected at all, and the table stayed triggerless for the life of the
+  process). Inside the transaction, correctness falls back to
+  `sync_tables(touched)`. The residual: a write that leaves `saw_statements`
+  false inside such a transaction would take the "nothing fed, no statement
+  seen, so nothing was written" early return with no scan. Not reproduced —
+  every write path measured here runs as a statement, so the combination looks
+  unreachable — and forcing a scan on every transaction that saw a trigger
+  install was rejected because it would make each `dbsp_track` cost a full
+  `sync_all`.
 - **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.
