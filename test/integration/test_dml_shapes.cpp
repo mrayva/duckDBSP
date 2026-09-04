@@ -61,13 +61,13 @@ TEST_CASE("dml shapes: same-table-twice transaction stays O(delta)",
   auto &m = fx.db.manager();
   // one table, two statements, one commit: both firings buffer into the same
   // per-transaction delta and it applies in one pass — no scan at commit
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("INSERT INTO tt VALUES (9, 1, 90)");
   fx.db.exec("DELETE FROM tt WHERE id = 1");
   fx.db.exec("COMMIT");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   fx.finish();
@@ -79,14 +79,14 @@ TEST_CASE("dml shapes: post-write subquery DELETE stays O(delta)",
   auto &m = fx.db.manager();
   // the DELETE's subquery reads tu AFTER this transaction wrote it: a source
   // that re-ran the predicate against committed state would miss id 4
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("INSERT INTO tu VALUES (4, 'z')");
   fx.db.exec("DELETE FROM tt WHERE id IN (SELECT id FROM tu)");
   fx.db.exec("COMMIT");
   // one apply per table: the INSERT (tu) and the DELETE (tt)
-  REQUIRE(m.captured_delta_syncs() == caps + 2);
+  REQUIRE(m.exact_delta_syncs() == caps + 2);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   // the subquery must have seen the txn-local INSERT: id 4 deleted too
@@ -99,12 +99,12 @@ TEST_CASE("dml shapes: rollback discards buffered rows",
           "[integration][dml_shapes]") {
   ShapeFixture fx;
   auto &m = fx.db.manager();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("INSERT INTO tt VALUES (9, 1, 90)");
   fx.db.exec("DELETE FROM tt WHERE grp = 1");
   fx.db.exec("ROLLBACK");
-  REQUIRE(m.captured_delta_syncs() == caps);
+  REQUIRE(m.exact_delta_syncs() == caps);
   fx.check(); // views match the unchanged table
   fx.finish();
 }
@@ -114,14 +114,14 @@ TEST_CASE("dml shapes: zero-match DELETE after write skips the scan",
   ShapeFixture fx;
   auto &m = fx.db.manager();
   const uint64_t scans = m.scan_syncs();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("INSERT INTO tt VALUES (9, 3, 90)");
   fx.db.exec("DELETE FROM tt WHERE id = 777"); // matches nothing
   fx.db.exec("COMMIT");
   // the DELETE fires nothing at all; the INSERT's delta still serves the
   // commit on its own
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   fx.finish();
@@ -133,11 +133,11 @@ TEST_CASE("dml shapes: UPDATE ... FROM stays O(delta)",
   auto &m = fx.db.manager();
   // the joined new values are not derivable from the target row alone; the
   // UPDATE trigger carries both transition tables, so they need not be
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("UPDATE tt SET val = tt.val + tu.id * 100 FROM tu "
              "WHERE tt.id = tu.id");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   fx.finish();
@@ -170,11 +170,11 @@ TEST_CASE("dml shapes: volatile SET expression captured exactly",
   auto &m = fx.db.manager();
   // random() in SET: re-evaluating the expression would give a DIFFERENT
   // value, so only the row the statement actually wrote will do
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("UPDATE tt SET val = CAST(random() * 1000 AS INT) "
              "WHERE id = 2");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   fx.finish();
@@ -191,10 +191,10 @@ TEST_CASE("dml shapes: indexed-column UPDATE (del_and_insert) stays O(delta)",
           "'SELECT id, val FROM tpk2 WHERE val > 5')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
   auto &m = db.manager();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   db.exec("UPDATE tpk2 SET id = id + 100 WHERE val = 10");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   auto expected = db.query("SELECT * FROM (SELECT id, val FROM tpk2 "
                            "WHERE val > 5) ORDER BY ALL");
@@ -213,25 +213,25 @@ TEST_CASE("dml shapes: non-repeatable INSERT sources stay O(delta)",
   auto &m = fx.db.manager();
 
   SECTION("table-function source") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO tt SELECT 100 + i, 3, CAST(i AS INT) "
                "FROM range(3) r(i)");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check();
   }
   SECTION("USING SAMPLE source") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     fx.db.exec("INSERT INTO tt SELECT id + 200, grp, val FROM tt "
                "USING SAMPLE 2");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     fx.check();
   }
   SECTION("permuted full column list") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     fx.db.exec("INSERT INTO tt (val, id, grp) VALUES (77, 300, 1)");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     fx.check();
   }
   SECTION("sequence DEFAULT, sequence still advances once") {
@@ -248,14 +248,14 @@ TEST_CASE("dml shapes: non-repeatable INSERT sources stay O(delta)",
     fx.db.exec("SELECT * FROM dbsp_create_view('tv_seq', "
                "'SELECT id, v FROM tseq')");
     const uint64_t scans = m.scan_syncs();
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     // 7, not 1: the row must be (id=1, v=7) so that a source mapping the two
     // INT columns in the wrong order produces (7, 1) and the comparison
     // below fails. With v=1 the row is (1, 1) and a swapped mapping still
     // compares equal — the assertion could not fail.
     fx.db.exec("INSERT INTO tseq (v) VALUES (7)");
     REQUIRE(m.scan_syncs() == scans);
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     auto res = fx.db.query("SELECT MAX(id), COUNT(*) FROM tseq");
     REQUIRE(res->GetValue(0, 0).GetValue<int64_t>() == 1); // advanced once
     REQUIRE(res->GetValue(1, 0).GetValue<int64_t>() == 1);
@@ -280,12 +280,12 @@ TEST_CASE("dml shapes: multi-statement string DML stays O(delta)",
   // statement classification calls this WRITE_UNKNOWN, which alone would mean
   // a full sync_all — but each sub-statement runs as its own autocommit
   // transaction and fires its own triggers, so each is served exactly
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("INSERT INTO tt VALUES (400, 1, 40); "
              "DELETE FROM tt WHERE id = 400; "
              "UPDATE tt SET val = val + 1 WHERE id = 2");
-  REQUIRE(m.captured_delta_syncs() == caps + 3);
+  REQUIRE(m.exact_delta_syncs() == caps + 3);
   REQUIRE(m.scan_syncs() == scans);
   fx.check();
   fx.finish();

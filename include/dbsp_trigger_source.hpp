@@ -701,7 +701,7 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     // same-shaped one; a user can `DROP TRIGGER` a single body by hand. Both
     // left the table permanently triggerless in that process — every later
     // write to it paid a scoped scan forever, and nothing ever looked again.
-    // Measured: `scan_syncs +1, captured_delta_syncs +0` on every write, view
+    // Measured: `scan_syncs +1, exact_delta_syncs +0` on every write, view
     // still exact, no error anywhere.
     //
     // The check is not free but it is not on the hot path either: it only runs

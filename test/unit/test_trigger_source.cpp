@@ -825,10 +825,10 @@ TEST_CASE("trigger source: bodies lost without a fingerprint change come back",
     // and the next write is served by an exact delta, not a scan
     db.exec("SELECT * FROM dbsp_sync('t')");
     const auto scans = db.manager().scan_syncs();
-    const auto caps = db.manager().captured_delta_syncs();
+    const auto caps = db.manager().exact_delta_syncs();
     db.exec("INSERT INTO t VALUES (3, 11.0)");
     REQUIRE(db.manager().scan_syncs() == scans);
-    REQUIRE(db.manager().captured_delta_syncs() == caps + 1);
+    REQUIRE(db.manager().exact_delta_syncs() == caps + 1);
     REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
   }
 

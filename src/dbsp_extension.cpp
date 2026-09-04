@@ -1139,8 +1139,8 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
       // Commits served by an exact trigger-fed delta instead of
       // scan-and-diff — one count per applied table delta, so a commit
       // touching two tracked tables adds two.
-      {"captured_delta_syncs",
-       NumericCast<int64_t>(manager.captured_delta_syncs())},
+      {"exact_delta_syncs",
+       NumericCast<int64_t>(manager.exact_delta_syncs())},
       // scan-and-diff table scans (the fallback path)
       {"scan_syncs", NumericCast<int64_t>(manager.scan_syncs())},
       // monotonic baseline-mutation counter (conflict detection)

@@ -1616,12 +1616,12 @@ TEST_CASE("planner K1: captured-delta commits hit the spilled baseline",
   db.exec("SELECT * FROM dbsp_create_view('v_cap', '" + sql + "')");
 
   auto &mgr = db.manager();
-  const uint64_t before = mgr.captured_delta_syncs();
+  const uint64_t before = mgr.exact_delta_syncs();
   db.exec("BEGIN TRANSACTION");
   db.exec("INSERT INTO t VALUES (100, 1, 'z'), (101, 2, 'z')");
   db.exec("COMMIT");
   // Fast path must still fire (baseline weight guard reads spilled totals)
-  REQUIRE(mgr.captured_delta_syncs() == before + 1);
+  REQUIRE(mgr.exact_delta_syncs() == before + 1);
   requireViewMatchesQuery(db, "v_cap", sql);
 
   // Follow-up scan-diff sync agrees with the appended baseline

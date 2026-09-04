@@ -143,7 +143,7 @@ TEST_CASE("exact deltas: explicit-txn inserts skip the scan",
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
 
   auto &manager = db.manager();
-  const uint64_t before = manager.captured_delta_syncs();
+  const uint64_t before = manager.exact_delta_syncs();
 
   db.exec("BEGIN");
   db.exec("INSERT INTO ct VALUES (2, 20), (3, 3)");
@@ -151,7 +151,7 @@ TEST_CASE("exact deltas: explicit-txn inserts skip the scan",
   db.exec("COMMIT");
 
   // Fast path must have served the commit (no scan-and-diff)...
-  REQUIRE(manager.captured_delta_syncs() == before + 1);
+  REQUIRE(manager.exact_delta_syncs() == before + 1);
   // ...and the view must be correct: vals 10, 20, 40 pass (3 filtered)
   db.assertViewRowCount("v_cap", 3);
 
@@ -169,7 +169,7 @@ TEST_CASE("exact deltas: txn mixing insert and same-table delete",
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
 
   auto &manager = db.manager();
-  const uint64_t before = manager.captured_delta_syncs();
+  const uint64_t before = manager.exact_delta_syncs();
 
   db.exec("BEGIN");
   db.exec("INSERT INTO ct2 VALUES (3, 30)");
@@ -178,7 +178,7 @@ TEST_CASE("exact deltas: txn mixing insert and same-table delete",
   db.exec("DELETE FROM ct2 WHERE id = 1");
   db.exec("COMMIT");
 
-  REQUIRE(manager.captured_delta_syncs() == before + 1);
+  REQUIRE(manager.exact_delta_syncs() == before + 1);
   db.assertViewRowCount("v_cap2", 2);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
@@ -221,28 +221,28 @@ TEST_CASE("exact deltas: autocommit INSERT sources",
   auto &manager = db.manager();
 
   // Plain VALUES: exact delta, no scan
-  uint64_t caps = manager.captured_delta_syncs();
+  uint64_t caps = manager.exact_delta_syncs();
   uint64_t scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 VALUES (2, 20)");
-  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.exact_delta_syncs() == caps + 1);
   REQUIRE(manager.scan_syncs() == scans);
   db.assertViewRowCount("v_cap4", 2);
 
   // INSERT ... SELECT over base tables: exact too — the trigger reports the
   // rows the statement appended, whatever produced them
-  caps = manager.captured_delta_syncs();
+  caps = manager.exact_delta_syncs();
   scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 SELECT id + 10, val + 10 FROM ct4 WHERE id = 2");
-  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.exact_delta_syncs() == caps + 1);
   REQUIRE(manager.scan_syncs() == scans);
   db.assertViewRowCount("v_cap4", 3);
 
   // LIMIT source: WHICH rows are appended depends on scan order, so nothing
   // could re-derive them — the trigger reports the ones actually appended
-  caps = manager.captured_delta_syncs();
+  caps = manager.exact_delta_syncs();
   scans = manager.scan_syncs();
   db.exec("INSERT INTO ct4 SELECT id + 20, val FROM ct4 LIMIT 1");
-  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.exact_delta_syncs() == caps + 1);
   REQUIRE(manager.scan_syncs() == scans);
 
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
@@ -312,33 +312,33 @@ TEST_CASE("H1: commits that changed nothing scan nothing",
   // Autocommit DELETE on sa: served by an exact delta, no scan of either
   // table — and sb, which nothing wrote, is untouched.
   uint64_t scans = manager.scan_syncs();
-  uint64_t caps = manager.captured_delta_syncs();
+  uint64_t caps = manager.exact_delta_syncs();
   db.exec("DELETE FROM sa WHERE id = 1");
   REQUIRE(manager.scan_syncs() == scans);
-  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.exact_delta_syncs() == caps + 1);
   db.assertViewRowCount("v_sa", 0);
   db.assertViewRowCount("v_sb", 1);
 
   // Explicit txn UPDATE on sb: same, one apply
   scans = manager.scan_syncs();
-  caps = manager.captured_delta_syncs();
+  caps = manager.exact_delta_syncs();
   db.exec("BEGIN");
   db.exec("UPDATE sb SET id = 2 WHERE id = 1");
   db.exec("COMMIT");
   REQUIRE(manager.scan_syncs() == scans);
-  REQUIRE(manager.captured_delta_syncs() == caps + 1);
+  REQUIRE(manager.exact_delta_syncs() == caps + 1);
   db.assertViewRowCount("v_sb", 1);
 
   // Read-only explicit txn: zero scans AND zero applies. This is the H1
   // early return — a commit that saw only reads has nothing to reconcile,
   // and before H1 it scan-diffed every tracked table.
   scans = manager.scan_syncs();
-  caps = manager.captured_delta_syncs();
+  caps = manager.exact_delta_syncs();
   db.exec("BEGIN");
   db.exec("SELECT * FROM sa");
   db.exec("COMMIT");
   REQUIRE(manager.scan_syncs() == scans);
-  REQUIRE(manager.captured_delta_syncs() == caps);
+  REQUIRE(manager.exact_delta_syncs() == caps);
 
   // A write matching NO rows evaluates the ingest scalar zero times, so the
   // commit falls back to the scan — and this is what proves the fallback is
@@ -422,19 +422,19 @@ TEST_CASE("exact deltas: single-row UPDATE (autocommit + explicit txn)",
   DeltaFixture fx;
   auto &m = fx.db.manager();
 
-  uint64_t caps = m.captured_delta_syncs();
+  uint64_t caps = m.exact_delta_syncs();
   uint64_t scans = m.scan_syncs();
   fx.db.exec("UPDATE wt SET val = 99 WHERE id = 1"); // autocommit
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check_views();
 
-  caps = m.captured_delta_syncs();
+  caps = m.exact_delta_syncs();
   scans = m.scan_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("UPDATE wt SET val = 7 WHERE id = 3");
   fx.db.exec("COMMIT");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check_views();
 
@@ -445,10 +445,10 @@ TEST_CASE("exact deltas: multi-row expression UPDATE",
           "[integration][auto_cdc][delta]") {
   DeltaFixture fx;
   auto &m = fx.db.manager();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   const uint64_t scans = m.scan_syncs();
   fx.db.exec("UPDATE wt SET val = val + 1 WHERE grp = 1");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check_views();
   fx.finish();
@@ -458,9 +458,9 @@ TEST_CASE("exact deltas: UPDATE moves a group-by key",
           "[integration][auto_cdc][delta]") {
   DeltaFixture fx;
   auto &m = fx.db.manager();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   fx.db.exec("UPDATE wt SET grp = 2 WHERE id = 1");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   fx.check_views();
   fx.finish();
 }
@@ -469,14 +469,14 @@ TEST_CASE("exact deltas: NULL handling in SET and WHERE",
           "[integration][auto_cdc][delta]") {
   DeltaFixture fx;
   auto &m = fx.db.manager();
-  uint64_t caps = m.captured_delta_syncs();
+  uint64_t caps = m.exact_delta_syncs();
   fx.db.exec("UPDATE wt SET val = NULL WHERE id = 2");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   fx.check_views();
 
-  caps = m.captured_delta_syncs();
+  caps = m.exact_delta_syncs();
   fx.db.exec("UPDATE wt SET val = 5 WHERE val IS NULL");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   fx.check_views();
   fx.finish();
 }
@@ -486,23 +486,23 @@ TEST_CASE("exact deltas: DELETE (autocommit + explicit txn + delete-all)",
   DeltaFixture fx;
   auto &m = fx.db.manager();
 
-  uint64_t caps = m.captured_delta_syncs();
+  uint64_t caps = m.exact_delta_syncs();
   uint64_t scans = m.scan_syncs();
   fx.db.exec("DELETE FROM wt WHERE id = 4");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   REQUIRE(m.scan_syncs() == scans);
   fx.check_views();
 
-  caps = m.captured_delta_syncs();
+  caps = m.exact_delta_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("DELETE FROM wt WHERE grp = 1");
   fx.db.exec("COMMIT");
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   fx.check_views();
 
-  caps = m.captured_delta_syncs();
+  caps = m.exact_delta_syncs();
   fx.db.exec("DELETE FROM wt"); // delete-all, still capturable
-  REQUIRE(m.captured_delta_syncs() == caps + 1);
+  REQUIRE(m.exact_delta_syncs() == caps + 1);
   fx.check_views();
   fx.finish();
 }
@@ -513,20 +513,20 @@ TEST_CASE("exact deltas: predicate shapes a predictor had to decline",
   auto &m = fx.db.manager();
 
   SECTION("DELETE with a subquery WHERE") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec(
         "DELETE FROM wt WHERE grp IN (SELECT grp FROM wd WHERE name = 'a')");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("DELETE USING a joined table") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("DELETE FROM wt USING wd WHERE wt.grp = wd.grp "
                "AND wd.name = 'b'");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
@@ -534,13 +534,13 @@ TEST_CASE("exact deltas: predicate shapes a predictor had to decline",
     // the DELETE's subquery must see the uncommitted INSERT into we, so
     // nothing that re-ran the predicate against committed state could get
     // this right (one apply per table: we insert + wt delete), no scan
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("BEGIN");
     fx.db.exec("INSERT INTO we VALUES (3, 'z')");
     fx.db.exec("DELETE FROM wt WHERE id IN (SELECT id FROM we)");
     fx.db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps + 2);
+    REQUIRE(m.exact_delta_syncs() == caps + 2);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
@@ -559,10 +559,10 @@ TEST_CASE("exact deltas: predicate shapes a predictor had to decline",
     // and reconciles by scan. It is SCOPED to the statement's target (H1),
     // not a full sync_all — that is what is pinned here.
     const uint64_t scans = m.scan_syncs();
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     fx.db.exec("UPDATE wt SET val = 1 WHERE random() < -1.0");
     REQUIRE(m.scan_syncs() == scans + 1); // wt only, not wd and we
-    REQUIRE(m.captured_delta_syncs() == caps);
+    REQUIRE(m.exact_delta_syncs() == caps);
     fx.check_views();
   }
   fx.finish();
@@ -574,7 +574,7 @@ TEST_CASE("exact deltas: mixed INSERT+UPDATE+DELETE transaction",
   auto &m = fx.db.manager();
 
   SECTION("across different tables: one apply per table") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("BEGIN");
     fx.db.exec("INSERT INTO wt VALUES (9, 1, 90)");
@@ -582,20 +582,20 @@ TEST_CASE("exact deltas: mixed INSERT+UPDATE+DELETE transaction",
     fx.db.exec("DELETE FROM we WHERE id = 1");
     fx.db.exec("COMMIT");
     // one apply per touched table, zero scans
-    REQUIRE(m.captured_delta_syncs() == caps + 3);
+    REQUIRE(m.exact_delta_syncs() == caps + 3);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("same table written twice: stays O(delta)") {
     // the UPDATE modifies the row this transaction just INSERTed; both
     // firings buffer into one delta and net to a single appended row
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("BEGIN");
     fx.db.exec("INSERT INTO wt VALUES (9, 1, 90)");
     fx.db.exec("UPDATE wt SET val = 1 WHERE id = 9");
     fx.db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
@@ -606,12 +606,12 @@ TEST_CASE("exact deltas: rollback discards buffered writes",
           "[integration][auto_cdc][delta]") {
   DeltaFixture fx;
   auto &m = fx.db.manager();
-  const uint64_t caps = m.captured_delta_syncs();
+  const uint64_t caps = m.exact_delta_syncs();
   fx.db.exec("BEGIN");
   fx.db.exec("UPDATE wt SET val = 1000 WHERE id = 1");
   fx.db.exec("DELETE FROM we WHERE id = 2");
   fx.db.exec("ROLLBACK");
-  REQUIRE(m.captured_delta_syncs() == caps);
+  REQUIRE(m.exact_delta_syncs() == caps);
   fx.check_views(); // views still match (unchanged) base tables
   fx.finish();
 }
@@ -632,22 +632,22 @@ TEST_CASE("exact deltas: the scan path lands identical views",
   };
 
   DeltaFixture exact;
-  const uint64_t caps = exact.db.manager().captured_delta_syncs();
+  const uint64_t caps = exact.db.manager().exact_delta_syncs();
   const uint64_t scans = exact.db.manager().scan_syncs();
   run_edits(exact);
-  REQUIRE(exact.db.manager().captured_delta_syncs() > caps);
+  REQUIRE(exact.db.manager().exact_delta_syncs() > caps);
   REQUIRE(exact.db.manager().scan_syncs() == scans);
   exact.check_views();
 
   DeltaFixture scanned;
   scanned.db.exec("SELECT * FROM dbsp_auto_sync(false)");
-  const uint64_t caps2 = scanned.db.manager().captured_delta_syncs();
+  const uint64_t caps2 = scanned.db.manager().exact_delta_syncs();
   const uint64_t scans2 = scanned.db.manager().scan_syncs();
   run_edits(scanned);
   scanned.db.exec("SELECT * FROM dbsp_sync('wt')");
   scanned.db.exec("SELECT * FROM dbsp_sync('wd')");
   REQUIRE(scanned.db.manager().scan_syncs() > scans2);
-  REQUIRE(scanned.db.manager().captured_delta_syncs() == caps2);
+  REQUIRE(scanned.db.manager().exact_delta_syncs() == caps2);
   scanned.check_views();
   scanned.finish();
 
@@ -693,49 +693,49 @@ TEST_CASE("exact deltas: autocommit INSERT VALUES differential",
   auto &m = fx.db.manager();
 
   SECTION("multi-row VALUES with expressions and NULLs") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO wt VALUES (10, 1, 5 * 8), (11, 2, NULL)");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("full-cover permuted column list") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     fx.db.exec("INSERT INTO wt (val, id, grp) VALUES (70, 12, 2)");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     fx.check_views();
   }
   SECTION("partial column list, NULL/default padding") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO wt (id, grp) VALUES (13, 1)"); // val -> NULL
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("INSERT ... SELECT differential") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO wt SELECT id + 100, grp, val * 2 FROM wt "
                "WHERE grp = 1");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("volatile expression: the value actually inserted") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     fx.db.exec("INSERT INTO wt VALUES (14, 1, CAST(random() * 0 AS INT))");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     fx.check_views();
   }
   SECTION("INSERT then UPDATE, separate autocommits") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     fx.db.exec("INSERT INTO wt VALUES (15, 1, 150)");
     fx.db.exec("UPDATE wt SET val = 151 WHERE id = 15");
-    REQUIRE(m.captured_delta_syncs() == caps + 2);
+    REQUIRE(m.exact_delta_syncs() == caps + 2);
     fx.check_views();
   }
   fx.finish();
@@ -763,7 +763,7 @@ TEST_CASE("Appender rows are captured (flush runs as a statement)",
   };
 
   SECTION("pure Appender transaction: exact, no scan") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     db.exec("BEGIN");
     {
@@ -773,12 +773,12 @@ TEST_CASE("Appender rows are captured (flush runs as a statement)",
       app.Close();
     }
     db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     check();
   }
   SECTION("Appender mixed with a plain INSERT: one apply") {
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     db.exec("BEGIN");
     db.exec("INSERT INTO wa VALUES (20, 200)");
@@ -788,7 +788,7 @@ TEST_CASE("Appender rows are captured (flush runs as a statement)",
       app.Close();
     }
     db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     check();
   }
@@ -796,7 +796,7 @@ TEST_CASE("Appender rows are captured (flush runs as a statement)",
     // Appender::FlushInternal runs an INSERT ... SELECT, so it goes through
     // the binder and fires the INSERT trigger like any other statement —
     // the UPDATE's and the flush's images merge into one delta
-    const uint64_t caps = m.captured_delta_syncs();
+    const uint64_t caps = m.exact_delta_syncs();
     const uint64_t scans = m.scan_syncs();
     db.exec("BEGIN");
     db.exec("UPDATE wa SET val = 60 WHERE id = 1");
@@ -806,7 +806,7 @@ TEST_CASE("Appender rows are captured (flush runs as a statement)",
       app.Close();
     }
     db.exec("COMMIT");
-    REQUIRE(m.captured_delta_syncs() == caps + 1);
+    REQUIRE(m.exact_delta_syncs() == caps + 1);
     REQUIRE(m.scan_syncs() == scans);
     check();
   }
@@ -869,11 +869,11 @@ TEST_CASE("dbsp_stats exposes sync-path counters",
   };
 
   REQUIRE(value_of("tracked_tables") >= 1);
-  const auto caps = value_of("captured_delta_syncs");
+  const auto caps = value_of("exact_delta_syncs");
   const auto trg = value_of("trigger_syncs");
   const auto seq = value_of("commit_seq");
   db.exec("UPDATE ws SET val = 60 WHERE id = 1");
-  REQUIRE(value_of("captured_delta_syncs") == caps + 1);
+  REQUIRE(value_of("exact_delta_syncs") == caps + 1);
   // The UPDATE trigger fires ONCE but its body evaluates the ingest scalar
   // TWICE — the two arms of the UNION ALL over the old and new transition
   // tables. This is the counter that makes "the triggers are live"

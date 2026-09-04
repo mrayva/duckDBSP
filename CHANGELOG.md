@@ -1,5 +1,23 @@
 # Changelog
 
+## `captured_delta_syncs` is now `exact_delta_syncs` — 2026-09-04
+
+**Renamed, not aliased.** The old name carried the vocabulary of the deleted
+capture stack — `TeeCapture`, `try_write_capture`, `apply_captured` — which has
+not existed since the trigger-only transition. What the counter means today is
+"a table delta applied EXACTLY, without a scan", and that is what it is called.
+
+The rename is safe because nothing outside the fork reads it. Grepped before
+touching it: NumPad's `calcengine/`, `api/` and `tests/` have **no** hits for
+`captured_delta_syncs`, and neither does the rest of that repo outside
+`docs/superpowers/` planning notes, which are history. NumPad reads
+`dbsp_stats()` at all in exactly zero places. Had there been a reader, the plan
+was an alias row and a deprecation note instead.
+
+The C++ accessor `CDCManager::captured_delta_syncs()` and the member are renamed
+with it; every fork test, benchmark and doc follows. Older entries in this file
+keep the old name — they record what was true when they were written.
+
 ## The internal-connection law is enforceable — 2026-09-04
 
 *Never read committed-only state on an internal connection while the user's

@@ -326,7 +326,7 @@ On the PyPI wheel `duckdb==1.6.0.dev379`
 - `dbsp_query` equals plain SQL after `INSERT ... VALUES`, `UPDATE`, `DELETE`,
   `COPY ... FROM` a CSV and `INSERT ... SELECT`;
 - `dbsp_stats()` reports `trigger_syncs 5`, `trigger_rows 12`,
-  `captured_delta_syncs 4`, `scan_syncs 2`, and carries no
+  `exact_delta_syncs 4`, `scan_syncs 2`, and carries no
   `delta_source_mode` / `capture_guard_fallbacks`;
 - after close and reopen with autopersist, the triggers are back and the view
   still matches plain SQL.
@@ -365,7 +365,7 @@ PyPI wheel, a CI that can build against a public one.
 What was NOT deleted: the scan-and-diff reconcile (`sync_tables` / `sync_all`),
 which is the safety net behind every route out of "I do not know what this
 transaction wrote"; the `ParserExtension` for `CREATE MATERIALIZED VIEW`, which
-is DDL and not capture; and the `captured_delta_syncs` counter, which now
+is DDL and not capture; and the `exact_delta_syncs` counter, which now
 counts trigger-fed deltas applied without a scan.
 
 Tests that asserted CDC correctness through the capture path were ported rather

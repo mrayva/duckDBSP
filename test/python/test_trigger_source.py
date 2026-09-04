@@ -126,14 +126,14 @@ try:
     s1 = stats(conn)
     assert s1["trigger_syncs"] > 0, "no trigger body ever delivered"
     assert s1["trigger_rows"] > 0, "no row images buffered"
-    assert s1["captured_delta_syncs"] > 0, "no commit was served by an exact delta"
+    assert s1["exact_delta_syncs"] > 0, "no commit was served by an exact delta"
     assert s1["scan_syncs"] == s0["scan_syncs"], (
         f"a commit fell back to scan-and-diff: "
         f"{s1['scan_syncs']} scans (was {s0['scan_syncs']})"
     )
     print(
         f"ok: trigger_syncs={s1['trigger_syncs']} rows={s1['trigger_rows']} "
-        f"exact_syncs={s1['captured_delta_syncs']} scans={s1['scan_syncs']}",
+        f"exact_syncs={s1['exact_delta_syncs']} scans={s1['scan_syncs']}",
         flush=True,
     )
 

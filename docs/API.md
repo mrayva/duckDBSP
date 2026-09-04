@@ -842,7 +842,7 @@ numeric row).
 ```sql
 SELECT * FROM dbsp_stats();
 -- metric                | value | detail
--- captured_delta_syncs  | 1042  |        -- exact table deltas applied (no scan)
+-- exact_delta_syncs    | 1042  |        -- exact table deltas applied (no scan)
 -- scan_syncs            | 3     |        -- scan-and-diff fallbacks
 -- commit_seq            | 1045  |        -- monotonic baseline mutations
 -- tracked_tables        | 4     |

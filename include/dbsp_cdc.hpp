@@ -5132,7 +5132,7 @@ public:
       it->second->apply_delta(delta);
     }
     propagate_changes(table_name, delta);
-    captured_delta_syncs_++;
+    exact_delta_syncs_++;
     return true;
   }
 
@@ -5198,14 +5198,14 @@ public:
     if (!sources.empty()) {
       propagate_changes_multi(sources);
       // Observable per-TABLE, matching the single-table path's count.
-      captured_delta_syncs_ += sources.size();
+      exact_delta_syncs_ += sources.size();
     }
     return failed;
   }
 
   // Number of table deltas applied exactly (trigger-fed) instead of
   // scan-and-diff (observable so tests can prove the fast path actually ran)
-  uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
+  uint64_t exact_delta_syncs() const { return exact_delta_syncs_; }
 
   // Tables currently held PROVISIONAL (TrackedTable::mark_provisional). Zero
   // in the ordinary single-writer session, and tests assert that.
@@ -6842,7 +6842,7 @@ private:
   // checkpoint had nothing" from "this call restored 0 because everything
   // was already loaded by an earlier call".
   size_t last_skipped_count_ = 0;
-  std::atomic<uint64_t> captured_delta_syncs_{0};
+  std::atomic<uint64_t> exact_delta_syncs_{0};
   // Tables currently PROVISIONAL. The commit hook's sweep loads this and
   // returns when it is zero, which is every commit of an ordinary session.
   std::atomic<uint64_t> provisional_count_{0};

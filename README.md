@@ -188,7 +188,7 @@ indistinguishable from one with nothing to report:
 SELECT * FROM dbsp_stats();
 -- trigger_syncs          5   trigger-body ingests served
 -- trigger_rows          12   row images buffered
--- captured_delta_syncs   4   table deltas applied exactly (no scan)
+-- exact_delta_syncs      4   table deltas applied exactly (no scan)
 -- scan_syncs             2   scan-and-diff reconciles
 -- provisional_tables     0   baselines awaiting a concurrency watermark
 -- reconcile_failures     0   reconcile scans that did NOT run

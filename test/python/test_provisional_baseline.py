@@ -129,7 +129,7 @@ def no_other_txn(label, a, b):
         agree(f"{label}/B edit {i}", b)
     end = stats(a)
     scans = end["scan_syncs"] - base["scan_syncs"]
-    exact = end["captured_delta_syncs"] - base["captured_delta_syncs"]
+    exact = end["exact_delta_syncs"] - base["exact_delta_syncs"]
     check(scans == 0,
           f"{label}: six edits cost {scans} scans (want 0)")
     check(exact == 6,
