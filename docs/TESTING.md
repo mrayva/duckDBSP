@@ -90,43 +90,57 @@ connection for a read of a USER table or for DDL declares an explicit
 a `Forbidden` call made while `user_transaction_open(context)` throws an
 `InternalException` naming the site.
 
-The covered sites, all of them:
+**15 declaration sites** carry a policy today — 4 `Forbidden`, 11
+`AllowedInTxn` — plus **6 helpers** that take the CALLER's policy rather than
+deciding for themselves (`stream_table_rows`, `stream_table_serialized`,
+`live_watermark`, `sync_table_scan_and_consume`, `fold_fresh_baseline`,
+`reconcile_ready_provisional`), and `sync_tables` / `sync_all`, which default to
+`Forbidden` so the commit reconcile is strict unless a caller says otherwise.
 
-| Site | Policy |
+`Forbidden` — a call here inside an open user transaction is a bug:
+
+| Site | Why it must not run there |
 |---|---|
-| `stream_table_rows`, `stream_table_serialized` (`dbsp_cdc.hpp`) | the caller's |
-| `live_watermark` (`dbsp_cdc.hpp`) | the caller's |
-| `fold_fresh_baseline` watermark | Forbidden (seeding) |
-| `sync_table_internal` (the seeding scan) | Forbidden |
-| the trigger sweep's DDL (`dbsp_trigger_source.hpp`) | Forbidden |
-| the sweep's `duckdb_triggers()` presence read | AllowedInTxn |
-| `rebuild_all_views`, `materialize_deferred_locked` | AllowedInTxn |
-| `dbsp_sync()` / `dbsp_sync('t')` | AllowedInTxn |
-| the provisional reconcile at commit / at read | AllowedInTxn / Forbidden |
-| `save_checkpoint` (bookkeeping DDL + source watermarks) | AllowedInTxn |
-| `checkpoint_valid` (restore watermarks) | AllowedInTxn |
-| `register_arrangements` (sidecar watermark) | AllowedInTxn |
-| `save_view_definitions`, `create_view`'s `_dbsp_views` upsert, `erase_persisted_view_row`, `erase_persisted_checkpoint_rows` | AllowedInTxn |
+| `sync_table_internal` (the seeding scan) | it ESTABLISHES a baseline; `seed_baseline` already refuses to reach it inside a transaction |
+| `sync_table_internal` (auto-spill probe) | a `COUNT(*)` over the USER's table on that same path, deciding whether the scan spills |
+| `sync_table_internal` (baseline fold) | the watermark must describe the state the seeding scan read |
+| the trigger sweep's DDL | the original defect of this family |
+| the provisional reconcile, at commit and at read | measured, not assumed — see below |
 
-The `AllowedInTxn` entries split into two reasons, both stated at the call
-site: DDL/DML over DBSP's OWN bookkeeping tables (`_dbsp_views`, `_dbsp_ckpt*`),
-which never needs the user's uncommitted catalog; and watermarks that describe
-COMMITTED storage and are compared against committed storage later, beside
-circuit state that is likewise committed-only. It is OFF by default deliberately: such a call is a bug the commit
-reconcile usually papers over, and turning that paper-over into a crash in
-production would trade a wrong answer for an outage.
+`AllowedInTxn` — every one for one of exactly two reasons:
+
+*DDL/DML over DBSP's OWN bookkeeping tables* (`_dbsp_views`, `_dbsp_ckpt*`,
+`__mv_*`, the trigger sinks), which never needs the user's uncommitted catalog:
+`save_view_definitions`, `create_view`'s `_dbsp_views` upsert,
+`initialize_persistence_table`, `erase_persisted_view_row`,
+`erase_persisted_checkpoint_rows`, `set_mv_tables` (mirror backfill),
+`maybe_drain_trigger_sinks`, and `save_checkpoint`'s bookkeeping DDL.
+
+*Reads that are RIGHT to see committed-only state*: the sweep's
+`duckdb_triggers()` presence read (a plain SELECT taking its own snapshot);
+`rebuild_all_views` and `materialize_deferred_locked`, which REFRESH a baseline
+that already exists rather than establishing one; `dbsp_sync()` / `dbsp_sync('t')`,
+where the caller asked for a reconcile against committed storage; and the
+watermarks in `save_checkpoint`, `checkpoint_valid` and `register_arrangements`,
+which describe committed storage and are compared against committed storage
+later, beside circuit state that is likewise committed-only.
+
+**What the switch cannot catch.** It fires on `user_transaction_open(context)`,
+and the engine clears the transaction context BEFORE running the commit
+callbacks (`duckdb/src/main/transaction_context.cpp:62`), so auto-commit is true
+inside every commit hook by construction. A violation made from a commit hook is
+therefore structurally invisible to this switch: it bites only on calls made
+DURING a statement. The `Forbidden` markings on the two provisional reconciles
+are still the honest state — they say what the site requires — but they are
+documentation there, not enforcement.
+
+It is OFF by default deliberately: such a call is a bug the commit reconcile
+usually papers over, and turning that paper-over into a crash in production
+would trade a wrong answer for an outage.
 
 An assertion inside `InternalQueryGuard` was rejected — 39 call sites, no
 `ClientContext` to ask, and legitimate exceptions that would false-positive.
-Instead each exception is whitelisted IN CODE at its call site with its reason.
-There are four:
-
-| Site | Why it is allowed |
-|---|---|
-| the sweep's `duckdb_triggers()` presence read | a plain SELECT that takes its own snapshot; it never tries to see the user's uncommitted catalog |
-| `rebuild_all_views` (from `QueryBegin`) | REFRESHES a baseline that already exists rather than establishing one |
-| `materialize_deferred_locked` (from `QueryBegin`) | same — a checkpoint-restored baseline whose content is by construction the committed table |
-| `dbsp_sync()` / `dbsp_sync('t')` | USER-INVOKED: the caller asked for a reconcile against committed storage, and this is the documented repair for a deferred seeding |
+Every exception is whitelisted IN CODE at its call site with its reason.
 
 Proof it bites, run 2026-09-04: flipping the `duckdb_triggers()` whitelist to
 `Forbidden` turns the strict run red (`trigger_source` fails, 44/45) with

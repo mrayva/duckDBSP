@@ -66,6 +66,12 @@ def case(label, con):
     check(s["last_reconcile_error"][1] is None,
           f"{label}: last_reconcile_error is NULL with nothing to report "
           f"(got {s['last_reconcile_error'][1]!r})")
+    # The VALUE column of a text-only row is NULL, not a copy of the
+    # reconcile_failures count. It repeated the count once, which invited it to
+    # be read as a number of its own.
+    check(s["last_reconcile_error"][0] is None,
+          f"{label}: last_reconcile_error.value is NULL "
+          f"(got {s['last_reconcile_error'][0]!r})")
 
     con.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
     con.execute("INSERT INTO t VALUES (1, 10.0)")
@@ -88,6 +94,9 @@ def case(label, con):
     check("reconcile scan did not run" in text and "main.t" in text,
           f"{label}: last_reconcile_error names the table and the failure "
           f"({text[:110]!r})")
+    check(s["last_reconcile_error"][0] is None,
+          f"{label}: last_reconcile_error.value stays NULL once it has text "
+          f"(got {s['last_reconcile_error'][0]!r})")
 
 
 with tempfile.TemporaryDirectory() as tmp:

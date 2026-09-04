@@ -250,6 +250,22 @@ try:
     print("ok: view names are unquoted, and unregisterable ones are refused",
           flush=True)
 
+    # REFRESH of a view that does not exist must SAY SO. It reported
+    # "is always up-to-date" for any name at all — including a qualified one
+    # the raw-text parser declines and the token path then swallows — which is
+    # the worst possible answer to "is my view current?".
+    for stmt in ("REFRESH MATERIALIZED VIEW nosuchview",
+                 "REFRESH MATERIALIZED VIEW s2.qv"):
+        try:
+            rows = conn.execute(stmt).fetchall()
+            raise AssertionError(f"{stmt} reported success: {rows}")
+        except duckdb.InvalidInputException as e:
+            assert "does not exist" in str(e), f"{stmt}: unexpected error {e}"
+    # ... and still succeeds for one that does.
+    msg = conn.execute("REFRESH MATERIALIZED VIEW v").fetchall()
+    assert len(msg) == 1 and "up-to-date" in msg[0][0], f"unexpected: {msg}"
+    print("ok: REFRESH refuses an unknown view, on both parse paths", flush=True)
+
     # --- the token path is still a working fallback ----------------------------
     # parser_override callbacks are skipped when allow_parser_override_extension
     # is DEFAULT, which is DuckDB's own default -- the extension raises it to

@@ -381,13 +381,12 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 ## Concurrency notes, and what is still open
 
 Most of what follows is CLOSED — a design note kept because the reasoning is
-load-bearing, with the commit that closed it. **Three** items are genuinely
+load-bearing, with the commit that closed it. **Five** items are genuinely
 open and say so: *an open transaction that loses its triggers* (a residual that
 has not been reproduced); *`dbsp_untrack` does not exist* (an unexercised
-branch); and the two `QueryBegin` internal scans, whose `AllowedInTxn`
-whitelist is a judgement rather than a proof — the commit reconcile appears to
-cover the window they open and nothing pins it (see *the internal-connection
-law* below).
+branch); the two `QueryBegin` internal scans, whose `AllowedInTxn` whitelist is
+a judgement rather than a proof; the provisional read gate's availability cost;
+and the strict switch's structural blindness to commit hooks.
 
 - **An open transaction that loses its triggers.** `DROP t; CREATE t (same
   columns)` inside a transaction takes the bodies with the old table and leaves
@@ -478,6 +477,42 @@ law* below).
   because nothing scanned it" from "empty because the table is empty" and seed
   it itself. Anything else that replays a baseline as though it were table
   content must ask the same question.
+- **OPEN — the provisional read gate costs AVAILABILITY it need not cost.**
+  While a source is PROVISIONAL, `dbsp_query` / `dbsp_changes` refuse on every
+  connection that cannot repair the baseline. That is required for a reader
+  INSIDE the deferring transaction, whose own uncommitted writes the baseline
+  cannot contain. It is NOT required for an ordinary autocommit reader on
+  another connection: that reader's snapshot cannot see the deferring writes
+  either, so the committed-state answer the baseline already holds is exactly
+  right for it — plain SQL on that connection reads `10.0` and the baseline
+  holds `10.0`. The gate does not distinguish the two, so it refuses both.
+
+  Nothing is wrong; something is unavailable. A long-running writer transaction
+  will expose it: for as long as it is open, every reader of a view whose
+  source was tracked during that window is refused, where most of them could
+  have been served correctly.
+
+  Candidate refinement, not costed: serve an autocommit reader whose own
+  catalog snapshot cannot see the deferring transaction's writes, and refuse
+  only the reader inside it (or one whose snapshot postdates the commit but
+  whose baseline has not yet been reconciled). It needs a way to compare the
+  reader's snapshot against the provisional watermark, which the transaction
+  manager exposes — `DuckTransaction::start_time` on the reader versus the
+  table's watermark — but the reasoning has to be got right before the gate is
+  loosened, and a wrong answer is worse than an error.
+
+- **The strict switch cannot see a commit hook.** `DBSP_STRICT_INTERNAL_QUERY=1`
+  fires on `user_transaction_open(context)`, and DuckDB clears the transaction
+  context BEFORE running its commit callbacks
+  (`duckdb/src/main/transaction_context.cpp:62`), so auto-commit is true inside
+  every commit hook by construction. A violation of the internal-connection law
+  made from a commit hook is therefore structurally invisible to the switch: it
+  bites only on calls made DURING a statement. The `Forbidden` markings on the
+  two provisional reconciles are still the honest state — they say what the
+  site requires — but there they are documentation, not enforcement. Anything
+  that starts reading committed-only state from a commit hook has to be
+  reviewed by hand.
+
 - **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.

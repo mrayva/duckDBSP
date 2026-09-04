@@ -87,8 +87,9 @@ statement into a call on the extension's own functions. Two consequences:
 `parser_override` callbacks are SKIPPED unless
 `allow_parser_override_extension` is `FALLBACK` or `STRICT`, and DuckDB's
 default is `DEFAULT`. **Loading the extension raises that setting to
-`FALLBACK`** — for the whole database, so any other parser-override extension
-becomes active too. Setting it back does not break the DDL: the older
+`FALLBACK`, and only from `DEFAULT`** — an explicit `FALLBACK` or `STRICT` is
+read and left alone. The change is for the whole database, so any other
+parser-override extension becomes active too. Setting it back does not break the DDL: the older
 token-reconstruction hook (which runs on PEG failures) still parses
 `CREATE`/`REFRESH`, and builds the same view. What is lost there is the exact
 text — `dbsp_views()` reports a normalised `t . "col" AS m , ...` with comments

@@ -141,10 +141,11 @@ grammar claims that statement and throws `Cannot drop MATERIALIZED VIEW yet`,
 so a hook running only on parse failures could never reach it.
 
 **Loading the extension raises `allow_parser_override_extension` to
-`FALLBACK`** (DuckDB's default, `DEFAULT`, skips every override callback). The
+`FALLBACK`, but only from `DEFAULT`** — DuckDB's default, which skips every
+override callback. An explicit `FALLBACK` or `STRICT` is left alone. The
 setting is global, so other parser-override extensions in that database become
-active too. Setting it back keeps the DDL working through the older
-token-reconstruction hook — same view, normalised stored SQL, no DROP.
+active too. Setting it back to `DEFAULT` keeps the DDL working through the
+older token-reconstruction hook — same view, normalised stored SQL, no DROP.
 
 ### The delta source
 
