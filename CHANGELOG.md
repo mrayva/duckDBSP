@@ -1,5 +1,43 @@
 # Changelog
 
+## create_view seeds its source baselines — 2026-09-04
+
+**Fixes a silent wrong answer on the fork's public API** (pre-existing; not
+reachable from NumPad, which auto-tracks through `create_view` rather than
+calling `dbsp_track` first).
+
+`dbsp_track` followed by `dbsp_create_view` could build the view over an EMPTY
+baseline: wrong number, no error, no counter moving, and no self-healing —
+after one insert the view read 3.0 where SQL read 6.0, after another 7.0
+against 10.0, the same constant offset forever.
+
+The public `track_table` creates a `TrackedTable` with an empty baseline on
+purpose ("Initial table sync deferred... call dbsp_sync() after dbsp_track()")
+and `create_view`'s replay streams exactly that. It was never correct — it only
+LOOKED correct because an unrelated commit usually ran a scan-sync in between,
+namely the statement-less-commit safety net that runs while
+`trigger_source_active()` is still false. Any earlier FAILED DBSP call shifts
+the commit sequencing by one statement, so that scan lands before the table is
+tracked and nothing ever seeds it.
+
+`TrackedTable::baseline_seeded()` now records whether a baseline has ever been
+established from committed storage (set by `install_rebuild`, `finish_rebuild`
+and `mark_deferred`), and `create_view` seeds an unseeded source itself —
+the same guarantee `track_table_internal` already gave auto-tracked sources.
+An already-seeded baseline is untouched, so view creation pays no extra scan.
+
+Also: the storage-version precheck now runs in `track_table_internal`, so
+`dbsp_create_view` over a source in a pre-v2.0.0 database fails with the
+readable error BEFORE tracking it. Previously it succeeded, tracked the table,
+and then every statement on that connection — `COMMIT` and `ROLLBACK` included
+— threw from the sweep, with `DETACH` the only escape. The sweep's own check
+moved below the deferral, so an open user transaction defers instead of
+throwing. The two helpers moved to `include/dbsp_trigger_capability.hpp`; the
+CDC core must not depend on the trigger source.
+
+ctest 45/45 (61.0 s) and 45/45 under `DBSP_TEST_VERIFY_VECTORS=1` (55.3 s);
+`test_trigger_source` 27 cases / 575 assertions; 26 of 27 Python probes exit 0.
+
 ## Trigger-fed deltas are the only delta source — 2026-09-03
 
 **BREAKING.** The predictive capture stack, the optimizer plan tee, the
@@ -36,7 +74,7 @@ wheel, and a CI that can build against a public one.
   so a zero-row write evaluates it zero times and "fired, nothing changed" is
   indistinguishable from "did not fire".
 
-**Deleted** (`git diff --shortstat 7549a02..HEAD`: 41 files, +1,751 / −6,137, net −4,386)
+**Deleted** (`git diff --shortstat 7549a02..HEAD`, this commit included: 44 files, +2,118 / −6,158, net −4,040)
 
 | File | Lines |
 |---|---:|

@@ -264,7 +264,11 @@ would have retried.
   writes a tracked user table from an internal connection; if that ever changes,
   this guard is not sufficient on its own.
 - **Storage version.** `CREATE TRIGGER` needs a database at storage version
-  `v2.0.0` or higher. Tracking a table in an older file throws
+  `v2.0.0` or higher. Both routes into the tracked set refuse before tracking —
+  `dbsp_track` and `create_view`'s source auto-tracking — with one readable
+  error naming the migration; the sweep's own check sits below the deferral, so
+  a user holding a transaction open never gets it out of their COMMIT or
+  ROLLBACK. The engine's own message is
   `Binder Error: CREATE TRIGGER is only supported for storage versions v2.0.0
   and higher`, from the install, on every statement. Files written by the 2.0
   wheel are `v2.0.0+`; a file written by 1.5.4 is `v1.0.0+` and must be rewritten
@@ -308,9 +312,9 @@ Correctness, on this tree (`ninja` build, `-j8`, stock engine
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 72.5 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 54.9 s |
-| `test_trigger_source` alone | **25 cases, 495 assertions** |
+| `ctest -j4` | **45/45 passed**, 61.0 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.3 s |
+| `test_trigger_source` alone | **27 cases, 575 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
@@ -350,9 +354,10 @@ one, and the other two were deleted:
 | capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
 | capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-Net over the whole transition: **−4,386 lines** across 41 files
-(`git diff --shortstat 7549a02..HEAD`: +1,751 / −6,137, measured at
-`428db53`), and the fork stopped being a fork of DuckDB — stock engine, stock
+Net over the whole transition: **−4,040 lines** across 44 files
+(`git diff --shortstat 7549a02..HEAD`: +2,118 / −6,158, taken with this
+commit itself in the range — a SHA cannot be quoted here without going stale
+the moment it is written), and the fork stopped being a fork of DuckDB — stock engine, stock
 PyPI wheel, a CI that can build against a public one.
 
 What was NOT deleted: the scan-and-diff reconcile (`sync_tables` / `sync_all`),
@@ -389,6 +394,12 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   unreachable — and forcing a scan on every transaction that saw a trigger
   install was rejected because it would make each `dbsp_track` cost a full
   `sync_all`.
+- **A baseline is only "seeded" once something has scanned it.** The public
+  `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
+  `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
+  because nothing scanned it" from "empty because the table is empty" and seed
+  it itself. Anything else that replays a baseline as though it were table
+  content must ask the same question.
 - **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.

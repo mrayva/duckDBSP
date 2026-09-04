@@ -77,7 +77,7 @@ self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source       # 25 cases, 495 assertions
+./test_trigger_source       # 27 cases, 575 assertions
 ```
 
 Beyond the oracle it pins the paths specific to this source: the C++
@@ -97,6 +97,16 @@ REPLACE`, `ALTER TABLE ... RENAME COLUMN`), and that tracking is REFUSED
 outright on a database below storage version v2.0.0, with an error naming the
 migration. Those are product constraints now, so they are asserted rather than
 discovered. See `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+One case is not about triggers at all but lives here because this is where the
+oracle is: `cdc: create_view seeds its source baseline, not an empty one`. The
+public `dbsp_track` leaves a baseline empty by design, so a view created
+straight afterwards used to be built over nothing unless an unrelated commit
+happened to scan-sync the table first — a permanently wrong answer with no
+error. Its five sections remove that accident (an earlier FAILED DBSP call
+does it) and assert the view matches SQL through two later edits, so a constant
+offset cannot hide. `test/python/test_create_view_seeding.py` is the
+file-backed sibling.
 
 Three more cases exist because the sweep runs concurrently — with the user, and
 with its own past. Bodies lost WITHOUT a fingerprint change (an
@@ -142,7 +152,7 @@ suffice) and that an attached catalog holding a triggered table still detaches.
 
 **Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
 `test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
-to the delta source. 25 of the 26 scripts exit 0.
+to the delta source. 26 of the 27 scripts exit 0.
 
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown
