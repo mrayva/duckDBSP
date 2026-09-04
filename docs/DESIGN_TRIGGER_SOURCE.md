@@ -105,14 +105,16 @@ untouched.
 
 ## Write-path coverage
 
-Measured on this build, not inferred. C++ cases are in
-`test/unit/test_trigger_source.cpp`; the shell cases are
-`.scratch/trigger_ddl_probe.sql` in the fork.
+Measured on this build, not inferred. Rows marked "C++ suite" are pinned by
+`test/unit/test_trigger_source.cpp` and will stay pinned. Two rows —
+`INSERT ... SELECT` and `TRUNCATE` — were verified only by a one-off shell probe
+(`.scratch/trigger_ddl_probe.sql`, disposable scratch): they are **measured but
+not pinned**, and the first thing to add if this source goes any further.
 
 | Write path | Covered? | Evidence |
 |---|---|---|
 | `INSERT ... VALUES` (multi-row) | Yes | `insert/update/delete keep the view current` |
-| `INSERT ... SELECT` | Yes | shell probe, sink row per statement |
+| `INSERT ... SELECT` | Yes | shell probe, sink row per statement (NOT pinned by a test) |
 | `UPDATE` (both images) | Yes | `update chain collapses to first-old / last-new` |
 | `DELETE` | Yes | `insert/update/delete keep the view current` |
 | Multi-statement single transaction | Yes | `multi-statement single transaction` (4 sections) |
@@ -120,7 +122,7 @@ Measured on this build, not inferred. C++ cases are in
 | `BEGIN ... ROLLBACK` | Yes | `explicit rollback discards everything` |
 | C++ `Appender` | Yes | `the C++ Appender updates the view` (3 rows, sum 61.0) |
 | `COPY ... FROM` (CSV) | Yes | `COPY FROM a CSV updates the view` (sum 111.0) |
-| `TRUNCATE` | Yes, as a full delete | shell probe: 3 old-image rows |
+| `TRUNCATE` | Yes, as a full delete | shell probe, 3 old-image rows (NOT pinned by a test) |
 | NULL-bearing rows | Yes | `NULLs survive the round trip` |
 | **`MERGE INTO` a tracked table** | **NO — hard engine error** | `MERGE INTO on a tracked table is rejected` |
 | `InternalAppender` (engine-internal) | No | `appender.cpp:747-750` calls `LocalAppend`, bypassing the binder |
@@ -241,6 +243,9 @@ runs `INSERT INTO ... SELECT`).
 ### What has to be true first
 
 Not decided by this spike; listed so the decision is not made on vibes.
+The benchmark column now exists (NumPad `214f15db`) and is inside the band, so
+item 1 is provisionally answered — on one pass, on battery, with the slowest
+disk of the five runs. It is not yet settled.
 
 1. **Throughput.** The benchmark column has to be inside the band. A trigger
    body pays a transition-table materialisation and a sink insert per statement
@@ -250,6 +255,9 @@ Not decided by this spike; listed so the decision is not made on vibes.
 3. **The user-visible catalog objects** must be acceptable — triggers and a
    sink table on the user's schema, in their exports and their `SHOW TABLES`.
 4. **A soak.** `soak_differential` has never been run against trigger mode.
+5. **The two unpinned coverage rows** (`INSERT ... SELECT`, `TRUNCATE`) must move
+   into the C++ suite, and the drop-on-untrack path — written, never executed —
+   needs an entry point to drive it and a test on it.
 
 Until all four hold, this stays a mode, not the default, and nothing on the
 deletion list gets deleted.
