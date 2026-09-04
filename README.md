@@ -235,8 +235,13 @@ cmake .. && make -j8
 ctest
 
 # Same suite under DuckDB's vector verification — catches chunks handed to
-# the engine with stale child-vector sizes. CI runs both.
+# the engine with stale child-vector sizes. CI runs all three.
 DBSP_TEST_VERIFY_VECTORS=1 ctest
+
+# Same suite under the internal-connection law: a helper that opens its own
+# connection for a data read or DDL while the user's transaction is open
+# throws, naming the site. Off by default (see docs/TESTING.md).
+DBSP_STRICT_INTERNAL_QUERY=1 ctest
 
 # Benchmarks (built but not part of ctest)
 make bench_planner_eval soak_differential

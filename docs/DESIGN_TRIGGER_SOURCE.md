@@ -521,17 +521,35 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   (`capture_.triggers_installed` → scan). A catalog served by a non-DuckDB
   transaction manager has no watermark to take; the table is never marked
   there, which is exactly the behaviour before this gate.
-- **Nothing enforces the internal-connection law.** The concrete proposal is
-  NOT an assertion inside `InternalQueryGuard` — it has 39 call sites, no
-  `ClientContext` to ask, and three legitimate exceptions that would
-  false-positive. It is a `DBSP_STRICT_INTERNAL_QUERY=1` runtime check at the
-  three helpers that open an internal `duckdb::Connection` for a DATA read —
+- **The internal-connection law is enforceable.** Not an assertion inside
+  `InternalQueryGuard` — that has 39 call sites, no `ClientContext` to ask, and
+  legitimate exceptions that would false-positive. Instead every helper that
+  opens an internal `duckdb::Connection` for a DATA read or DDL takes an
+  explicit `InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name:
   `stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and the
-  sweep's DDL (`dbsp_trigger_source.hpp`) — each taking an explicit
-  `InternalReadPolicy{Forbidden, AllowedInTxn}` argument, so every exception is
-  whitelisted in code with its reason at the call site rather than in a
-  comment. Run `ctest` a third time with it set, the way
-  `DBSP_TEST_VERIFY_VECTORS` is run today.
+  sweep's DDL (`dbsp_trigger_source.hpp`). Under
+  `DBSP_STRICT_INTERNAL_QUERY=1` a `Forbidden` call made while
+  `user_transaction_open(context)` throws an `InternalException` naming the
+  site; `ctest` runs a third time with it set, the way
+  `DBSP_TEST_VERIFY_VECTORS` does (`docs/TESTING.md`).
+
+  Off by default on purpose: such a call is a bug the commit reconcile usually
+  papers over, and turning that paper-over into a crash in production would
+  trade a wrong answer for an outage.
+
+  Four exceptions, each whitelisted in code at its call site with its reason:
+  the sweep's `duckdb_triggers()` presence read (a plain SELECT taking its own
+  snapshot); `rebuild_all_views` and `materialize_deferred_locked`, both
+  reached from `QueryBegin`, which REFRESH a baseline that already exists
+  rather than establishing one; and user-invoked `dbsp_sync()` /
+  `dbsp_sync('t')`, where committed storage is exactly what the caller asked
+  for. The seeding scan is `Forbidden` and means it — `seed_baseline` already
+  refuses to reach it inside an open transaction, so a throw there says that
+  refusal has been bypassed.
+
+  Proved to bite: flipping the `duckdb_triggers()` whitelist to `Forbidden`
+  turns the strict run red (44/45, `trigger_source` failing with the law's own
+  message); restoring it returns 45/45.
 - **A failed reconcile scan is visible from SQL.** `dbsp_stats()` carries
   `reconcile_failures` (a count) and `last_reconcile_error` (the message, in a
   new third `detail` column). This is the one way a view is left stale with the

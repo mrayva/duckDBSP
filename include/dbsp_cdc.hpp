@@ -2404,9 +2404,16 @@ public:
         const bool was_deferred = table.is_deferred();
         try {
           table.begin_rebuild();
-          stream_table_rows(context, name, [&](DuckDBRow &&row) {
-            table.add_scanned_row(std::move(row));
-          });
+          stream_table_rows(
+              context, name,
+              [&](DuckDBRow &&row) { table.add_scanned_row(std::move(row)); },
+              // WHITELISTED. rebuild_all_views runs from QueryBegin, which
+              // fires inside open user transactions, and it REFRESHES a
+              // baseline that already exists rather than establishing one:
+              // the committed content it reads is the right answer for a
+              // rebuild, and the transaction's own writes still arrive through
+              // its triggers and its commit reconcile.
+              InternalReadPolicy::AllowedInTxn, "rebuild_all_views");
           table.install_rebuild();
           fold_fresh_baseline(context, name, table);
           if (was_deferred) {
@@ -3689,7 +3696,14 @@ public:
     std::optional<DuckDBZSet> delta_opt;
     {
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      delta_opt = sync_table_scan_and_consume(context, table_name);
+      delta_opt = sync_table_scan_and_consume(
+          context, table_name, nullptr,
+          // WHITELISTED. sync_table is the USER-INVOKED entry point
+          // (`dbsp_sync('t')`, and crash recovery): the caller asked for a
+          // reconcile against committed storage, so committed storage is
+          // exactly what it should read. It is also the documented repair for
+          // a baseline whose seeding was deferred inside a transaction.
+          InternalReadPolicy::AllowedInTxn, "dbsp_sync(table)");
     }
 
     if (!delta_opt.has_value()) {
@@ -3709,7 +3723,9 @@ public:
   // Returns sync_tables' verdict: false when at least one table was NOT
   // reconciled (see there).
   bool sync_all(duckdb::ClientContext &context,
-                duckdb::MetaTransaction *meta_transaction = nullptr) {
+                duckdb::MetaTransaction *meta_transaction = nullptr,
+                InternalReadPolicy policy = InternalReadPolicy::Forbidden,
+                const char *site = "sync_all") {
     // Snapshot table names and parallel flag under a shared lock, then release
     // before spawning threads. Holding struct_mutex_ while waiting on futures
     // that also need struct_mutex_ would block — snapshot it instead.
@@ -3722,7 +3738,8 @@ public:
         table_names.push_back(entry.first);
       }
     }
-    return sync_tables(context, table_names, do_parallel, meta_transaction);
+    return sync_tables(context, table_names, do_parallel, meta_transaction,
+                       policy, site);
   }
 
   // Sync only the named tables (H1 touched-table scoping: the transaction
@@ -3740,7 +3757,9 @@ public:
   bool sync_tables(duckdb::ClientContext &context,
                    const std::vector<std::string> &table_refs,
                    bool do_parallel,
-                   duckdb::MetaTransaction *meta_transaction = nullptr) {
+                   duckdb::MetaTransaction *meta_transaction = nullptr,
+                   InternalReadPolicy policy = InternalReadPolicy::Forbidden,
+                   const char *site = "sync_tables") {
     std::vector<std::string> table_names;
     table_names.reserve(table_refs.size());
     {
@@ -3764,7 +3783,8 @@ public:
       std::vector<std::future<void>> futures;
       for (size_t i = 0; i < table_names.size(); i++) {
         futures.push_back(std::async(std::launch::async,
-            [this, &context, &table_names, &deltas, i, meta_transaction]() {
+            [this, &context, &table_names, &deltas, i, meta_transaction,
+             policy, site]() {
           std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
           auto lock_it = table_locks_.find(table_names[i]);
@@ -3773,7 +3793,8 @@ public:
 
           std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
           deltas[i] = sync_table_scan_and_consume(context, table_names[i],
-                                                  meta_transaction);
+                                                  meta_transaction, policy,
+                                                  site);
         }));
       }
       for (auto &f : futures) {
@@ -3801,7 +3822,8 @@ public:
 
         std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
         deltas[i] = sync_table_scan_and_consume(context, table_names[i],
-                                                meta_transaction);
+                                                meta_transaction, policy,
+                                                site);
       }
     }
 
@@ -5439,10 +5461,16 @@ private:
   // Finalize()), so that path was removed.
   // Guard: OnConnectionOpened must not run first-time recovery here -
   // the calling thread may hold struct_mutex_ and recovery re-acquires it.
+  //
+  // `policy`/`site` enforce the law above under DBSP_STRICT_INTERNAL_QUERY=1
+  // (see InternalReadPolicy): every caller states in code whether reading
+  // committed-only state here is legal for it, and why.
   static int64_t
   stream_table_rows(duckdb::ClientContext &context,
                     const std::string &table_key,
-                    const std::function<void(DuckDBRow &&)> &emit) {
+                    const std::function<void(DuckDBRow &&)> &emit,
+                    InternalReadPolicy policy, const char *site) {
+    enforce_internal_read_policy(context, policy, site);
     InternalQueryGuard guard;
     auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
     duckdb::Connection fresh_con(fresh_db);
@@ -5569,7 +5597,8 @@ private:
   std::optional<DuckDBZSet> sync_table_scan_and_consume(
       duckdb::ClientContext &context,
       const std::string &table_name,
-      duckdb::MetaTransaction *meta_transaction = nullptr) {
+      duckdb::MetaTransaction *meta_transaction,
+      InternalReadPolicy policy, const char *site) {
     DbspScopeTimer timer("source_sync", table_name);
 
     auto it = tracked_tables_.find(table_name);
@@ -5612,9 +5641,10 @@ private:
       it->second->begin_rebuild();
       scan_syncs_++;
 
-      stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
-        it->second->add_scanned_row(std::move(row));
-      });
+      stream_table_rows(
+          context, table_name,
+          [&](DuckDBRow &&row) { it->second->add_scanned_row(std::move(row)); },
+          policy, site);
 
       // Diff against the previous baseline and swap the new one in
       // (spill mode: digest-index compare + on-disk payloads; RAM mode:
@@ -5686,9 +5716,15 @@ private:
 
     tt.begin_rebuild();
     const int64_t scanned = stream_table_rows(
-        context, table_name, [&](DuckDBRow &&row) {
-          tt.add_scanned_row(std::move(row));
-        }); // throws on scan failure: baseline stays deferred
+        context, table_name,
+        [&](DuckDBRow &&row) { tt.add_scanned_row(std::move(row)); },
+        // WHITELISTED, same reason as rebuild_all_views: this reaches
+        // QueryBegin through materialize_all_deferred and REFRESHES a
+        // checkpoint-restored baseline whose content is by construction the
+        // committed table, rather than establishing a new one.
+        InternalReadPolicy::AllowedInTxn,
+        "materialize_deferred_locked"); // throws on scan failure: baseline
+                                        // stays deferred
     const bool clean = (scanned == expected);
 
     tt.install_rebuild();
@@ -6181,12 +6217,19 @@ private:
             context, table_name,
             [&](const std::vector<uint8_t> &bytes) {
               tt.add_scanned_bytes(bytes);
-            });
+            },
+            // FORBIDDEN, and it means it: this is the SEEDING scan, the one
+            // that ESTABLISHES a baseline. seed_baseline already refuses to
+            // reach here inside an open user transaction (it defers and
+            // records the debt instead), so a throw under the strict switch
+            // means that refusal has been bypassed.
+            InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
       if (!streamed) {
-        stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
-          tt.add_scanned_row(std::move(row));
-        });
+        stream_table_rows(
+            context, table_name,
+            [&](DuckDBRow &&row) { tt.add_scanned_row(std::move(row)); },
+            InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
       tt.install_rebuild();
       fold_fresh_baseline(context, table_name, tt);
@@ -6206,7 +6249,9 @@ private:
   // mid-table).
   static bool stream_table_serialized(
       duckdb::ClientContext &context, const std::string &table_key,
-      const std::function<void(const std::vector<uint8_t> &)> &emit) {
+      const std::function<void(const std::vector<uint8_t> &)> &emit,
+      InternalReadPolicy policy, const char *site) {
+    enforce_internal_read_policy(context, policy, site);
     InternalQueryGuard guard;
     auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
     duckdb::Connection fresh_con(fresh_db);

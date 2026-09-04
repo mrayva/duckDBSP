@@ -15,6 +15,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
+#include <cstdlib>
 #include <string>
 
 namespace dbsp_native {
@@ -118,6 +119,59 @@ inline void require_trigger_capable_catalog(duckdb::ClientContext &context,
 inline bool user_transaction_open(duckdb::ClientContext &context) {
   return context.transaction.HasActiveTransaction() &&
          !context.transaction.IsAutoCommit();
+}
+
+/// The internal-connection law, made enforceable.
+///
+/// *Never read committed-only state on an internal connection while the user's
+/// transaction is open.* A helper that opens its own `duckdb::Connection`
+/// cannot see the caller's uncommitted rows, so what it reads is a DIFFERENT
+/// database from the one the caller is looking at. Three defects of this family
+/// have shipped and been fixed here — the sweep's DDL, the sweep's
+/// catalog-version read, and the seeding scan — and nothing asked the question
+/// of the fourth.
+///
+/// It stays a RULE rather than a blanket assertion because there are legitimate
+/// exceptions. The design that was rejected is a check inside
+/// `InternalQueryGuard`: 39 call sites, no `ClientContext` to ask, and
+/// exceptions that would false-positive. Instead each helper that opens an
+/// internal connection takes an explicit policy, so every exception is
+/// whitelisted IN CODE at its call site with its reason.
+///
+/// Off by default. A `Forbidden` call inside a user transaction is a bug the
+/// commit reconcile usually papers over, and turning that paper-over into a
+/// crash in production would trade a wrong answer for an outage. Under
+/// `DBSP_STRICT_INTERNAL_QUERY=1` it throws; the suite is run that way as a
+/// third pass (see `docs/TESTING.md`).
+enum class InternalReadPolicy {
+  Forbidden,    ///< must not run inside an open user transaction
+  AllowedInTxn, ///< whitelisted — the call site states why
+};
+
+inline bool strict_internal_query() {
+  static const bool on = [] {
+    const char *v = std::getenv("DBSP_STRICT_INTERNAL_QUERY");
+    return v != nullptr && *v != '\0' && std::string(v) != "0";
+  }();
+  return on;
+}
+
+/// Throw when `site` opened an internal connection under `Forbidden` while the
+/// user holds a transaction open, and the strict switch is on.
+inline void enforce_internal_read_policy(duckdb::ClientContext &context,
+                                         InternalReadPolicy policy,
+                                         const char *site) {
+  if (policy == InternalReadPolicy::AllowedInTxn || !strict_internal_query()) {
+    return;
+  }
+  if (!user_transaction_open(context)) {
+    return;
+  }
+  throw duckdb::InternalException(
+      "DBSP internal-connection law: %s opened an internal connection while "
+      "the user's transaction was open — what it reads cannot include that "
+      "transaction's own rows",
+      std::string(site));
 }
 
 } // namespace dbsp_native

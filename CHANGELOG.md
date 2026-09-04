@@ -1,5 +1,40 @@
 # Changelog
 
+## The internal-connection law is enforceable — 2026-09-04
+
+*Never read committed-only state on an internal connection while the user's
+transaction is open.* Three defects of that family have shipped and been fixed
+here — the sweep's DDL, the sweep's catalog-version read, and the seeding scan —
+and nothing asked the question of the fourth: it was a rule in a comment.
+
+Every helper that opens an internal `duckdb::Connection` for a data read or DDL
+now takes an explicit `InternalReadPolicy{Forbidden, AllowedInTxn}` and a site
+name — `stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and
+the sweep's DDL (`dbsp_trigger_source.hpp`). Under
+`DBSP_STRICT_INTERNAL_QUERY=1` a `Forbidden` call made while
+`user_transaction_open(context)` throws an `InternalException` naming the site.
+`ctest` now runs a THIRD way with it set, alongside `DBSP_TEST_VERIFY_VECTORS`;
+all three are green (45/45).
+
+An assertion inside `InternalQueryGuard` was rejected: 39 call sites, no
+`ClientContext` to ask, and legitimate exceptions that would false-positive.
+Each exception is whitelisted IN CODE at its call site with its reason — the
+sweep's `duckdb_triggers()` presence read (a plain SELECT taking its own
+snapshot), `rebuild_all_views` and `materialize_deferred_locked` (both reached
+from `QueryBegin`, both REFRESHING a baseline that already exists rather than
+establishing one), and user-invoked `dbsp_sync()` / `dbsp_sync('t')`, where
+committed storage is what the caller asked for. The seeding scan is `Forbidden`
+and means it: `seed_baseline` already refuses to reach it inside an open
+transaction, so a throw there says that refusal has been bypassed.
+
+Off by default deliberately. Such a call is a bug the commit reconcile usually
+papers over; turning that paper-over into a crash in production would trade a
+wrong answer for an outage.
+
+Proved to bite: flipping the `duckdb_triggers()` whitelist to `Forbidden` turns
+the strict run red — `trigger_source` fails, 44/45, with the law's own message —
+and restoring it returns 45/45.
+
 ## A failed reconcile is visible from SQL — 2026-09-04
 
 `sync_table_scan_and_consume` reports failure by RETURNING `nullopt`, not by

@@ -465,7 +465,13 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   manager.maybe_autoload(context);
 
   if (data.sync_all) {
-    manager.sync_all(context);
+    // WHITELISTED. dbsp_sync() is USER-INVOKED: the caller asked for a
+    // reconcile against committed storage, so committed storage is what it
+    // should read — and this is the documented repair for a baseline whose
+    // seeding was deferred inside a transaction.
+    manager.sync_all(context, nullptr,
+                     dbsp_native::InternalReadPolicy::AllowedInTxn,
+                     "dbsp_sync()");
     output.SetChildCardinality(1);
     output.SetValue(0, 0, Value("Synced all tracked tables"));
   } else {

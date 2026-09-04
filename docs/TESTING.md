@@ -65,6 +65,59 @@ are expected green; a failure only under the switch is a real latent bug, not
 a test-harness artifact. `test/python/*.py` are not covered — they open their
 own connections and are not in ctest anyway.
 
+### `DBSP_STRICT_INTERNAL_QUERY=1` — the internal-connection law
+
+```bash
+ctest                                   # normal run
+DBSP_TEST_VERIFY_VECTORS=1 ctest        # same suite under VERIFY_VECTORS
+DBSP_STRICT_INTERNAL_QUERY=1 ctest      # same suite under the law
+```
+
+A third pass, run the same way and for the same reason as the one above: one
+environment variable, no second test registration, all three expected green.
+
+The law is *never read committed-only state on an internal connection while the
+user's transaction is open.* A helper that opens its own `duckdb::Connection`
+cannot see the caller's uncommitted rows, so what it reads is a different
+database from the one the caller is looking at. Three defects of that family
+have shipped and been fixed here — the sweep's DDL, the sweep's catalog-version
+read, and the seeding scan — and until this switch nothing asked the question of
+the fourth.
+
+Mechanics (`dbsp_trigger_capability.hpp`): every helper that opens an internal
+connection for a data read or DDL takes an explicit
+`InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name —
+`stream_table_rows` and `stream_table_serialized` (`dbsp_cdc.hpp`) and the
+sweep's DDL (`dbsp_trigger_source.hpp`). Under the switch a `Forbidden` call
+made while `user_transaction_open(context)` throws an `InternalException` naming
+the site. It is OFF by default deliberately: such a call is a bug the commit
+reconcile usually papers over, and turning that paper-over into a crash in
+production would trade a wrong answer for an outage.
+
+An assertion inside `InternalQueryGuard` was rejected — 39 call sites, no
+`ClientContext` to ask, and legitimate exceptions that would false-positive.
+Instead each exception is whitelisted IN CODE at its call site with its reason.
+There are four:
+
+| Site | Why it is allowed |
+|---|---|
+| the sweep's `duckdb_triggers()` presence read | a plain SELECT that takes its own snapshot; it never tries to see the user's uncommitted catalog |
+| `rebuild_all_views` (from `QueryBegin`) | REFRESHES a baseline that already exists rather than establishing one |
+| `materialize_deferred_locked` (from `QueryBegin`) | same — a checkpoint-restored baseline whose content is by construction the committed table |
+| `dbsp_sync()` / `dbsp_sync('t')` | USER-INVOKED: the caller asked for a reconcile against committed storage, and this is the documented repair for a deferred seeding |
+
+Proof it bites, run 2026-09-04: flipping the `duckdb_triggers()` whitelist to
+`Forbidden` turns the strict run red (`trigger_source` fails, 44/45) with
+
+```
+INTERNAL Error: DBSP internal-connection law: trigger sweep duckdb_triggers()
+read opened an internal connection while the user's transaction was open —
+what it reads cannot include that transaction's own rows
+```
+
+and restoring it returns the run to 45/45. Do that check again whenever a
+whitelist is added.
+
 ### `trigger_source` — the delta source
 
 `test_trigger_source` (`test/unit/test_trigger_source.cpp`, registered as an

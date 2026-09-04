@@ -729,6 +729,13 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   // Cost: one internal connection and one query per sweep that gets past the
   // gate. In the steady state the gate is shut and this never runs.
   if (!unproven.empty()) {
+    // WHITELISTED. This is a plain SELECT over duckdb_triggers(), not a data
+    // read and not DDL: it takes its own snapshot instead of trying to see the
+    // user's uncommitted catalog changes, which is why it sits ABOVE the
+    // "defer while the user's transaction is open" check rather than below it.
+    // See the paragraph above.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "trigger sweep duckdb_triggers() read");
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
     const auto live_triggers = read_dbsp_triggers(con);
@@ -815,6 +822,14 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   // transaction and any of them can lose the same race.
   bool changed = false;
   if (!to_install.empty() || !to_drop.empty()) {
+    // FORBIDDEN, and it means it. This is the sweep's DDL, the original defect
+    // of this family: it commits on an internal connection that cannot see the
+    // user's uncommitted catalog changes, which produced `Referenced column
+    // "note" not found` out of a user's own COMMIT. The deferral check above
+    // already keeps it out of an open transaction, so a throw under the strict
+    // switch means that check has been bypassed.
+    enforce_internal_read_policy(context, InternalReadPolicy::Forbidden,
+                                 "trigger sweep DDL");
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
 
