@@ -37,36 +37,20 @@ subsystem, bespoke parser, standalone Z-set spilling).
 
 ## Performance
 
-- **O(Δ) sync covers most plain SQL writes.** G2: explicit transactions
-  containing only INSERTs commit via captured deltas (~0.6ms/commit incl.
-  the COUNT(*) guard vs ~47ms scan-diff on a 50k-row chain — 74×); wrap
-  streaming appends in BEGIN/COMMIT to get it. Write capture
-  (docs/DESIGN_WRITE_CAPTURE.md): whitelisted UPDATE/DELETE statements —
-  explicit-txn AND autocommit — commit via captured deltas too (~1.5ms
-  for a single-row UPDATE at 1M rows vs ~2.4s scan-diff); the old
-  version-info blocker was worked around by capturing pre-images with an
-  internal SELECT before the statement runs. Autocommit INSERTs (VALUES
-  or deterministic SELECT source; partial column lists take declared
-  DEFAULTs) are captured the same way — evaluated with the INSERT's own
-  casts (~1.0ms at 1M rows). Upserts with an explicit
-  conflict target and excluded.-qualified SET are captured via a LEFT
-  JOIN probe. Subquery predicates and
-  DELETE USING (EXISTS-probe rewrite) capture too when the statement sees
-  pure committed state (autocommit, or explicit txn before its first
-  write). D2 plan tee (optimizer
-  extension): any remaining UPDATE or DELETE shape is captured from the
-  rows the plan actually processed — UPDATE...FROM, parameters, volatile
-  expressions, post-write subqueries, indexed-column UPDATEs,
-  same-table-twice txns. The INSERT tee covers
-  autocommit INSERTs with full-cover column maps (any source shape, incl.
-  LIMIT/SAMPLE/table functions) and multi-statement DML strings (each
-  sub-statement tees as its own autocommit txn). Still scan-diff:
-  multi-match UPDATE...FROM (ambiguous; tee detects and steps aside),
-  DEFAULT-filled partial-column INSERTs from non-repeatable sources
-  (defaults resolve in a physical projection above the tee). Appender
-  writes ARE captured: the flush runs through the statement hooks as a
-  plain INSERT and G2's LocalStorage capture takes it (probed
-  empirically; tested incl. Appender-then-UPDATE ordering).
+- **O(Δ) sync covers every write to a tracked table.** `dbsp_track` puts
+  statement-level AFTER triggers on the table; their bodies hand the exact old
+  and new row images to the extension as the statement runs, so INSERT (VALUES,
+  SELECT, COPY FROM, the C++ Appender), UPDATE, DELETE and TRUNCATE all commit
+  in O(Δ), whatever the predicate — including shapes nothing could predict
+  (UPDATE...FROM, volatile expressions, prepared parameters, post-write
+  subqueries, indexed-column UPDATEs, same-table-twice transactions,
+  multi-statement DML strings). Scan-and-diff, scoped to the tables the
+  transaction wrote, is the fallback for what the triggers could not account
+  for: a write matching zero rows, a transaction under which the triggers were
+  installed or regenerated, an unparseable statement, a conversion failure.
+  The price is what the engine then refuses on a tracked table — MERGE INTO,
+  ON CONFLICT DO UPDATE, INSERT OR REPLACE, every ALTER but ADD COLUMN — and a
+  storage version of v2.0.0 or higher (docs/DESIGN_TRIGGER_SOURCE.md).
   Engine-behavior assumptions are pinned
   by test/integration/test_engine_assumptions.cpp — run it FIRST on any
   engine bump.

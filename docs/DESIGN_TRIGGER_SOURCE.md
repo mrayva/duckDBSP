@@ -1,8 +1,7 @@
 # Trigger-fed delta source
 
-Status: SHIPPED behind `DBSP_DELTA_SOURCE=trigger` (2026-09-03). Third delta
-source alongside `docs/DESIGN_ENGINE_HOOK.md` (patched engine) and
-`docs/DESIGN_WRITE_CAPTURE.md` (predictive capture). Off unless asked for.
+Status: the ONLY delta source (2026-09-03). No switch, no fallback mechanism —
+the scan-and-diff reconcile is the safety net, not a second source.
 
 ## The one-sentence version
 
@@ -37,14 +36,14 @@ CREATE OR REPLACE TRIGGER dbsp_trg_t_upd AFTER UPDATE ON "cat"."sch"."t"
       SELECT dbsp_trigger_ingest('cat.sch.t',  1, "c1", ...) AS v FROM dbsp_new);
 ```
 
-`dbsp_trigger_ingest(key, weight, cols...)` is a new vectorised extension
+`dbsp_trigger_ingest(key, weight, cols...)` is a vectorised extension
 scalar (`src/dbsp_extension.cpp`, `TriggerIngestScalar`). It is `VOLATILE` (so
 it is never folded or cached) with `SPECIAL_HANDLING` null handling (row images
 are full of NULLs; the default would have skipped them). It converts its chunk
 of row images into a signed Z-set — reading typed vector data directly, exactly
 like `engine_cdc_to_zset` — and writes it into
-`DBSPContextState::engine_buffer_delta`, the **same** per-transaction buffer
-the engine hook fills.
+`DBSPContextState::buffer_trigger_delta`, the committing connection's
+per-transaction buffer.
 
 Everything downstream is therefore unchanged: `TransactionCommit` applies the
 buffer through `apply_captured_deltas` in one pass over all tables, and
@@ -65,7 +64,7 @@ would break every tracked write. Nothing ever reads it; it is drained
 
 Considered and rejected: a staging table holding full row images that the
 extension reads at commit. It collides with a law this fork already recorded
-(*catalog lookups inside Commit are unsafe*, `dbsp_engine_hook.hpp`), and it
+(*catalog lookups inside `DuckTransaction::Commit` are unsafe*), and it
 would materialise every changed row into real storage and WAL and read it back.
 
 ### Installing the triggers
@@ -84,24 +83,54 @@ therefore cannot see the new triggers. This is handled, not ignored:
 afterwards is served by triggers. Cost: one scan-and-diff, once, per newly
 tracked table.
 
-`CREATE OR REPLACE` makes re-tracking after a reopen free of "trigger already
-exists" failures. The install record is per database and holds a **weak
-reference** to its `DatabaseInstance`: keying it on the raw address alone was
-wrong in exactly the way this fork has recorded before — DuckDB reuses freed
-addresses, and consecutive test harnesses in one process inherited a stale
-"already installed" list and ran with no triggers at all. Two tests failed on
-that and nothing else; it is a real bug class, not a theoretical one.
+`CREATE OR REPLACE` makes re-tracking free of "trigger already exists"
+failures. The install record is per database and holds a **weak reference** to
+its `DatabaseInstance`: keying it on the raw address alone was wrong in exactly
+the way this fork has recorded before — DuckDB reuses freed addresses, and
+consecutive test harnesses in one process inherited a stale "already installed"
+list and ran with no triggers at all. Two tests failed on that and nothing
+else; it is a real bug class, not a theoretical one.
+
+**The catalog is the record, not this process's memory.** Trigger names carry a
+hash of the table key AND the column fingerprint
+(`dbsp_trg_<table>_<hash>_<op>`), so a process that finds the three names in
+`duckdb_triggers()` knows the installed bodies match the table's current
+columns without re-issuing any DDL. This matters because re-issuing is not
+free: the new bodies commit on an internal connection AFTER the current
+statement took its catalog snapshot, so the sweep has to mark that transaction
+untrusted and its commit reconciles by scanning every tracked table. Measured
+before the names carried the fingerprint: the FIRST WRITE AFTER EVERY REOPEN
+paid that full scan, and it also cost the delta-append sidecar save
+(`test/python/test_delta_append_sidecars.py` went red — a dirty save rewrote
+the whole base digest index instead of appending an O(changed-rows) delta).
+
+A fingerprint change (only `ADD COLUMN` reaches this — every other schema
+change is refused on a triggered table) produces different names, so the
+install also DROPS by name every `dbsp_trg_*` trigger on that table that is not
+one of the three it is about to create. `CREATE OR REPLACE` alone would leave
+the old-fingerprint bodies in place, delivering rows of the wrong width
+alongside the new ones.
+
+The presence check reads `duckdb_triggers()` on an internal connection. That is
+a plain READ, so unlike the DDL it is safe to run while the user holds a
+transaction open: it takes its own snapshot rather than trying to see their
+uncommitted catalog changes. It is paid only when this process's install record
+disagrees with the tracked set — once per database in the steady state.
+(`Catalog::GetEntry` is not an option: it returns nothing for
+`CatalogType::TRIGGER_ENTRY` even when the trigger is right there in
+`duckdb_triggers()`, measured on `v2.0.0-alpha39998`.)
 
 ### No double counting
 
-In trigger mode `register_engine_hook` does not register, and the capture stack
-and plan tee disarm through `exact_delta_source_active()`. As with the engine
-hook, the flag that disarms them flips only on a **delivered** ingest, never at
-install time — triggers that exist but never fire leave the capture stack armed
-rather than silently dropping every commit. Pinned by
+Each firing must deliver its rows exactly once. Pinned by
 `trigger source: one insert counts exactly once`, which asserts a **sum**, not
 a row count: a row delivered twice doubles the sum while leaving the row count
 untouched.
+
+`trigger_source_flag()` is the proof of life. It flips only on a **delivered**
+ingest, never at install time, and the commit path's cheap "this transaction
+saw no statements, so it wrote nothing" early return is gated on it. Triggers
+that exist but never fire therefore cost scans, not silent staleness.
 
 ## Write-path coverage
 
@@ -155,11 +184,11 @@ Sources: `duckdb/src/planner/binder/statement/bind_merge_into.cpp:226-233` for
 MERGE; the other two messages are the engine's own, reproduced in the shell on
 this build.
 
-So trigger mode does not merely add a delta source — it **removes upserts and
-most schema changes from every table NumPad tracks**. Neither the engine hook
-nor the capture stack costs anything like that. An earlier draft of this
-document called MERGE "the one real price"; that was wrong, and the full list
-is the thing to weigh.
+So this source does not merely learn what changed — it **removes upserts and
+most schema changes from every table NumPad tracks**. Neither of the two
+sources it replaced cost anything like that. An earlier draft of this document
+called MERGE "the one real price"; that was wrong, and the full list is the
+thing to weigh. The owner accepted it knowingly on 2026-09-03.
 
 For NumPad specifically: the single `MERGE INTO` site is
 `api/integration/transforms/service.py:371`, targeting `land.<relation>` in the
@@ -234,10 +263,29 @@ would have retried.
   covers work executed on the issuing thread. That is enough because DBSP never
   writes a tracked user table from an internal connection; if that ever changes,
   this guard is not sufficient on its own.
+- **Storage version.** `CREATE TRIGGER` needs a database at storage version
+  `v2.0.0` or higher. Tracking a table in an older file throws
+  `Binder Error: CREATE TRIGGER is only supported for storage versions v2.0.0
+  and higher`, from the install, on every statement. Files written by the 2.0
+  wheel are `v2.0.0+`; a file written by 1.5.4 is `v1.0.0+` and must be rewritten
+  (`ATTACH ... (STORAGE_VERSION 'v2.0.0')` + `COPY FROM DATABASE`, then move the
+  `.dbsp_spill/` sidecar directory alongside the new file). Verified end to end:
+  the restored views match plain SQL and the triggers install on the next
+  statement.
+- **A write that matches no rows costs one scoped scan.** The bodies evaluate
+  the ingest scalar once per transition-table row, so a zero-row write
+  evaluates it zero times — and "the trigger fired and nothing changed" is then
+  indistinguishable from "no trigger fired at all". The commit reconciles by
+  scanning the statement's target table (H1 scoping keeps it to that one
+  table). Pinned by `exact deltas: zero matching rows costs one SCOPED scan`.
+- **A DETACH must not be preceded by the sweep.** Reading a catalog's version
+  joins it to the statement's transaction, and `DETACH` refuses to run against
+  a catalog the transaction has touched. `statement_detaches()` skips the sweep
+  for that one statement. A keyword sniff is the right instrument here and the
+  wrong one for detecting DDL: a miss costs that same loud error, never silent
+  staleness.
 
 ## Buffering and rollback
-
-Identical to the engine hook by construction, because it is the same buffer:
 
 - images are buffered per transaction, keyed by canonical
   `catalog.schema.table`, old at weight −1 and new at +1;
@@ -246,95 +294,95 @@ Identical to the engine hook by construction, because it is the same buffer:
 - an update chain collapses to the first old image and the last new image;
 - `TransactionRollback` clears the buffer, so a rolled-back transaction leaves
   views untouched — and the sink rows the bodies wrote roll back with it;
-- a conversion failure calls `engine_mark_unknown()`, which forces that commit
+- a conversion failure calls `mark_delta_unknown()`, which forces that commit
   to reconcile by scan instead of applying a partial delta.
 
-One thing the trigger path has that the hook does not: bodies run on
-**execution threads**, and an aggregate over a large transition table may be
-parallel. `engine_buffer_delta` therefore takes a mutex.
+Bodies run on **execution threads**, and an aggregate over a large transition
+table may be parallel, so more than one thread can be inside
+`buffer_trigger_delta` at once — it takes a mutex.
 
 ## Measurements
 
-Correctness, on this tree (`ninja` build, `-j8`):
+Correctness, on this tree (`ninja` build, `-j8`, stock engine
+`v2.0.0-alpha39998 / a00803f768`):
 
 | Run | Result |
 |---|---|
-| `ctest` (build/test, default mode) | **48/48 passed**, 175.6 s |
-| `test_trigger_source` alone | **11/11 cases, 211 assertions** |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest` | **48/48 passed**, 114.8 s |
+| `ctest -j4` | **45/45 passed**, 59.4 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.5 s |
+| `test_trigger_source` alone | **22 cases, 416 assertions** |
+| `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
-47 of those 48 are the pre-existing suite; `trigger_source` is the new entry.
-It is built **without** `DBSP_ENGINE_HOOK`, which is the point: nothing in it
-can be served by the patched engine's callback.
-
-On the **stock** PyPI wheel `duckdb==1.6.0.dev379`
+On the PyPI wheel `duckdb==1.6.0.dev379`
 (`v2.0.0-alpha39998 / a00803f768 / Cyanoptera`), via
-`.scratch/probe_trigger_source.py` in NumPad_App:
+`NumPad_App/.scratch/probe_a5.py`:
 
-- `delta_source_mode = 3`, triggers present as
-  `dbsp_trg_items_{del,ins,upd}`;
-- `dbsp_query` equals plain SQL after INSERT, UPDATE and DELETE;
-- `trigger_syncs 4`, `trigger_rows 5`, `captured_delta_syncs 0 → 3`,
-  `scan_syncs 0`, `capture_guard_fallbacks 0` — every commit served by an
-  exact trigger-fed delta, no scan, no capture-stack activity;
-- after close and reopen with autopersist, the triggers are back
-  (`dbsp_trg_t_{del,ins,upd}`) and the view still matches plain SQL.
+- `dbsp_query` equals plain SQL after `INSERT ... VALUES`, `UPDATE`, `DELETE`,
+  `COPY ... FROM` a CSV and `INSERT ... SELECT`;
+- `dbsp_stats()` reports `trigger_syncs 5`, `trigger_rows 12`,
+  `captured_delta_syncs 4`, `scan_syncs 2`, and carries no
+  `delta_source_mode` / `capture_guard_fallbacks`;
+- after close and reopen with autopersist, the triggers are back and the view
+  still matches plain SQL.
+
+Migration from a database written by the 1.5.4 build: the file is storage
+version `v1.0.0+` and `CREATE TRIGGER` is refused on it, so the install throws.
+After `ATTACH ... (STORAGE_VERSION 'v2.0.0')` + `COPY FROM DATABASE` and moving
+the `.dbsp_spill/` directory across, the views restore, the triggers install,
+and edits are served by exact deltas (`NumPad_App/.scratch/probe_upgrade.py`).
 
 Throughput, NumPad `medium` suite, config `E_20_trigger`: see
 `NumPad_App/docs/benchmarks/2026-09-03-duckdb-2.0-alpha-comparison.md`.
 
-## What this would let us delete
+## History
 
-This is the reason the spike exists. If trigger mode becomes the default, the
-following stop having a justification. Counts are `wc -l` on this tree.
+The trigger source began as a spike behind `DBSP_DELTA_SOURCE=trigger`
+alongside two other delta sources. On 2026-09-03 the owner made it the only
+one, and the other two were deleted:
 
-| Candidate | Lines | Why it can go |
+| Removed | Lines | What it was |
 |---|---:|---|
-| `include/dbsp_write_capture.hpp` | 656 | predictive pre-image capture: the trigger reports facts, so there is nothing to predict |
-| `include/dbsp_plan_tee.hpp` | 506 | optimizer tee for shapes design-1 declines |
-| `test/unit/test_write_capture.cpp` | 518 | |
-| `test/integration/test_plan_tee.cpp` | 293 | |
-| `test/benchmarks/bench_write_capture.cpp` | 114 | |
-| `include/dbsp_engine_hook.hpp` | 202 | the hook consumer |
-| `test/unit/test_engine_hook.cpp` | 299 | |
-| `test/integration/test_engine_hook_consumer.cpp` | 128 | |
-| `patches/v2.0.0-alpha39998-dbsp-txn-callback.patch` | 371 | **the engine patch itself** |
-| capture/tee state in `dbsp_context_state.hpp` | ~400 of 1291 | `TeeCapture`, `classify`, `try_write_capture`, `apply_captured`, the commit guard |
-| **Total** | **~3,500** | against the 506 + 363 lines this source added |
+| `include/dbsp_write_capture.hpp` | 656 | predictive pre-image capture: rewrote a whitelisted UPDATE/DELETE/INSERT into a SELECT that read the old images and computed the new ones |
+| `include/dbsp_plan_tee.hpp` | 506 | an `OptimizerExtension` that widened a DML plan and teed the rows it actually processed, for shapes the pre-image SELECT declined |
+| `include/dbsp_engine_hook.hpp` | 202 | consumer for a patched engine's transaction-modification callback |
+| `patches/` (2 files) | 719 | the engine patch itself, and its 1.5.4 archive |
+| `scripts/build_engine_wheel.sh` + `.github/workflows/engine-wheel.yml` | 259 | the patched-wheel build machinery |
+| capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
+| capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-The **real** prize is not the line count. It is the last row but one: with a
-trigger source there is no forked engine. That removes
+Net over the whole transition: **−4,747 lines** across 37 files
+(`git diff --shortstat 7549a02..HEAD`: +1,377 / −6,124), and the fork stopped
+being a fork of DuckDB — stock engine, stock PyPI wheel, a CI that can build
+against a public one.
 
-- `patches/` and `build.sh`'s `git apply` step,
-- the `DBSP_ENGINE_HOOK` compile flag and the two CMake branches that carry it,
-- the pinned `duckdb-python` fork ref and the locally built wheel NumPad
-  depends on,
-- and the CI-unbuildable problem recorded against this fork: CI could build
-  against a **public** DuckDB wheel, which it cannot do today.
+What was NOT deleted: the scan-and-diff reconcile (`sync_tables` / `sync_all`),
+which is the safety net behind every route out of "I do not know what this
+transaction wrote"; the `ParserExtension` for `CREATE MATERIALIZED VIEW`, which
+is DDL and not capture; and the `captured_delta_syncs` counter, which now
+counts trigger-fed deltas applied without a scan.
 
-The write-capture stack's own justification is already gone: it exists for
-write paths the binder never sees, and in 2.0 the Appender is no longer one of
-them (`Appender::FlushInternal`, `duckdb/src/main/appender.cpp:614-627`, now
-runs `INSERT INTO ... SELECT`).
+Tests that asserted CDC correctness through the capture path were ported rather
+than deleted: `test_plan_tee.cpp` became `test_dml_shapes.cpp` (same shapes,
+now asserted through the trigger path), and the differential matrix in
+`test_auto_cdc.cpp` kept every case whose subject was the answer rather than
+the mechanism. Deleted with a stated reason: the upsert cases (the engine now
+refuses upserts on a tracked table — the refusal itself is pinned instead), the
+commit-guard counter case (the guard is gone), and the forced-scan differential
+(its kill switch is gone; the scan arm is now reached through
+`dbsp_auto_sync(false)` + an explicit `dbsp_sync`).
 
-### What has to be true first
+## Follow-ups
 
-Not decided by this spike; listed so the decision is not made on vibes.
-The benchmark column now exists (NumPad `214f15db`) and is inside the band, so
-item 1 is provisionally answered — on one pass, on battery, with the slowest
-disk of the five runs. It is not yet settled.
-
-1. **Throughput.** The benchmark column has to be inside the band. A trigger
-   body pays a transition-table materialisation and a sink insert per statement
-   that neither other source pays.
-2. **`MERGE INTO`.** Removing it from tracked tables must be an acceptable
-   product constraint, permanently.
-3. **The user-visible catalog objects** must be acceptable — triggers and a
-   sink table on the user's schema, in their exports and their `SHOW TABLES`.
-4. **A soak.** `soak_differential` has never been run against trigger mode.
-5. **The two unpinned coverage rows** (`INSERT ... SELECT`, `TRUNCATE`) must move
-   into the C++ suite, and the drop-on-untrack path — written, never executed —
-   needs an entry point to drive it and a test on it.
-
-Until all four hold, this stays a mode, not the default, and nothing on the
-deletion list gets deleted.
+- **An open transaction that loses its triggers.** Inside a transaction,
+  `DROP t; CREATE t (same columns); dbsp_track('t')` is not detected until
+  commit, because the `duckdb_triggers()` check needs SQL that cannot run
+  there. Correctness falls back to `sync_tables(touched)`. The residual: a
+  write that leaves `saw_statements` false inside such a transaction would take
+  the "nothing fed, no statement seen, so nothing was written" early return
+  with no scan. Not reproduced — every write path measured here runs as a
+  statement, so the combination looks unreachable — and forcing a scan on every
+  transaction that saw a trigger install was rejected because it would make
+  each `dbsp_track` cost a full `sync_all`.
+- **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
+  when a table stops being tracked some other way (rollback of a `dbsp_track`),
+  and is otherwise unexercised.

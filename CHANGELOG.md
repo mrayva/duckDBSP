@@ -1,5 +1,106 @@
 # Changelog
 
+## Trigger-fed deltas are the only delta source — 2026-09-03
+
+**BREAKING.** The predictive capture stack, the optimizer plan tee, the
+patched-engine hook consumer, the engine patch and the patched-wheel machinery
+are gone. Change capture is the statement triggers `dbsp_track` generates, and
+nothing else. The fork stops being a fork of DuckDB: stock engine, stock PyPI
+wheel, and a CI that can build against a public one.
+
+**What breaks**
+
+- `DBSP_DELTA_SOURCE` no longer exists. Setting it does nothing.
+- `dbsp_stats()` no longer reports `delta_source_mode` or
+  `capture_guard_fallbacks`. `captured_delta_syncs` stays and now counts
+  trigger-fed table deltas applied without a scan; `trigger_syncs` /
+  `trigger_rows` stay.
+- `CDCManager::write_capture_enabled()` / `set_write_capture_enabled()` and
+  `capture_guard_fallbacks()` / `note_capture_guard_fallback()` are removed.
+  The scan path is now reached with `dbsp_auto_sync(false)` + `dbsp_sync`.
+- The CMake option `DBSP_ENGINE_HOOK` is gone from both `CMakeLists.txt` files,
+  and `build.sh` has no patch step — it FAILS if `duckdb/` is dirty.
+- **Tracking a table costs it** (engine behaviour, pinned by tests): on a
+  triggered table the engine refuses `MERGE INTO`,
+  `INSERT ... ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`, and every
+  `ALTER TABLE` form except `ADD COLUMN`. The triggers and a
+  `dbsp_trigger_sink` table are user-visible catalog objects.
+- **Storage version.** `CREATE TRIGGER` requires storage version `v2.0.0` or
+  higher. A database written by DuckDB 1.5.4 is `v1.0.0+` and the install
+  throws on it. Migration: `ATTACH ... (STORAGE_VERSION 'v2.0.0')` +
+  `COPY FROM DATABASE`, then move the `.dbsp_spill/` sidecar directory
+  alongside the new file. Verified end to end — the views restore, the triggers
+  install, and edits are served by exact deltas.
+- A write matching **zero rows** now costs one scan of the statement's target
+  table: the bodies evaluate the ingest scalar once per transition-table row,
+  so a zero-row write evaluates it zero times and "fired, nothing changed" is
+  indistinguishable from "did not fire".
+
+**Deleted** (`git diff --shortstat 7549a02..HEAD`: 37 files, +1,377 / −6,124, net −4,747)
+
+| File | Lines |
+|---|---:|
+| `include/dbsp_write_capture.hpp` | 656 |
+| `include/dbsp_plan_tee.hpp` | 506 |
+| `include/dbsp_engine_hook.hpp` | 202 |
+| `test/unit/test_write_capture.cpp` | 518 |
+| `test/unit/test_engine_hook.cpp` | 299 |
+| `test/integration/test_engine_hook_consumer.cpp` | 128 |
+| `test/benchmarks/bench_write_capture.cpp` | 114 |
+| `patches/v2.0.0-alpha39998-dbsp-txn-callback.patch` | 371 |
+| `patches/archive/v1.5.4-dbsp-txn-callback.patch` | 348 |
+| `scripts/build_engine_wheel.sh` | 146 |
+| `.github/workflows/engine-wheel.yml` | 113 |
+| `docs/DESIGN_ENGINE_HOOK.md` | 166 |
+| `docs/DESIGN_WRITE_CAPTURE.md` | 316 |
+| `docs/UPSTREAM_PROPOSAL.md` | 92 |
+
+`include/dbsp_context_state.hpp` went from 1,321 to ~560 lines. The
+`ParserExtension` for `CREATE MATERIALIZED VIEW` stays — it is DDL, not
+capture. `duckdb/` was reverted to stock `a00803f7687ca3d7188d417216e288c5c4b22b58`.
+
+**Also fixed in the same pass**
+
+- The sweep's catalog-version gate joined every tracked catalog to the
+  statement's transaction, which made `DETACH` impossible on any catalog
+  holding a tracked table (`Cannot detach database b because the current
+  transaction has outstanding work on it`). The sweep now skips a `DETACH`
+  statement.
+- Trigger names carry a hash of the table key AND the column fingerprint, so a
+  process with an empty install record can see from `duckdb_triggers()` that
+  the right bodies are already installed. Before this, the first statement
+  after every reopen re-issued `CREATE OR REPLACE`, which marked that
+  transaction untrusted and made the first write after every reopen a full
+  scan-and-diff — and cost the delta-append sidecar save
+  (`test_delta_append_sidecars.py` went red: a dirty save rewrote the whole
+  base digest index instead of appending an O(changed-rows) delta). A
+  fingerprint change now also DROPS the old-fingerprint bodies by name;
+  `CREATE OR REPLACE` alone would have left them delivering wrong-width rows.
+- `dbsp_track` inside a transaction that ROLLS BACK no longer keeps its
+  tracking intent. The tracked-table set is process state, not transactional
+  state, so `TransactionRollback` drops it by hand; `dbsp_tables()` used to go
+  on listing a table that never committed.
+- `TriggerInstallState::firings_since_drain` and `request_trigger_recheck()`
+  are removed — a process-global mutex and map insert on every trigger firing,
+  for a counter nothing read, and a caller-free function.
+
+**Test suite**
+
+- ctest: **45 entries, 45/45 green**, 59.4 s plain and 55.5 s under
+  `DBSP_TEST_VERIFY_VECTORS=1`. (Was 48 with the hook build: −`engine_hook`,
+  −`engine_hook_consumer`, −`write_capture`; `plan_tee` was renamed.)
+- `test_trigger_source`: **22 cases, 416 assertions**.
+- `test_plan_tee.cpp` → `test_dml_shapes.cpp` (**10 cases, 352 assertions**):
+  the same DML shapes, now asserted through the trigger path.
+- `test_auto_cdc.cpp` kept every case whose subject was the answer rather than
+  the mechanism, renamed off the capture vocabulary. Deleted with reasons: the
+  two upsert cases (the engine now refuses upserts on a tracked table — the
+  refusal is pinned instead), the commit-guard counter case (the guard is
+  gone), and the forced-scan differential (its kill switch is gone; the scan
+  arm is now `dbsp_auto_sync(false)` + `dbsp_sync`).
+- `test_engine_assumptions.cpp` kept only the autocommit hook-ordering canary.
+  The five plan-shape canaries went with the plan tee they existed for.
+
 ## DuckDB 2.0 alpha issues
 
 Open problems in the pinned engine (v2.0.0-alpha39998, `a00803f7`) that the
@@ -106,11 +207,8 @@ below. Pinned by `test/python/test_ddl_syntax.py`.
   `INSERT OR REPLACE` ("not yet supported with REFERENCING NEW TABLE AS
   triggers"), and every `ALTER TABLE` form except `ADD COLUMN` (dependency
   error). All of them work normally in default and capture mode.
-- New suite `trigger_source` (`test/unit/test_trigger_source.cpp`), built
-  WITHOUT `DBSP_ENGINE_HOOK` on purpose. It brings ctest to 46 entries on a
-  hook-OFF tree and 48 on the hook-ON tree this repo builds by default; both
-  were 48/48 here, plain and under `DBSP_TEST_VERIFY_VECTORS=1`. The suite
-  itself is 18 cases / 318 assertions.
+- New suite `trigger_source` (`test/unit/test_trigger_source.cpp`). (Counts as
+  of this entry are superseded by the trigger-only entry below.)
 - Two of those tests failed at first for one reason, worth recording again: the
   per-database install record was keyed on the raw `DatabaseInstance` address,
   and DuckDB reuses freed addresses, so consecutive harnesses in one process

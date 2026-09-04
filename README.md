@@ -119,57 +119,77 @@ See [examples/](examples/) for more comprehensive demos.
 ```
 
 This will:
-1. Download DuckDB source (if not present)
-2. Apply the engine patches from `patches/` (the patch files are the fork —
-   stock DuckDB lacks the transaction-callback symbols the extension needs;
-   idempotent, fails loudly if the tree has drifted from the patch)
-3. Build the DBSP extension (uses `ccache` and Ninja automatically when
+1. Download DuckDB source (if not present), pinned by COMMIT
+2. Build the DBSP extension (uses `ccache` and Ninja automatically when
    installed; parallelism capped at `-j 8`)
-4. Output `dbsp.duckdb_extension`
+3. Output `dbsp.duckdb_extension`
 
-Any change to DuckDB engine sources must land as an updated patch file in
-`patches/` in the same commit — a fresh clone builds only from the patches.
+**No engine patch.** The engine tree in `duckdb/` is stock, and `build.sh`
+fails loudly if it is not: change capture comes from generated statement
+triggers, which are ordinary SQL objects a stock DuckDB already supports. The
+extension therefore loads into the public PyPI wheel of the same engine commit,
+and CI can build against one.
 
-**Hook-OFF fallback.** `DBSP_ENGINE_HOOK=OFF ./build.sh` skips the patch step
-and builds the extension against an unpatched engine; it then serves deltas
-from the capture stack instead of the commit-time callback, which is a
-supported configuration (it is what the PyPI-wheel setup runs). `build.sh`
-also falls back to hook-OFF automatically when no patch file exists for the
-pinned `DUCKDB_VERSION` (`build.sh:37-39`). Note that OFF only *skips*
-applying the patch — it does not revert one already applied to `duckdb/`;
-`git -C duckdb checkout -- .` first if a genuinely stock tree is wanted.
+### The delta source
 
-### Choosing a delta source: `DBSP_DELTA_SOURCE`
+The extension learns what a committing transaction wrote from statement-level
+`AFTER` triggers it generates on every tracked table. `dbsp_track(t)` creates
+three of them plus a small `dbsp_trigger_sink` table in `t`'s own catalog; the
+bodies hand the exact old/new row images to the extension, which buffers them
+per transaction and applies them at commit. There is no mode switch and no
+second mechanism. Full design: `docs/DESIGN_TRIGGER_SOURCE.md`.
 
-How the extension learns what a committing transaction wrote. Read **once**, at
-extension load — an environment variable rather than a `SET`, because the mode
-has to be fixed before the commit callback registers and before the first table
-is tracked, and a host that cannot run SQL before it opens the database still
-has to be able to choose.
+The scan-and-diff reconcile (`dbsp_sync`) remains the safety net: any commit
+whose picture is or might be incomplete is reconciled by scanning, so
+correctness never depends on a trigger having fired.
 
-| Value | Source | Engine |
-|---|---|---|
-| unset | today's behaviour: the hook if the build and engine have it, else capture | either |
-| `hook` | patched engine's commit callback | patched |
-| `capture` | predictive capture stack + plan tee | stock or patched |
-| `trigger` | generated statement-level `AFTER` triggers | **stock** |
+#### What tracking a table costs it
 
-`trigger` is the spike documented in `docs/DESIGN_TRIGGER_SOURCE.md`: exact
-deltas with no forked engine. Not the default, and the price is paid by every
-table it tracks — on a tracked table the engine then refuses `MERGE INTO`,
-`INSERT ... ON CONFLICT DO UPDATE` and `INSERT OR REPLACE`, and every
-`ALTER TABLE` form except `ADD COLUMN`. The generated triggers and a small
-`dbsp_trigger_sink` table are also visible in the user's catalog. The full
-list, with the engine's own error messages, is in the design doc.
+These are engine behaviours, measured on `v2.0.0-alpha39998` and pinned by
+`test/unit/test_trigger_source.cpp`. They are permanent constraints on every
+tracked table, to be re-checked when DuckDB 2.0 goes stable.
 
-Verify which mode a process actually got — mis-set variables are otherwise
-invisible:
+| On a tracked (triggered) table | Engine response |
+|---|---|
+| `MERGE INTO <t> ...` | `Not implemented Error: MERGE INTO is not supported on tables with triggers` |
+| `INSERT ... ON CONFLICT DO UPDATE` | `Not implemented Error: ON CONFLICT DO UPDATE is not yet supported with REFERENCING NEW TABLE AS triggers` |
+| `INSERT OR REPLACE` (same path) | same error |
+| `ALTER TABLE ... DROP COLUMN` / `RENAME COLUMN` / `ALTER COLUMN ... TYPE` / `RENAME TO` | `Dependency Error: Cannot alter entry "t" because there are entries that depend on it.` |
+| `ALTER TABLE ... ADD COLUMN` | allowed — the sweep notices and regenerates the bodies |
+| `INSERT ... ON CONFLICT DO NOTHING` | allowed |
+| `DROP TABLE` | allowed; takes the triggers with it, and a recreate + re-track reinstalls them |
+
+**Storage version.** `CREATE TRIGGER` requires a database at storage version
+`v2.0.0` or higher. A file written by DuckDB 1.5.4 is `v1.0.0+`, and tracking a
+table in it throws
+`Binder Error: CREATE TRIGGER is only supported for storage versions v2.0.0 and higher`.
+Files created by the 2.0 wheel are `v2.0.0+` and need nothing. To migrate an
+older one:
+
+```sql
+ATTACH 'old.duckdb' AS src (READ_ONLY);
+ATTACH 'new.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');
+COPY FROM DATABASE src TO dst;
+```
+
+then move the `old.duckdb.dbsp_spill/` sidecar directory alongside the new file
+(the paths are derived from the database path). Verified: the restored views
+match plain SQL, the triggers install on the next statement, and edits are
+served by exact deltas.
+
+The triggers and the sink are user-visible catalog objects: they appear in
+`duckdb_triggers()` / `duckdb_tables()`, are WAL-logged, and travel in
+`EXPORT DATABASE`.
+
+Verify the source is live — a database whose triggers never fire is otherwise
+indistinguishable from one with nothing to report:
 
 ```sql
 SELECT * FROM dbsp_stats();
--- delta_source_mode  3      (0 default / 1 hook / 2 capture / 3 trigger)
--- trigger_syncs      4      trigger-body ingests served
--- trigger_rows       5      row images buffered
+-- trigger_syncs          5   trigger-body ingests served
+-- trigger_rows          12   row images buffered
+-- captured_delta_syncs   4   table deltas applied exactly (no scan)
+-- scan_syncs             2   scan-and-diff reconciles
 ```
 
 With `DBSP_TIMING=1` the trigger path prints `[dbsp-timing] trigger_ingest`.
@@ -404,16 +424,14 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Incremental aggregation** | ~2,200,000 rows/s |
 | **Incremental join (100k delta vs 100k index)** | ~460,000 rows/s |
 | **Delta propagation, 3-level view chain** | ~13 µs/row |
-| **Captured-delta commit (explicit INSERT txn)** | ~0.3 ms |
-| **Captured UPDATE/DELETE commit (1M-row table, single row)** | ~1.5 ms |
-| **Captured autocommit INSERT (1M-row table)** | ~1.0 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
-*Apple M-series, release build (`test/build_test`), 100k-row deltas unless
-noted; reproduce with `bench_planner_eval` / `bench_write_capture`.
-Explicit INSERT-only transactions and whitelisted UPDATE/DELETE
-statements (including autocommit) commit O(Δ) via captured deltas; other
-writes pay the scan-and-diff sync (docs/DESIGN_WRITE_CAPTURE.md).*
+*Apple M-series, release build, 100k-row deltas unless noted; reproduce with
+`bench_planner_eval`. The per-commit figures that used to sit here were
+measured under the predictive capture stack, which no longer exists — they are
+not reproducible and have been removed rather than re-labelled. A commit whose
+trigger bodies fired is served by an exact delta and pays no table scan; every
+other commit pays the scan-and-diff above.*
 
 ## Project Structure
 

@@ -27,11 +27,11 @@ Internal design of the DBSP DuckDB extension.
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │      Auto-sync hooks (DBSPContextState, per connection)      ││
-│  │  - O(Δ) captured deltas: INSERT txns (LocalStorage scan,    ││
-│  │    G2) + whitelisted UPDATE/DELETE incl. autocommit          ││
-│  │    (pre-image capture SELECT, dbsp_write_capture.hpp)        ││
-│  │  - Commit guard: seq conflict + signed COUNT(*) + rowid      ││
-│  │    re-verify; any miss → scoped scan-and-diff fallback       ││
+│  │  - Trigger-fed exact deltas: generated AFTER triggers hand   ││
+│  │    old/new images to dbsp_trigger_ingest during the          ││
+│  │    statement (dbsp_trigger_source.hpp)                       ││
+│  │  - Buffered per transaction, applied at commit in ONE pass;  ││
+│  │    anything unaccounted → scoped scan-and-diff fallback      ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
@@ -431,37 +431,30 @@ sequential applies would overcount Δl⋈Δr and strand stale rows.
 The same rule holds one level up, at the commit boundary: a transaction
 that wrote SEVERAL tracked tables runs as ONE propagation pass
 (`propagate_changes_multi` — every commit path collects all table deltas
-first: engine-hook, trigger-source and write-capture all via
-`apply_captured_deltas`, the scan fallback via `sync_tables`). Per-table passes would rewrite each
+first: the trigger source via `apply_captured_deltas`, the scan fallback via
+`sync_tables`). Per-table passes would rewrite each
 downstream view's single-generation `dbsp_changes` buffer (a view over
 both tables keeps only the last table's effects) and miss the join
 both-shared correction above. All views stepped in the pass share one
 delta generation.
 
-### Delta sources
+### The delta source
 
-Three ways to learn what a committing transaction wrote. All three end at the
-same place — a per-transaction buffer, drained by `TransactionCommit` into
-`apply_captured_deltas` — so the CDC core has one ingest path, not three.
-`DBSP_DELTA_SOURCE` (read once at extension load) picks: `hook`, `capture`,
-`trigger`; unset keeps the built-in default. Exactly one is ever live, and
-each proves itself by DELIVERING before the others stand down.
+ONE way to learn what a committing transaction wrote: statement-level `AFTER`
+triggers, generated on every tracked table (`dbsp_trigger_source.hpp`). Their
+bodies call a volatile extension scalar during the statement, which buffers the
+exact old/new row images per transaction; `TransactionCommit` drains the buffer
+into `apply_captured_deltas`. Trigger expansion is binder-level, so this works
+on a STOCK engine and covers the Appender too (its flush runs an
+`INSERT ... SELECT`).
 
 ```
     a user statement writes a tracked table
                     │
-   ┌────────────────┼─────────────────────────────┐
-   │                │                             │
-   ▼                ▼                             ▼
- capture stack    engine hook                trigger source
- (stock engine)   (patched engine)           (stock engine)
- predicts the     engine reports the         generated AFTER triggers
- delta before     exact images inside        hand the images to a
- the statement,   DuckTransaction::Commit    volatile extension scalar
- then a commit                               during the statement
- guard validates
-   │                │                             │
-   └────────────────┴─────────────────────────────┘
+                    ▼
+        generated AFTER trigger fires
+   (transition tables → dbsp_trigger_ingest,
+    a volatile extension scalar, per chunk)
                     │
                     ▼
      DBSPContextState per-transaction buffer
@@ -472,16 +465,17 @@ each proves itself by DELIVERING before the others stand down.
              (ONE pass, all tables)
 ```
 
-- **capture stack** (`dbsp_write_capture.hpp` + `dbsp_plan_tee.hpp`) — the
-  original, extension-only. Predicts, then distrusts itself: a commit-time
-  guard re-verifies against committed storage and falls back to scan-and-diff.
-- **engine hook** (`dbsp_engine_hook.hpp`, `DBSP_ENGINE_HOOK` builds) — the
-  patched engine hands over each committing transaction's exact per-table old
-  and new images. Facts, so no guard.
-- **trigger source** (`dbsp_trigger_source.hpp`) — statement-level `AFTER`
-  triggers with transition tables, generated per tracked table. Also facts, and
-  on a **stock** engine; costs `MERGE INTO` on tracked tables. See
-  `docs/DESIGN_TRIGGER_SOURCE.md`.
+The trigger reports facts, so nothing guards it. What it cannot report — a
+firing that could not reach the buffer, a conversion failure, a transaction
+whose trigger bodies did not match its tables — poisons the buffer instead, and
+that commit reconciles by scan (`sync_tables` / `sync_all`). Silence is the one
+outcome this source must never have.
+
+Two predecessor sources were removed in the trigger-only transition: a
+predictive capture stack (a pre-image SELECT plus an optimizer plan tee, which
+guessed the delta and then distrusted itself with a commit-time guard) and a
+consumer for a patched engine's transaction callback. Both are gone, along with
+the engine patch; see `docs/DESIGN_TRIGGER_SOURCE.md`, "History".
 
 ### Incremental Aggregation Example
 
@@ -735,9 +729,7 @@ src/
 ├── dbsp_extension.cpp           # Entry point, function registration
 include/
 ├── dbsp_cdc.hpp                 # CDC manager, dependency graph
-├── dbsp_context_state.hpp       # Auto-sync hooks + captured-delta paths
-├── dbsp_write_capture.hpp       # UPDATE/DELETE capture vetting + SQL builder
-├── dbsp_engine_hook.hpp         # Patched-engine commit-callback consumer
+├── dbsp_context_state.hpp       # Auto-sync hooks + commit-time delta apply
 ├── dbsp_trigger_source.hpp      # Trigger-fed delta source (stock engine)
 ├── dbsp_duckdb_types.hpp        # DuckDB-native Z-sets and views
 └── dbsp_plan_translator.hpp     # Planner frontend + circuit-IR optimizer

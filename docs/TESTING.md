@@ -8,19 +8,20 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-All tests build in `test/build_test`. ctest registers **46** entries with
-the default `-DDBSP_ENGINE_HOOK=OFF`-equivalent tree and **48** with
-`-DDBSP_ENGINE_HOOK=ON`: the two extra are `engine_hook` and
-`engine_hook_consumer`, which only compile against a patched engine
-(`test/CMakeLists.txt`). Two of the 46 are bench binaries registered
-as smoke entries (`planner_eval_smoke`, `window_bench`).
+ctest registers **45** entries. Two of them are bench binaries registered as
+smoke entries (`planner_eval_smoke`, `window_bench`). There is one build
+configuration — the engine is stock and there is no build option to vary.
 
 ```bash
 cd test/build_test
 cmake .. && make -j8
-ctest                       # full suite, ~15-45s
+ctest -j4                   # full suite, ~1 min
 ./test_planner_frontend     # the big differential suite on its own
 ```
+
+The root build (`./build.sh`) also builds every test binary into `build/test`
+from the same sources and options, so `ctest` from `build/` is equivalent and
+saves a second ~2.6GB DuckDB build when disk is tight.
 
 ### `DBSP_TEST_VERIFY_VECTORS=1` — vector verification, suite-wide
 
@@ -64,46 +65,50 @@ are expected green; a failure only under the switch is a real latent bug, not
 a test-harness artifact. `test/python/*.py` are not covered — they open their
 own connections and are not in ctest anyway.
 
-### `trigger_source` — the trigger delta source
+### `trigger_source` — the delta source
 
 `test_trigger_source` (`test/unit/test_trigger_source.cpp`, registered as an
-integration test because it needs the extension) arms
-`DBSP_DELTA_SOURCE=trigger` **process-wide** from a static initializer, before
-any harness opens a database — the mode is read once and cached, so it cannot
-be set later. That is why it is its own binary: no other test may run in that
-mode, and this one may not run in any other.
-
-It is deliberately built **without** `DBSP_ENGINE_HOOK`. The claim the suite
-exists to check is that trigger-fed deltas need no patched engine, so nothing
-in it may be served by the engine callback.
+integration test because it needs the extension) is the differential oracle for
+the one delta source: old images at −1, new at +1, insert-then-delete nets to
+zero, update chains collapse to first-old/last-new, rollback discards
+everything, multi-table transactions apply in one pass. Every case also
+cross-checks `dbsp_query` against plain SQL, because a source that is
+self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source                      # 20 cases
-DBSP_DELTA_SOURCE=trigger ./test_...       # redundant: the binary sets it
+./test_trigger_source       # 22 cases, 416 assertions
 ```
 
-It ports the engine-hook differential oracle (old images −1, new +1,
-insert-then-delete nets to zero, update chains, rollback, multi-table commits)
-and adds the paths specific to this source: the C++ `Appender`, `COPY FROM`,
-`INSERT ... SELECT`, `TRUNCATE`, multi-chunk DML under `threads=8`, a user's own
-trigger coexisting on a tracked table, a double-count guard that asserts a
-**sum** rather than a row count, `ALTER TABLE ... ADD COLUMN` regenerating the
-bodies, `DROP TABLE` + recreate reinstalling them, and pins on every statement
-the engine refuses on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`,
-`INSERT OR REPLACE`, `ALTER TABLE ... RENAME COLUMN`), and DDL inside an explicit transaction —
-`ADD COLUMN` with and without a write in the same transaction, an `ALTER` that
-rolls back, and `CREATE TABLE` + `dbsp_track` in one transaction committed and
-rolled back. 20 cases. See `docs/DESIGN_TRIGGER_SOURCE.md`.
+Beyond the oracle it pins the paths specific to this source: the C++
+`Appender`, `COPY FROM`, `INSERT ... SELECT`, `TRUNCATE`, multi-chunk DML under
+`threads=8`, a user's own trigger coexisting on a tracked table, a double-count
+guard that asserts a **sum** rather than a row count, `ALTER TABLE ... ADD
+COLUMN` regenerating the bodies, `DROP TABLE` + recreate reinstalling them, DDL
+inside an explicit transaction (`ADD COLUMN` with and without a write in the
+same transaction, an `ALTER` that rolls back, `CREATE TABLE` + `dbsp_track`
+committed and rolled back), a tracked catalog still being `DETACH`able, and an
+empty install record re-using the bodies already in the catalog instead of
+re-issuing the DDL.
 
-Two things it cannot cover, both needing a process where the mode is NOT
-trigger: a database created in trigger mode and then reopened without the
-variable must have its persisted bodies deliver nothing, and its
-`dbsp_trigger_sink` must still be drained (the bodies keep writing a row per
-statement whatever the mode). The mode is process-wide, so both checks live in
-`test/python/test_trigger_source.py`, which forks a child interpreter with the
-variable removed and `DBSP_TRIGGER_SINK_DRAIN` lowered so the bound is
-observable.
+It also pins what tracking a table COSTS it — the statements the engine refuses
+on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`, `INSERT OR
+REPLACE`, `ALTER TABLE ... RENAME COLUMN`). Those are product constraints now,
+so they are asserted rather than discovered. See
+`docs/DESIGN_TRIGGER_SOURCE.md`.
+
+### `dml_shapes` — shapes a delta source can get wrong
+
+`test_dml_shapes` (`test/integration/test_dml_shapes.cpp`, 10 cases) collects
+the DML shapes that defeated earlier delta sources: a table written twice in
+one transaction, a predicate reading transaction-local state, `UPDATE ... FROM`
+(including an ambiguous multi-match), a volatile SET expression, an
+indexed-column UPDATE the engine runs as delete+re-append, non-repeatable
+INSERT sources (table functions, `USING SAMPLE`, sequence DEFAULTs) and
+multi-statement DML in one string. Each checks the view against direct SQL AND
+asserts via counters that no scan ran — a fallback would still produce the
+right view, so the correctness check alone could not fail on a silent
+regression.
 
 ### Python scripts (`test/python/`)
 
@@ -123,10 +128,19 @@ add — an open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha
 (CHANGELOG, "DuckDB 2.0 alpha issues").
 
 `test_trigger_source.py` is the one that has to run here rather than in ctest:
-it checks the trigger delta source inside an **unpatched** wheel straight from
-PyPI, which is the whole claim of that source and something no in-tree binary
-can demonstrate. It re-executes itself with `DBSP_DELTA_SOURCE=trigger` if the
-variable is not already set, because the mode is read once at extension load.
+it checks the delta source inside a wheel straight from PyPI, which is the
+whole claim of that source and something no in-tree binary can demonstrate. It
+also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
+suffice) and that an attached catalog holding a triggered table still detaches.
+
+**Known reds, measured 2026-09-03 on `v2.0.0-alpha39998`:**
+
+- `test_mv_tables.py` — `disable must stop mirroring`. Pre-existing; unrelated
+  to the delta source.
+- `test_nth_value_frames.py`, `test_self_join_case.py`, `test_view_state.py`
+  print `PASS` and then exit 139. That is the alpha's interpreter-exit SIGSEGV
+  (CHANGELOG, "DuckDB 2.0 alpha issues"); which scripts hit it varies run to
+  run, and the fix is for the script to close its connection.
 
 Benchmarks and the soak test build alongside but are not part of ctest:
 

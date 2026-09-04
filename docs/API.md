@@ -690,47 +690,28 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 Toggle automatic change capture — **ON by default**: views update on
 every transaction commit without calling `dbsp_sync`.
 
-Most plain SQL writes commit in **O(delta)** via captured deltas:
+Every write to a tracked table commits in **O(delta)**: `dbsp_track` puts
+statement-level `AFTER` triggers on the table, and their bodies hand the exact
+old and new row images to the extension as the statement runs. That covers
+INSERT (`VALUES`, `SELECT`, `COPY FROM`, the C++ `Appender`), UPDATE, DELETE
+and TRUNCATE, whatever the predicate — including shapes nothing could predict:
+`UPDATE ... FROM`, volatile expressions, prepared parameters, subqueries that
+read this transaction's own uncommitted writes, indexed-column UPDATEs, and
+repeated writes to one table in a transaction.
 
-- **INSERT** — explicit transactions containing only INSERTs (G2,
-  captured from transaction-local storage), and autocommit INSERTs from a
-  VALUES list or a deterministic SELECT (evaluated with the INSERT's own
-  casts; partial column lists take their declared DEFAULTs; ~1.0 ms at
-  1M rows). SELECT sources must be repeatable: no LIMIT/SAMPLE, no table
-  functions, no window functions, no CTEs.
-- **Upserts** (`INSERT ... ON CONFLICT (cols) DO UPDATE SET
-  excluded.-qualified / DO NOTHING`) — captured via a LEFT JOIN probe of
-  committed state; unqualified target columns in SET, conditional
-  `DO ... WHERE`, `OR REPLACE`, and implicit conflict targets fall back.
-- **UPDATE / DELETE** — explicit-transaction *and* autocommit statements
-  (write capture: one internal SELECT reads the old images and computes
-  the new ones before the statement runs; a commit guard — interleaved-
-  commit check, signed COUNT(*), rowid re-verification — validates the
-  captured delta against committed storage). Subquery predicates and
-  `DELETE ... USING` (rewritten to a correlated EXISTS probe) capture
-  too, when the statement sees pure committed state: autocommit, or an
-  explicit transaction before its first write. A single-row UPDATE on a
-  1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
+Scan-and-diff, scoped to the tables the transaction touched, remains the
+fallback for anything the triggers could not account for: a write matching zero
+rows (the bodies evaluate nothing, so the commit cannot tell that from silence),
+a transaction under which the triggers were installed or regenerated, an
+unparseable or multi-statement string whose targets could not be resolved, and
+a delta that failed to convert. Correctness never depends on a trigger having
+fired.
 
-- **Any other UPDATE or DELETE** — a plan tee (optimizer extension)
-  observes the exact rows the statement processed, covering everything
-  the pre-image capture declines: `UPDATE ... FROM`, prepared
-  parameters, volatile expressions, post-write subqueries, `USING` over
-  transaction-local state, indexed-column UPDATEs, repeated writes to
-  one table in a transaction.
-
-Everything else uses scan-and-diff scoped to the tables the transaction
-touched: multi-match `UPDATE ... FROM` (two new images for one row —
-ambiguous, the tee detects it and steps aside), CTEs/`RETURNING` on
-non-teeable shapes,
-non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
-or LIST-typed columns, multi-statement strings, and any
-transaction that writes the same table twice. If any
-statement in a transaction is un-capturable, the whole transaction falls
-back — captured and scanned deltas never mix for one commit, and guard
-failures fall back loudly (`capture_guard_fallbacks` counter).
-Correctness never depends on capture; the design is in
-`docs/DESIGN_WRITE_CAPTURE.md`.
+Tracking a table also **costs** it: on a table carrying triggers the engine
+refuses `MERGE INTO`, `INSERT ... ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`,
+and every `ALTER TABLE` form except `ADD COLUMN`; the database must be at
+storage version `v2.0.0` or higher. The full list, with the engine's own error
+messages, is in `docs/DESIGN_TRIGGER_SOURCE.md`.
 
 Turn auto-sync off for bulk loads (each autocommit INSERT pays a scoped
 scan) and run one `dbsp_sync()` afterwards.
@@ -833,13 +814,20 @@ serves a workload:
 
 ```sql
 SELECT * FROM dbsp_stats();
--- metric                  | value
--- captured_delta_syncs    | 1042   -- O(Δ) captured applies (per table)
--- scan_syncs              | 3      -- scan-and-diff fallbacks
--- capture_guard_fallbacks | 0      -- guard-rejected captures (loud)
--- commit_seq              | 1045   -- monotonic baseline mutations
--- tracked_tables          | 4
+-- metric                | value
+-- captured_delta_syncs  | 1042   -- exact table deltas applied (no scan)
+-- scan_syncs            | 3      -- scan-and-diff fallbacks
+-- commit_seq            | 1045   -- monotonic baseline mutations
+-- tracked_tables        | 4
+-- trigger_syncs         | 1310   -- trigger-body ingest calls served
+-- trigger_rows          | 5218   -- row images they buffered
 ```
+
+`trigger_syncs` is the proof of life: it stays 0 until a generated trigger body
+has actually delivered, so a database whose triggers never fire is
+distinguishable from one with nothing to report. An UPDATE fires ONE trigger
+whose body evaluates the ingest scalar TWICE — the two arms of a UNION ALL over
+the old and new transition tables — so it adds 2.
 
 ### dbsp_parallel(enable)
 
