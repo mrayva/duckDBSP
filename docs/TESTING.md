@@ -90,8 +90,9 @@ connection for a read of a USER table or for DDL declares an explicit
 a `Forbidden` call made while `user_transaction_open(context)` throws an
 `InternalException` naming the site.
 
-**15 declaration sites** carry a policy today — 4 `Forbidden`, 11
-`AllowedInTxn` — plus **6 helpers** that take the CALLER's policy rather than
+The two tables below list every declaration site (the `Forbidden` table has
+five rows; `AllowedInTxn` the rest) — do not trust a quoted count, recount from
+the tree with `grep -rn 'InternalReadPolicy::' include src` — plus **6 helpers** that take the CALLER's policy rather than
 deciding for themselves (`stream_table_rows`, `stream_table_serialized`,
 `live_watermark`, `sync_table_scan_and_consume`, `fold_fresh_baseline`,
 `reconcile_ready_provisional`), and `sync_tables` / `sync_all`, which default to
@@ -127,7 +128,7 @@ later, beside circuit state that is likewise committed-only.
 
 **What the switch cannot catch.** It fires on `user_transaction_open(context)`,
 and the engine clears the transaction context BEFORE running the commit
-callbacks (`duckdb/src/main/transaction_context.cpp:62`), so auto-commit is true
+callbacks (`duckdb/src/transaction/transaction_context.cpp:62`), so auto-commit is true
 inside every commit hook by construction. A violation made from a commit hook is
 therefore structurally invisible to this switch: it bites only on calls made
 DURING a statement. The `Forbidden` markings on the two provisional reconciles

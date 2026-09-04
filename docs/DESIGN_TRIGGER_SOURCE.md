@@ -504,7 +504,7 @@ and the strict switch's structural blindness to commit hooks.
 - **The strict switch cannot see a commit hook.** `DBSP_STRICT_INTERNAL_QUERY=1`
   fires on `user_transaction_open(context)`, and DuckDB clears the transaction
   context BEFORE running its commit callbacks
-  (`duckdb/src/main/transaction_context.cpp:62`), so auto-commit is true inside
+  (`duckdb/src/transaction/transaction_context.cpp:62`), so auto-commit is true inside
   every commit hook by construction. A violation of the internal-connection law
   made from a commit hook is therefore structurally invisible to the switch: it
   bites only on calls made DURING a statement. The `Forbidden` markings on the
