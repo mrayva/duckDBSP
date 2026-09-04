@@ -4239,6 +4239,27 @@ public:
     return it->second.get();
   }
 
+  // Name of a source TABLE this view transitively reads whose baseline has
+  // never been established, or "" when every source is seeded.
+  //
+  // An unseeded baseline is EMPTY because nothing has scanned it yet, not
+  // because the table is empty (TrackedTable::baseline_seeded). A view
+  // replayed over one holds the empty answer: measured, `dbsp_query` returned
+  // NULL where SQL read 10.0, on the connection holding
+  // `BEGIN; dbsp_create_view(...)` open AND on every other connection, until
+  // that transaction ended. The apply path already refuses to apply an exact
+  // delta onto such a baseline; this is what the READ surfaces ask.
+  //
+  // Sources can be other views, so the walk is transitive. A cyclic definition
+  // cannot be created (create_view rejects cycles), but `seen` keeps a
+  // corrupted one from looping.
+  std::string unseeded_source_of_view(const std::string &view_name) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    std::unordered_set<std::string> seen;
+    return unseeded_source_locked(view_name, seen);
+  }
+
   // Scan a view's rows under shared locks: safe against concurrent
   // propagate_changes/create_view, which take view_mutex_ exclusively.
   // Returns false if the view does not exist.
@@ -5689,6 +5710,30 @@ private:
   //
   // Returns false only when a scan that SHOULD have run failed; the caller
   // must not replay an unseeded baseline as though it were table content.
+  // Caller holds struct_mutex_ and view_mutex_ shared. See
+  // unseeded_source_of_view().
+  std::string unseeded_source_locked(const std::string &name,
+                                     std::unordered_set<std::string> &seen) {
+    if (!seen.insert(name).second) {
+      return "";
+    }
+    auto tbl = tracked_tables_.find(name);
+    if (tbl != tracked_tables_.end()) {
+      return tbl->second->baseline_seeded() ? "" : name;
+    }
+    auto vw = views_.find(name);
+    if (vw == views_.end()) {
+      return "";
+    }
+    for (const auto &src : vw->second->source_tables()) {
+      const std::string bad = unseeded_source_locked(src, seen);
+      if (!bad.empty()) {
+        return bad;
+      }
+    }
+    return "";
+  }
+
   bool seed_baseline(duckdb::ClientContext &context,
                      const std::string &table_name) {
     if (std::getenv("DBSP_DEBUG_SEED")) {

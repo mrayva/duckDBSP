@@ -441,6 +441,30 @@ SELECT * FROM dbsp_query('customer_totals');
 - Query is O(result_size), not O(source_size)
 - Column names derived from SQL or auto-generated (col0, col1, ...)
 
+**Refuses on an unseeded baseline.** Creating a view inside an open
+transaction defers the seeding scan of its sources (that scan runs on an
+internal connection and cannot see the transaction's own rows), so between
+`BEGIN; dbsp_create_view(...)` and the end of that transaction the view stands
+on a baseline nothing has scanned. `dbsp_query` and `dbsp_changes` throw there
+rather than serve the empty answer:
+
+```
+Invalid Input Error: dbsp_query('mv'): source table 'db.main.t' has an
+UNSEEDED baseline — its seeding scan was deferred because a transaction was
+open when the view was created, and nothing has scanned the table since.
+Reading now would return the unseeded (empty) answer, not the table's content.
+End that transaction (COMMIT or ROLLBACK), or run dbsp_sync(), and read again.
+```
+
+The refusal fires on every connection of the instance, not only the one
+holding the transaction: the debt is per-connection but the baseline is
+per-instance. It clears when the deferring transaction ends (its COMMIT widens
+itself to a scan-and-diff; its ROLLBACK asks for a rebuild from committed
+storage) or when someone runs `dbsp_sync()`. `dbsp_view_state()` is
+deliberately not gated — it reports row counts as diagnostics, and a
+diagnostic that refuses while the state is broken is useless exactly when it
+is needed.
+
 ---
 
 ### dbsp_changes(view_name)

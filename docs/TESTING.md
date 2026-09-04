@@ -160,9 +160,17 @@ whole claim of that source and something no in-tree binary can demonstrate. It
 also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
 suffice) and that an attached catalog holding a triggered table still detaches.
 
+`test_unseeded_read.py` pins the read surfaces against a baseline nothing has
+scanned. It needs two connections against one database, which is why it lives
+here: connection A holds `BEGIN; dbsp_create_view(...)` open, and `dbsp_query`
+/ `dbsp_changes` must throw on A and on B until that transaction ends. It runs
+both ways out of the window (COMMIT and ROLLBACK) and then compares the view
+against plain SQL through a later edit on each connection, so a baseline short
+by the deferred rows cannot hide as a constant offset.
+
 **Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
 `test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
-to the delta source. 26 of the 27 scripts exit 0.
+to the delta source. 27 of the 28 scripts exit 0.
 
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown

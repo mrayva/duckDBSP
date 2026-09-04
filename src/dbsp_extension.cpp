@@ -478,6 +478,40 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   data.done = true;
 }
 
+// A read surface must not serve a view standing on a baseline nothing has
+// scanned. Seeding is DEFERRED while a user transaction is open — the seeding
+// scan runs on an internal connection and cannot see that transaction's own
+// rows — so between `BEGIN; dbsp_create_view(...)` and that transaction's end
+// the view holds the empty answer. Measured before this gate: `dbsp_query`
+// returned NULL where plain SQL read 10.0, on the deferring connection and on
+// every other connection of the instance, on :memory: and on a file.
+//
+// It REFUSES rather than reconciling. Reconciling here would mean scanning the
+// table on an internal connection while the reader's own transaction is open,
+// which is exactly the read that produced the empty baseline in the first
+// place; and on the deferring connection that transaction is open by
+// construction. The debt is paid where it can be: at the deferring
+// transaction's COMMIT (which widens itself to a scan-and-diff), by an
+// explicit `dbsp_sync()`, or by a ROLLBACK's view rebuild.
+//
+// `dbsp_view_state` is deliberately NOT gated: it reports row counts as
+// DIAGNOSTICS, and a diagnostic that refuses while the state is broken is
+// useless precisely when it is needed.
+static void RefuseIfUnseeded(dbsp_native::CDCManager &manager,
+                             const string &fn, const string &view_name) {
+  const string bad = manager.unseeded_source_of_view(view_name);
+  if (bad.empty()) {
+    return;
+  }
+  throw InvalidInputException(
+      fn + "('" + view_name + "'): source table '" + bad +
+      "' has an UNSEEDED baseline — its seeding scan was deferred because a "
+      "transaction was open when the view was created, and nothing has "
+      "scanned the table since. Reading now would return the unseeded "
+      "(empty) answer, not the table's content. End that transaction (COMMIT "
+      "or ROLLBACK), or run dbsp_sync(), and read again.");
+}
+
 // ============================================================================
 // dbsp_query - Query a materialized view
 // Usage: SELECT * FROM dbsp_query('view_name');
@@ -505,6 +539,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  RefuseIfUnseeded(manager, "dbsp_query", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -596,6 +631,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  RefuseIfUnseeded(manager, "dbsp_changes", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   bool found = manager.scan_view_delta(

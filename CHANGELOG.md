@@ -1,5 +1,35 @@
 # Changelog
 
+## A read surface refuses an unseeded baseline — 2026-09-04
+
+The apply-path gate below closed the case where a delta is applied onto a
+baseline nothing has scanned. It did not touch a plain read. While connection
+A held `BEGIN; dbsp_create_view('mv', 'SELECT sum(v) FROM t')` open, measured
+on `:memory:` and on a file, on A and on a second connection:
+
+```
+in-window A: dbsp_query('mv')   -> [(None,)]              plain SQL -> 10.0
+in-window B: dbsp_query('mv')   -> [(None,)]              plain SQL -> 10.0
+in-window B: dbsp_changes('mv') -> [(None,-1),(10.0,1)]   -- and query said NULL
+```
+
+`dbsp_query` and `dbsp_changes` now walk the view's sources transitively
+(`CDCManager::unseeded_source_of_view`) and throw when any tracked source has
+`baseline_seeded() == false`, naming the table and how to clear it.
+
+They REFUSE rather than reconcile. Reconciling here means scanning the table on
+an internal connection while the reader's own transaction is open — the exact
+read that produced the empty baseline in the first place — and on the deferring
+connection that transaction is open by construction. The debt is still paid
+where it can be: at the deferring transaction's COMMIT, by `dbsp_sync()`, or by
+a ROLLBACK's rebuild. `dbsp_view_state()` is deliberately NOT gated: it reports
+row counts as diagnostics, and a diagnostic that refuses while the state is
+broken is useless exactly when it is needed.
+
+Pinned by `test/python/test_unseeded_read.py` (both backends, both connections,
+both ways out of the window, and exactness through a later edit on each
+connection so a constant offset cannot hide).
+
 ## An unseeded baseline is never applied onto, on any connection — 2026-09-04
 
 **Third and last correction to deferred seeding.** The debt recorded by
