@@ -1,10 +1,9 @@
 #pragma once
-// Trigger-fed delta source (spike). A third way to learn what a committing
-// transaction wrote, alongside the SaaS engine hook (dbsp_engine_hook.hpp)
-// and the predictive capture stack (dbsp_write_capture.hpp + dbsp_plan_tee.hpp).
+// Trigger-fed delta source — the ONLY way this extension learns what a
+// committing transaction wrote.
 //
-// The idea: DuckDB 2.0 has statement-level AFTER triggers with transition
-// tables. `dbsp_track(t)` generates three of them on `t`
+// DuckDB 2.0 has statement-level AFTER triggers with transition tables.
+// `dbsp_track(t)` generates three of them on `t`
 //
 //   CREATE OR REPLACE TRIGGER dbsp_trg_<t>_ins AFTER INSERT ON <t>
 //     REFERENCING NEW TABLE AS dbsp_new FOR EACH STATEMENT
@@ -14,22 +13,21 @@
 // (plus the DELETE/-1 and the UPDATE one, which carries BOTH images through a
 // UNION ALL). The body is SQL — that is all the engine offers, there is no C++
 // trigger API — so the row images reach C++ through a vectorised, volatile
-// extension scalar that writes them into the SAME per-transaction buffer the
-// engine hook fills (DBSPContextState::engine_buffer_delta), tagged with the
-// canonical catalog.schema.table key and weight (-1 old image, +1 new image).
-// TransactionCommit then applies them through the one existing ingest path, so
-// the CDC core (dbsp_cdc.hpp) is untouched, and TransactionRollback discards
-// them for free.
+// extension scalar that writes them into the committing connection's
+// per-transaction buffer (DBSPContextState::buffer_trigger_delta), tagged with
+// the canonical catalog.schema.table key and weight (-1 old image, +1 new
+// image). TransactionCommit then applies them through the one existing ingest
+// path, so the CDC core (dbsp_cdc.hpp) is untouched, and TransactionRollback
+// discards them for free.
 //
 // Why it matters: trigger expansion is binder-level, and in 2.0 even the
 // Appender goes through the binder (Appender::FlushInternal runs an
 // INSERT ... SELECT). So this source needs NO patched engine — it is exact
-// deltas on a STOCK DuckDB. What it costs is `MERGE INTO`, which the engine
-// rejects outright on any table carrying a trigger.
+// deltas on a STOCK DuckDB. What it costs is the write forms the engine
+// refuses on a table carrying a trigger: MERGE INTO, ON CONFLICT DO UPDATE /
+// INSERT OR REPLACE, and every ALTER TABLE except ADD COLUMN.
 //
-// Mode is chosen by the DBSP_DELTA_SOURCE environment variable, read once at
-// extension load: `trigger` | `hook` | `capture`; unset keeps today's
-// behaviour (hook if the build and engine have it, capture otherwise).
+// There is no mode switch. Triggers are the only delta source.
 //
 // See docs/DESIGN_TRIGGER_SOURCE.md.
 
@@ -37,17 +35,17 @@
 #include "dbsp_qualified_name.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <functional>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -58,48 +56,11 @@
 
 namespace dbsp_native {
 
-// ---------------------------------------------------------------------------
-// Mode switch
-// ---------------------------------------------------------------------------
-
-enum class DeltaSource { DEFAULT, HOOK, CAPTURE, TRIGGER };
-
-// Read ONCE, at first use. The benchmark host (NumPad) cannot run SQL before
-// its own code opens the database, so an environment variable — not a SET — is
-// the load-bearing switch. `dbsp_stats()` reports the resulting mode so it is
-// verifiable from the host.
-inline DeltaSource delta_source() {
-  static const DeltaSource mode = [] {
-    const char *v = std::getenv("DBSP_DELTA_SOURCE");
-    if (!v || !*v) {
-      return DeltaSource::DEFAULT;
-    }
-    if (std::strcmp(v, "trigger") == 0) {
-      return DeltaSource::TRIGGER;
-    }
-    if (std::strcmp(v, "hook") == 0) {
-      return DeltaSource::HOOK;
-    }
-    if (std::strcmp(v, "capture") == 0) {
-      return DeltaSource::CAPTURE;
-    }
-    // Fail loud rather than silently running a mode the caller did not ask
-    // for: a typo here would otherwise be invisible in a benchmark.
-    std::cerr << "DBSP: unknown DBSP_DELTA_SOURCE='" << v
-              << "' (expected trigger|hook|capture) — using the default\n";
-    return DeltaSource::DEFAULT;
-  }();
-  return mode;
-}
-
-inline bool trigger_source_enabled() {
-  return delta_source() == DeltaSource::TRIGGER;
-}
-
-// PROOF OF LIFE, the same contract the engine hook keeps: the flag that
-// disarms the capture stack flips only when a trigger body has actually
-// delivered rows, never at install time. A trigger that never fires leaves
-// the capture stack armed instead of silently dropping every commit.
+// PROOF OF LIFE: this flag flips only when a trigger body has actually
+// DELIVERED rows, never at install time. Until then the commit path keeps its
+// pessimistic net — a transaction it cannot account for is reconciled by scan
+// rather than assumed empty. Triggers that exist but never fire therefore cost
+// scans, not silent staleness.
 inline std::atomic<bool> &trigger_source_flag() {
   static std::atomic<bool> flag{false};
   return flag;
@@ -120,10 +81,9 @@ inline TriggerSourceStats &trigger_source_stats() {
 
 // Cheap process-wide gate for the sink drain, so the common commit path never
 // touches the per-database map (see maybe_drain_trigger_sinks). Counts
-// COMMITS, not trigger firings: a database created in trigger mode keeps its
-// trigger bodies when reopened in any other mode, and those bodies keep
-// writing one sink row per statement even though the ingest scalar now
-// refuses to deliver. Gating the drain on the MODE left that growth unbounded.
+// COMMITS, not trigger firings: the bodies write one sink row per statement
+// whether or not this process has installed anything, so tying the drain to
+// what this process installed left that growth unreclaimed.
 inline std::atomic<uint64_t> &trigger_commits_total() {
   static std::atomic<uint64_t> n{0};
   return n;
@@ -148,7 +108,7 @@ inline uint64_t trigger_sink_drain_interval() {
 // Row images: chunk columns [first_col, end) -> signed Z-set
 // ---------------------------------------------------------------------------
 
-// Vectorised, mirroring engine_cdc_to_zset (dbsp_engine_hook.hpp): read typed
+// Vectorised, on the stream_table_rows idiom (dbsp_cdc.hpp): read typed
 // vector data directly for the common types instead of boxing every cell, and
 // pre-seed each row's hash from the vectorised chunk_row_hashes over EXACTLY
 // the row columns. Hashing the whole args chunk instead would fold the key and
@@ -261,7 +221,6 @@ struct TriggerInstallState {
   // uncommitted catalog changes of its own. That second property is what
   // makes an in-flight `ALTER TABLE ... ADD COLUMN` visible.
   std::unordered_map<std::string, idx_t> catalog_versions;
-  std::atomic<uint64_t> firings_since_drain{0};
   // Force the next sweep to do the full reconcile. CLEARED ONLY ON SUCCESS —
   // an earlier version cleared it up front, so any throw (or a deferral)
   // disarmed the one thing that would have retried, and stale bodies stood
@@ -317,31 +276,39 @@ inline std::string trigger_quote_ident(const std::string &name) {
   return out;
 }
 
-// Deterministic, collision-free trigger name for one table/op. Tracked table
-// names are usually plain identifiers (dbsp_track validates its argument), but
-// view-source auto-tracking can reach a quoted name — those get sanitised and
-// disambiguated by a hash of the original so two odd names cannot collide.
-inline std::string trigger_name_for(const std::string &table, const char *op) {
+// Deterministic trigger name for one table/op, carrying a hash of the table
+// key AND the column fingerprint the body was generated from.
+//
+// The fingerprint is IN THE NAME on purpose: it makes the catalog, not this
+// process's memory, the record of what is installed. A fresh process (or a
+// reopened database) can then see "these exact bodies are already here" from
+// `duckdb_triggers()` alone, instead of re-issuing CREATE OR REPLACE and
+// declaring the current transaction untrusted. Measured before that: the first
+// write after every reopen discarded its exact delta and ran a full
+// scan-and-diff of every tracked table.
+//
+// It also makes a stale body impossible to mistake for a current one: a
+// changed column list produces a different name, so the check is an existence
+// test rather than a text comparison against the engine's re-rendered SQL.
+inline std::string trigger_name_for(const std::string &table,
+                                    const std::string &fingerprint,
+                                    const char *op) {
   std::string sanitized;
-  bool changed = false;
   for (char c : table) {
-    if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
-      sanitized += c;
-    } else {
-      sanitized += '_';
-      changed = true;
-    }
+    sanitized += (std::isalnum(static_cast<unsigned char>(c)) || c == '_')
+                     ? c
+                     : '_';
   }
-  std::string name = "dbsp_trg_" + sanitized;
-  if (changed) {
-    char buf[20];
-    snprintf(buf, sizeof(buf), "_%08llx",
-             static_cast<unsigned long long>(std::hash<std::string>{}(table) &
-                                             0xffffffffULL));
-    name += buf;
-  }
-  return name + "_" + op;
+  char buf[24];
+  snprintf(buf, sizeof(buf), "_%08llx",
+           static_cast<unsigned long long>(
+               std::hash<std::string>{}(table + "|" + fingerprint) &
+               0xffffffffULL));
+  return "dbsp_trg_" + sanitized + buf + "_" + op;
 }
+
+// Every DBSP trigger name starts with this, whatever the table or fingerprint.
+inline const char *trigger_name_prefix() { return "dbsp_trg_"; }
 
 // catalog.schema.table -> the three parts. Keys are produced by
 // canonical_table_key, so exactly two dots separate three non-empty parts.
@@ -386,7 +353,8 @@ inline std::string ingest_call(const std::string &key, int weight,
 }
 
 inline std::vector<std::string> trigger_ddl_for(const std::string &key,
-                                                const TableSchema &schema) {
+                                                const TableSchema &schema,
+                                                const std::string &fp) {
   std::string catalog, schema_name, table;
   if (!split_table_key(key, catalog, schema_name, table)) {
     return {};
@@ -394,13 +362,13 @@ inline std::vector<std::string> trigger_ddl_for(const std::string &key,
   const std::string qualified = quote_table_key(key);
   const std::string sink = sink_name_for(catalog, schema_name);
   std::vector<std::string> ddl;
-  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, "ins") +
+  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, fp, "ins") +
                 " AFTER INSERT ON " + qualified +
                 " REFERENCING NEW TABLE AS dbsp_new FOR EACH STATEMENT"
                 " INSERT INTO " +
                 sink + " SELECT max(" + ingest_call(key, 1, schema) +
                 ") FROM dbsp_new");
-  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, "del") +
+  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, fp, "del") +
                 " AFTER DELETE ON " + qualified +
                 " REFERENCING OLD TABLE AS dbsp_old FOR EACH STATEMENT"
                 " INSERT INTO " +
@@ -408,7 +376,7 @@ inline std::vector<std::string> trigger_ddl_for(const std::string &key,
                 ") FROM dbsp_old");
   // Both images in ONE body: the Z-set wants the old row at -1 and the new one
   // at +1 independently, so no join between the transition tables is needed.
-  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, "upd") +
+  ddl.push_back("CREATE OR REPLACE TRIGGER " + trigger_name_for(table, fp, "upd") +
                 " AFTER UPDATE ON " + qualified +
                 " REFERENCING OLD TABLE AS dbsp_old NEW TABLE AS dbsp_new"
                 " FOR EACH STATEMENT INSERT INTO " +
@@ -419,15 +387,17 @@ inline std::vector<std::string> trigger_ddl_for(const std::string &key,
   return ddl;
 }
 
-inline std::vector<std::string> trigger_drop_ddl_for(const std::string &key) {
-  std::string catalog, schema_name, table;
-  if (!split_table_key(key, catalog, schema_name, table)) {
-    return {};
-  }
+// Drop by NAME: the caller reads the live names off duckdb_triggers(), because
+// a body generated under an older fingerprint carries an older name and could
+// not be reconstructed from the table's current columns.
+inline std::vector<std::string>
+trigger_drop_ddl_for(const std::string &key,
+                     const std::vector<std::string> &names) {
   const std::string qualified = quote_table_key(key);
   std::vector<std::string> ddl;
-  for (const char *op : {"ins", "del", "upd"}) {
-    ddl.push_back("DROP TRIGGER IF EXISTS " + trigger_name_for(table, op) +
+  ddl.reserve(names.size());
+  for (const auto &name : names) {
+    ddl.push_back("DROP TRIGGER IF EXISTS " + trigger_quote_ident(name) +
                   " ON " + qualified);
   }
   return ddl;
@@ -470,13 +440,82 @@ inline std::string schema_fingerprint(const TableSchema &schema) {
   return fp;
 }
 
-/// Arm a full catalog reconcile on this database's next statement.
-inline void request_trigger_recheck(
-    const duckdb::shared_ptr<duckdb::DatabaseInstance> &db) {
-  if (!trigger_source_enabled()) {
-    return;
+/// Every DBSP trigger currently in the catalog, as
+/// "catalog.schema.table" -> [trigger names].
+///
+/// Read on an internal connection, which is safe here in a way that DDL is
+/// not: this is a plain READ, so it takes its own snapshot instead of trying
+/// to see (or fight with) the user's uncommitted catalog changes. It is paid
+/// only when the process's own install record disagrees with the tracked set —
+/// once per database in the steady state.
+///
+/// duckdb_triggers() is the route because trigger entries are not reachable
+/// through Catalog::GetEntry: the generic entry lookup returns nothing for
+/// CatalogType::TRIGGER_ENTRY even when the trigger is right there in
+/// duckdb_triggers() (measured on v2.0.0-alpha39998).
+inline std::unordered_map<std::string, std::vector<std::string>>
+read_dbsp_triggers(duckdb::Connection &con) {
+  std::unordered_map<std::string, std::vector<std::string>> out;
+  auto r = con.Query(
+      "SELECT database_name, schema_name, table_name, trigger_name "
+      "FROM duckdb_triggers() "
+      "WHERE trigger_name LIKE 'dbsp\\_trg\\_%' ESCAPE '\\'");
+  if (r->HasError()) {
+    throw duckdb::InvalidInputException(
+        "DBSP trigger source: could not read duckdb_triggers(): %s",
+        r->GetError());
   }
-  trigger_install_state(db).recheck.store(true, std::memory_order_relaxed);
+  for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
+    out[r->GetValue(0, i).ToString() + "." + r->GetValue(1, i).ToString() +
+        "." + r->GetValue(2, i).ToString()]
+        .push_back(r->GetValue(3, i).ToString());
+  }
+  return out;
+}
+
+/// Are the three bodies for `key` at column fingerprint `fp` already present?
+/// The fingerprint is part of the trigger NAME (trigger_name_for), so presence
+/// alone proves the bodies match the table's current columns — no comparison
+/// against the engine's re-rendered trigger SQL, which normalises quoting and
+/// clause order and could not be compared reliably.
+inline bool triggers_present(
+    const std::unordered_map<std::string, std::vector<std::string>> &live,
+    const std::string &key, const std::string &table, const std::string &fp) {
+  auto it = live.find(key);
+  if (it == live.end()) {
+    return false;
+  }
+  for (const char *op : {"ins", "del", "upd"}) {
+    const std::string want = trigger_name_for(table, fp, op);
+    if (std::find(it->second.begin(), it->second.end(), want) ==
+        it->second.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// True for a statement the sweep must keep its hands off entirely.
+///
+/// Reading a catalog's version (catalog_version_of, below) calls
+/// Transaction::Get for that catalog, which JOINS it to the statement's
+/// transaction. `DETACH` refuses to run when the transaction has any
+/// outstanding work on the target database
+/// (duckdb/src/execution/operator/schema/physical_detach.cpp:20-30), so the
+/// sweep's own gate made DETACH impossible for every catalog holding a tracked
+/// table. Measured: `DETACH b` threw "Cannot detach database b because the
+/// current transaction has outstanding work on it - commit or rollback first"
+/// on a connection that had only ever read from b.
+///
+/// A leading-keyword sniff is the right instrument HERE and the wrong one for
+/// detecting DDL: a miss costs that same loud error, never silent staleness.
+/// The sweep is skipped for this one statement and `recheck` still stands.
+inline bool statement_detaches(const std::string &query) {
+  const auto first = query.find_first_not_of(" \t\r\n(");
+  if (first == std::string::npos) {
+    return false;
+  }
+  return duckdb::StringUtil::Lower(query.substr(first, 6)) == "detach";
 }
 
 /// True while the USER holds an explicit transaction open. Autocommit
@@ -495,9 +534,10 @@ inline bool user_transaction_open(duckdb::ClientContext &context) {
          !context.transaction.IsAutoCommit();
 }
 
-/// The catalog's current version, or "unknown" when the catalog does not
-/// support versioning (a non-DuckDB attached catalog). Unknown is treated as
-/// "may have moved", which is the conservative direction.
+/// The catalog's current version, or false when the catalog does not support
+/// versioning (a non-DuckDB attached catalog). A catalog that answers false is
+/// never RECORDED (see the end of install_pending_triggers), so it is skipped
+/// by catalogs_moved rather than fingerprinted per statement.
 inline bool catalog_version_of(duckdb::ClientContext &context,
                                const std::string &catalog_name, idx_t &out) {
   try {
@@ -518,6 +558,13 @@ inline bool catalog_version_of(duckdb::ClientContext &context,
 /// This replaces an earlier leading-keyword sniff of the statement text, which
 /// could not see DDL that did not arrive as text and could not see a
 /// transaction's own uncommitted changes at all.
+///
+/// Only catalogs the last reconcile RECORDED a version for are checked, and a
+/// catalog whose version could not be read is never recorded — so the
+/// "unversioned" branch below is a belt-and-braces guard, not a live path.
+/// Every attached DuckDB file is a DuckCatalog and answers GetCatalogVersion;
+/// a catalog that is not one cannot host the triggers at all, and the install
+/// throws there rather than going quietly stale.
 inline bool catalogs_moved(duckdb::ClientContext &context,
                            TriggerInstallState &st) {
   std::vector<std::string> names;
@@ -563,9 +610,6 @@ enum class ReconcileResult { UNCHANGED, CHANGED, DEFERRED };
 
 inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
                                                 CDCManager &manager) {
-  if (!trigger_source_enabled()) {
-    return ReconcileResult::UNCHANGED;
-  }
   auto &st = trigger_install_state(context.db);
 
   // ---- gate -------------------------------------------------------------
@@ -585,9 +629,11 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   }
 
   // ---- what needs doing, computed WITHOUT SQL ---------------------------
-  // resolve_table_entry is a plain catalog lookup on the CALLER's context, so
-  // it sees exactly what the caller sees — including their own uncommitted
-  // ALTER. No internal connection is opened unless something has to change.
+  // Every lookup below runs on the CALLER's context, so it sees exactly what
+  // the caller sees — including their own uncommitted DDL — and opens no
+  // internal connection. That matters twice over: an internal connection
+  // cannot see uncommitted catalog changes at all, and running one while the
+  // user holds a transaction open is what wedged their connection.
   const std::vector<std::string> keys = manager.list_tracked_tables();
   const std::unordered_set<std::string> tracked(keys.begin(), keys.end());
 
@@ -596,6 +642,13 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     TableSchema live;
     std::string fingerprint;
   };
+  struct Candidate {
+    std::string key;
+    std::string table;
+    TableSchema live;
+    std::string fingerprint;
+  };
+  std::vector<Candidate> unproven; // process record disagrees; ask the catalog
   std::vector<Pending> to_install;
   std::vector<std::string> now_missing;
   std::vector<std::string> back_from_missing;
@@ -619,17 +672,44 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       continue;
     }
     const std::string fp = schema_fingerprint(live);
-    bool need;
     {
       std::lock_guard<std::mutex> g(st.mutex);
-      auto it = st.installed.find(key);
-      need = (it == st.installed.end()) || (it->second != fp);
       if (st.missing.count(key)) {
         back_from_missing.push_back(key);
       }
+      auto it = st.installed.find(key);
+      if (it != st.installed.end() && it->second == fp) {
+        continue; // this process installed exactly these bodies
+      }
     }
-    if (need) {
-      to_install.push_back({key, std::move(live), fp});
+    unproven.push_back({key, table, std::move(live), fp});
+  }
+
+  // The CATALOG is the record, not this process's memory. Trigger names carry
+  // the column fingerprint, so "the three names exist" IS "the right bodies
+  // are installed". Before this, a reopened database (empty install record,
+  // bodies already in the catalog) re-issued CREATE OR REPLACE on the first
+  // statement — and because that DDL commits on an internal connection AFTER
+  // the statement took its catalog snapshot, the sweep had to mark the
+  // transaction untrusted, making the FIRST WRITE AFTER EVERY REOPEN a full
+  // scan-and-diff of every tracked table.
+  //
+  // The read is safe where the DDL is not: it takes its own snapshot instead
+  // of trying to see the user's uncommitted catalog changes. It is paid only
+  // when this process's install record disagrees with the tracked set — once
+  // per database in the steady state.
+  if (!unproven.empty()) {
+    InternalQueryGuard guard;
+    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+    const auto live_triggers = read_dbsp_triggers(con);
+    for (auto &c : unproven) {
+      if (triggers_present(live_triggers, c.key, c.table, c.fingerprint)) {
+        std::lock_guard<std::mutex> g(st.mutex);
+        st.installed[c.key] = c.fingerprint;
+        st.missing.erase(c.key);
+        continue;
+      }
+      to_install.push_back({c.key, std::move(c.live), c.fingerprint});
     }
   }
 
@@ -643,29 +723,6 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     }
   }
 
-  // A table whose fingerprint still matches can still have lost its triggers
-  // (DROP TABLE takes them along). That check needs the catalog, so it is only
-  // paid once something else already told us to look.
-  std::vector<Pending> lost;
-  bool have_trigger_catalog = false;
-  std::unordered_set<std::string> live_triggers;
-
-  auto load_trigger_catalog = [&](duckdb::Connection &con) {
-    auto r = con.Query("SELECT database_name, schema_name, trigger_name "
-                       "FROM duckdb_triggers()");
-    if (r->HasError()) {
-      throw duckdb::InvalidInputException(
-          "DBSP trigger source: could not read duckdb_triggers(): %s",
-          r->GetError());
-    }
-    for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
-      live_triggers.insert(r->GetValue(0, i).ToString() + "." +
-                           r->GetValue(1, i).ToString() + "." +
-                           r->GetValue(2, i).ToString());
-    }
-    have_trigger_catalog = true;
-  };
-
   // ---- defer while the user's transaction is open -----------------------
   // Nothing above opened a connection or ran DDL, which is the point: the
   // internal connection cannot see uncommitted catalog changes, so touching it
@@ -676,51 +733,41 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   const bool work_pending =
       !to_install.empty() || !to_drop.empty() || !now_missing.empty();
   if (user_transaction_open(context)) {
-    if (work_pending || armed) {
+    if (work_pending) {
       st.recheck.store(true, std::memory_order_relaxed);
       return ReconcileResult::DEFERRED;
     }
-    return ReconcileResult::UNCHANGED;
+    // Nothing to do — and the bookkeeping above is pure memory, so it is safe
+    // to bank it and stop re-deriving it on every statement of a long
+    // transaction. `armed` alone is not a reason to defer any more.
   }
 
   // ---- act --------------------------------------------------------------
   bool changed = false;
-  {
+  if (!to_install.empty() || !to_drop.empty()) {
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
 
-    if (!to_install.empty() || !to_drop.empty() || armed || count_moved) {
-      load_trigger_catalog(con);
-      for (const auto &key : keys) {
-        std::string catalog, schema_name, table;
-        if (!split_table_key(key, catalog, schema_name, table)) {
-          continue;
-        }
-        bool already = false;
-        for (const auto &p : to_install) {
-          if (p.key == key) {
-            already = true;
-            break;
-          }
-        }
-        if (already) {
-          continue;
-        }
-        bool gone = false;
-        for (const char *op : {"ins", "del", "upd"}) {
-          if (!live_triggers.count(catalog + "." + schema_name + "." +
-                                   trigger_name_for(table, op))) {
-            gone = true;
-            break;
-          }
-        }
-        if (!gone) {
-          continue;
-        }
-        TableSchema live;
-        if (live_table_columns(context, key, live)) {
-          lost.push_back({key, live, schema_fingerprint(live)});
-        }
+    // The DBSP triggers already on the tables we are about to touch. Needed
+    // because a body generated under an OLDER fingerprint carries an older
+    // name: CREATE OR REPLACE would leave it in place, and it would go on
+    // delivering rows of the wrong width alongside the new one.
+    std::unordered_map<std::string, std::vector<std::string>> existing;
+    {
+      auto r = con.Query(
+          "SELECT database_name, schema_name, table_name, trigger_name "
+          "FROM duckdb_triggers() "
+          "WHERE trigger_name LIKE 'dbsp\\_trg\\_%' ESCAPE '\\'");
+      if (r->HasError()) {
+        throw duckdb::InvalidInputException(
+            "DBSP trigger source: could not read duckdb_triggers(): %s",
+            r->GetError());
+      }
+      for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
+        existing[r->GetValue(0, i).ToString() + "." +
+                 r->GetValue(1, i).ToString() + "." +
+                 r->GetValue(2, i).ToString()]
+            .push_back(r->GetValue(3, i).ToString());
       }
     }
 
@@ -737,7 +784,30 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
               r->GetError());
         }
       }
-      for (const auto &sql : trigger_ddl_for(p.key, p.live)) {
+      // Drop every DBSP trigger on this table that is not one of the three we
+      // are about to create — i.e. the bodies of a previous fingerprint.
+      std::unordered_set<std::string> wanted;
+      for (const char *op : {"ins", "del", "upd"}) {
+        wanted.insert(trigger_name_for(table, p.fingerprint, op));
+      }
+      std::vector<std::string> stale;
+      auto it = existing.find(p.key);
+      if (it != existing.end()) {
+        for (const auto &name : it->second) {
+          if (!wanted.count(name)) {
+            stale.push_back(name);
+          }
+        }
+      }
+      for (const auto &sql : trigger_drop_ddl_for(p.key, stale)) {
+        auto r = con.Query(sql);
+        if (r->HasError()) {
+          throw duckdb::InvalidInputException(
+              "DBSP trigger source: could not drop a stale body: %s [%s]",
+              r->GetError(), sql);
+        }
+      }
+      for (const auto &sql : trigger_ddl_for(p.key, p.live, p.fingerprint)) {
         auto r = con.Query(sql);
         if (r->HasError()) {
           throw duckdb::InvalidInputException("DBSP trigger source: %s [%s]",
@@ -754,13 +824,12 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       install_one(p);
       changed = true;
     }
-    for (const auto &p : lost) {
-      install_one(p);
-      changed = true;
-    }
     for (const auto &key : to_drop) {
-      for (const auto &sql : trigger_drop_ddl_for(key)) {
-        con.Query(sql); // best effort: the table itself may already be gone
+      auto it = existing.find(key);
+      if (it != existing.end()) {
+        for (const auto &sql : trigger_drop_ddl_for(key, it->second)) {
+          con.Query(sql); // best effort: the table itself may already be gone
+        }
       }
       std::lock_guard<std::mutex> g(st.mutex);
       st.installed.erase(key);
@@ -800,11 +869,10 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
 // they are drained periodically to keep a long-lived process from growing the
 // sink without bound.
 //
-// Deliberately NOT gated on the mode. Triggers are catalog objects: a database
-// tracked once in trigger mode carries its bodies forever, and those bodies go
-// on writing a sink row per statement in every later mode even though the
-// ingest scalar refuses to deliver from them. Gating on the mode meant that
-// growth was never reclaimed on a non-trigger build.
+// The sinks it drains are the ones the CATALOG reports, not the ones this
+// process installed: triggers are catalog objects, so a database tracked by an
+// earlier process arrives with bodies already writing sink rows, and a drain
+// keyed on this process's own install record would never reclaim those.
 inline void maybe_drain_trigger_sinks(duckdb::ClientContext &context) {
   const uint64_t every = trigger_sink_drain_interval();
   if (trigger_commits_total().fetch_add(1, std::memory_order_relaxed) + 1 <

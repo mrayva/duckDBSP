@@ -1,47 +1,40 @@
 """Trigger delta source on a real Python client, on a STOCK engine.
 
-`DBSP_DELTA_SOURCE=trigger` (docs/DESIGN_TRIGGER_SOURCE.md) makes dbsp_track
-generate statement-level AFTER triggers whose bodies feed the row images to the
-extension. The C++ suite (test/unit/test_trigger_source.cpp) proves the oracle;
-this proves the same thing where it actually has to hold — a loadable extension
-inside an UNPATCHED DuckDB wheel from PyPI, which is the whole point of this
-source. Nothing here can be served by the engine-hook callback, because the
-wheel has no such callback.
+`dbsp_track` generates statement-level AFTER triggers whose bodies feed the row
+images to the extension (docs/DESIGN_TRIGGER_SOURCE.md). The C++ suite
+(test/unit/test_trigger_source.cpp) proves the oracle; this proves the same
+thing where it actually has to hold — a loadable extension inside an UNPATCHED
+DuckDB wheel from PyPI, which is the whole point of this source.
 
 Covered:
-  - dbsp_stats() reports delta_source_mode = 3, so a mis-set variable is loud
-  - the three triggers exist in duckdb_triggers() after tracking
+  - the three triggers exist in duckdb_triggers() after tracking, and the sink
+    table is created in the tracked table's own catalog
   - dbsp_query equals plain SQL after INSERT, UPDATE and DELETE
-  - trigger_syncs / trigger_rows climb while capture_guard_fallbacks does not,
-    and the commits are served by exact deltas rather than scans
+  - trigger_syncs / trigger_rows climb and the commits are served by exact
+    deltas rather than scans
+  - dbsp_stats() carries no retired hook/capture counters
+  - the sink the bodies write into stays bounded (the drain interval is
+    overridden so the bound is observable without 50,000 statements)
   - autopersist close-and-reopen re-installs the triggers (CREATE OR REPLACE
     must not fail on "trigger already exists") and the view stays correct
+  - a catalog holding a tracked, triggered table can still be DETACHed
 
-Run: DBSP_DELTA_SOURCE=trigger python test_trigger_source.py <path-to-ext>
-Without the variable the script sets it itself and re-executes, because the
-mode is read ONCE at extension load and cannot be changed afterwards.
+Run: python test_trigger_source.py <path-to-ext>
 """
 
 import os
 import pathlib
 import signal
-import subprocess
 import sys
 import tempfile
 
-# The child phase below runs with the variable DELIBERATELY unset, so it must
-# be handled before the re-exec that arms trigger mode for everything else.
-CHILD_FLAG = "--default-mode-child"
-IS_CHILD = len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG
+# Read once at first use inside the extension, so it must be set before any
+# connection commits anything.
+os.environ.setdefault("DBSP_TRIGGER_SINK_DRAIN", "10")
 
-if not IS_CHILD and os.environ.get("DBSP_DELTA_SOURCE") != "trigger":
-    os.environ["DBSP_DELTA_SOURCE"] = "trigger"
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+import duckdb  # noqa: E402
 
-import duckdb  # noqa: E402  (must be imported with the variable already set)
-
-EXT = (sys.argv[2] if IS_CHILD else
-       (sys.argv[1] if len(sys.argv) > 1 else "build/dbsp.duckdb_extension"))
+EXT = sys.argv[1] if len(sys.argv) > 1 else "build/dbsp.duckdb_extension"
 TIMEOUT_S = 120
 
 
@@ -64,69 +57,19 @@ def stats(con):
     return dict(con.execute("SELECT * FROM dbsp_stats()").fetchall())
 
 
-# ---- child phase: the same database, opened WITHOUT the variable ------------
-# Triggers are catalog objects and outlive the mode that created them. Opening
-# such a database in any other mode must NOT have the persisted bodies deliver
-# alongside that mode's own source — measured before the guard as
-# `delta_source_mode 0` with `trigger_syncs 3`, i.e. every row counted twice on
-# a hook build.
-if IS_CHILD:
-    db_path = sys.argv[3]
-    conn = connect(db_path)
-    try:
-        s = stats(conn)
-        assert s["delta_source_mode"] != 3, "child still in trigger mode"
-        assert s["trigger_syncs"] == 0, (
-            f"persisted triggers delivered in mode {s['delta_source_mode']}: "
-            f"trigger_syncs={s['trigger_syncs']} — double counting"
-        )
-        conn.execute("INSERT INTO t VALUES (3, 11.0)")
-        s2 = stats(conn)
-        assert s2["trigger_syncs"] == 0, (
-            f"persisted triggers delivered on a write in mode "
-            f"{s2['delta_source_mode']}: trigger_syncs={s2['trigger_syncs']}"
-        )
-        got = conn.execute("SELECT * FROM dbsp_query('tot')").fetchall()[0][0]
-        want = conn.execute("SELECT SUM(v) FROM t").fetchone()[0]
-        assert got == want, f"default-mode view {got} != SQL {want}"
-        print(
-            f"ok: mode {s2['delta_source_mode']} ignored the persisted triggers "
-            f"(trigger_syncs=0) and the view is correct: {got}",
-            flush=True,
-        )
-
-        # The bodies keep writing one sink row per statement even though the
-        # scalar refuses to deliver from them, so the drain must NOT be gated
-        # on the mode. DBSP_TRIGGER_SINK_DRAIN (set by the parent) makes the
-        # bound observable without running fifty thousand statements.
-        for i in range(100):
-            conn.execute(f"INSERT INTO t VALUES ({100 + i}, 1.0)")
-        rows = conn.execute("SELECT count(*) FROM dbsp_trigger_sink").fetchone()[0]
-        interval = int(os.environ.get("DBSP_TRIGGER_SINK_DRAIN", "50000"))
-        assert rows <= 2 * interval, (
-            f"sink grew unbounded in mode {s2['delta_source_mode']}: "
-            f"{rows} rows after 100 statements (drain every {interval})"
-        )
-        got = conn.execute("SELECT * FROM dbsp_query('tot')").fetchall()[0][0]
-        want = conn.execute("SELECT SUM(v) FROM t").fetchone()[0]
-        assert got == want, f"default-mode view {got} != SQL {want}"
-        print(f"ok: sink bounded at {rows} rows after 100 statements "
-              f"(drain every {interval}), view still correct", flush=True)
-    finally:
-        conn.close()
-    print("CHILD PASS", flush=True)
-    sys.exit(0)
-
 # Every connection is closed in a finally: the 2.0 alpha SIGSEGVs at
 # interpreter exit if an instance holding DBSP views is destroyed during static
 # destruction (CHANGELOG, "DuckDB 2.0 alpha issues").
 conn = connect(":memory:")
 try:
     s0 = stats(conn)
-    assert s0["delta_source_mode"] == 3, (
-        f"not in trigger mode: delta_source_mode={s0['delta_source_mode']}"
+    retired = {"delta_source_mode", "capture_guard_fallbacks"} & set(s0)
+    assert not retired, f"retired counters are back in dbsp_stats(): {retired}"
+    assert "trigger_syncs" in s0 and "trigger_rows" in s0, (
+        f"dbsp_stats() lost the trigger counters: {sorted(s0)}"
     )
-    print("ok: delta_source_mode = 3 (trigger)", flush=True)
+    print("ok: dbsp_stats() reports the trigger counters and nothing retired",
+          flush=True)
 
     conn.execute("CREATE TABLE items (id INTEGER, name VARCHAR, price DOUBLE)")
     conn.execute("SELECT * FROM dbsp_track('items')")
@@ -138,18 +81,26 @@ try:
         "SELECT * FROM dbsp_create_view('total', 'SELECT SUM(price) AS s FROM items')"
     )
 
-    triggers = [
+    # Names carry a hash of the table key and the column fingerprint, so they
+    # are matched by shape rather than spelled out.
+    triggers = sorted(
         r[0]
         for r in conn.execute(
-            "SELECT trigger_name FROM duckdb_triggers() ORDER BY 1"
+            "SELECT trigger_name FROM duckdb_triggers()"
         ).fetchall()
-    ]
-    assert triggers == [
-        "dbsp_trg_items_del",
-        "dbsp_trg_items_ins",
-        "dbsp_trg_items_upd",
-    ], f"unexpected triggers: {triggers}"
-    print("ok: three triggers installed on the tracked table", flush=True)
+    )
+    assert len(triggers) == 3 and all(
+        t.startswith("dbsp_trg_items_") for t in triggers
+    ), f"unexpected triggers: {triggers}"
+    assert sorted(t.rsplit("_", 1)[1] for t in triggers) == ["del", "ins", "upd"], (
+        f"unexpected trigger ops: {triggers}"
+    )
+    sinks = conn.execute(
+        "SELECT count(*) FROM duckdb_tables() WHERE table_name = 'dbsp_trigger_sink'"
+    ).fetchone()[0]
+    assert sinks == 1, f"expected one sink table, found {sinks}"
+    print("ok: three triggers installed on the tracked table, sink created",
+          flush=True)
 
     def same_as_sql(step):
         got = conn.execute("SELECT * FROM dbsp_query('total')").fetchall()[0][0]
@@ -172,15 +123,32 @@ try:
     s1 = stats(conn)
     assert s1["trigger_syncs"] > 0, "no trigger body ever delivered"
     assert s1["trigger_rows"] > 0, "no row images buffered"
-    assert s1["capture_guard_fallbacks"] == s0["capture_guard_fallbacks"], (
-        "the capture stack ran too — that is a double-delivery risk"
-    )
     assert s1["captured_delta_syncs"] > 0, "no commit was served by an exact delta"
+    assert s1["scan_syncs"] == s0["scan_syncs"], (
+        f"a commit fell back to scan-and-diff: "
+        f"{s1['scan_syncs']} scans (was {s0['scan_syncs']})"
+    )
     print(
         f"ok: trigger_syncs={s1['trigger_syncs']} rows={s1['trigger_rows']} "
         f"exact_syncs={s1['captured_delta_syncs']} scans={s1['scan_syncs']}",
         flush=True,
     )
+
+    # The bodies write one sink row per statement firing and nothing ever reads
+    # them, so the drain has to keep the sink bounded on a long-lived process.
+    for i in range(100):
+        conn.execute(f"INSERT INTO items VALUES ({100 + i}, 'bulk', 1.0)")
+    rows = conn.execute("SELECT count(*) FROM dbsp_trigger_sink").fetchone()[0]
+    interval = int(os.environ["DBSP_TRIGGER_SINK_DRAIN"])
+    assert rows <= 2 * interval, (
+        f"sink grew unbounded: {rows} rows after 100 statements "
+        f"(drain every {interval})"
+    )
+    got = conn.execute("SELECT * FROM dbsp_query('total')").fetchall()[0][0]
+    want = conn.execute("SELECT SUM(price) FROM items").fetchone()[0]
+    assert got == want, f"after the bulk inserts: view {got} != SQL {want}"
+    print(f"ok: sink bounded at {rows} rows after 100 statements "
+          f"(drain every {interval}), view still correct", flush=True)
 finally:
     conn.close()
 
@@ -202,16 +170,15 @@ with tempfile.TemporaryDirectory() as tmp:
 
     conn = connect(db_path)
     try:
-        triggers = [
+        triggers = sorted(
             r[0]
             for r in conn.execute(
-                "SELECT trigger_name FROM duckdb_triggers() "
-                "WHERE table_name = 't' ORDER BY 1"
+                "SELECT trigger_name FROM duckdb_triggers() WHERE table_name = 't'"
             ).fetchall()
-        ]
-        assert triggers == ["dbsp_trg_t_del", "dbsp_trg_t_ins", "dbsp_trg_t_upd"], (
-            f"triggers did not survive reopen: {triggers}"
         )
+        assert len(triggers) == 3 and all(
+            t.startswith("dbsp_trg_t_") for t in triggers
+        ), f"triggers did not survive reopen: {triggers}"
         conn.execute("INSERT INTO t VALUES (2, 7.0)")
         got = conn.execute("SELECT * FROM dbsp_query('tot')").fetchall()[0][0]
         want = conn.execute("SELECT SUM(v) FROM t").fetchone()[0]
@@ -221,17 +188,34 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         conn.close()
 
-    # Same database, a child interpreter, no DBSP_DELTA_SOURCE at all.
-    child_env = {k: v for k, v in os.environ.items()
-                 if k != "DBSP_DELTA_SOURCE"}
-    child_env["DBSP_TRIGGER_SINK_DRAIN"] = "10"
-    proc = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), CHILD_FLAG, EXT, db_path],
-        env=child_env, capture_output=True, text=True, timeout=TIMEOUT_S,
-    )
-    sys.stdout.write(proc.stdout)
-    if proc.returncode != 0 or "CHILD PASS" not in proc.stdout:
-        sys.stderr.write(proc.stderr)
-        raise AssertionError("default-mode child failed — see output above")
+# ---- a triggered catalog must still be detachable ---------------------------
+# Reading a catalog's version joins it to the statement's transaction, and
+# DETACH refuses to run against a catalog the transaction has touched. Before
+# the sweep learned to keep its hands off a DETACH, this threw
+# "Cannot detach database m because the current transaction has outstanding
+# work on it" on a connection that had only ever read from it.
+with tempfile.TemporaryDirectory() as tmp:
+    model = str(pathlib.Path(tmp) / "model.duckdb")
+    setup = duckdb.connect(model)
+    setup.execute("CREATE TABLE li (k INTEGER, v DOUBLE)")
+    setup.execute("INSERT INTO li SELECT i % 3, i * 1.0 FROM range(6) t(i)")
+    setup.close()
 
+    conn = connect(":memory:")
+    try:
+        conn.execute(f"ATTACH '{model}' AS m (READ_WRITE)")
+        conn.execute(
+            "CREATE MATERIALIZED VIEW m_sum AS SELECT k, SUM(v) AS s FROM m.li GROUP BY k"
+        )
+        conn.execute("INSERT INTO m.li VALUES (0, 50.0)")
+        got = dict(conn.execute("SELECT k, s FROM dbsp_query('m_sum')").fetchall())
+        want = dict(conn.execute("SELECT k, SUM(v) FROM m.li GROUP BY k").fetchall())
+        assert got == want, f"attached-catalog view {got} != SQL {want}"
+        conn.execute("DETACH m")
+        print("ok: an attached catalog with a tracked, triggered table detaches",
+              flush=True)
+    finally:
+        conn.close()
+
+signal.alarm(0)
 print("PASS", flush=True)

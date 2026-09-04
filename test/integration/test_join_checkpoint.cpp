@@ -460,9 +460,8 @@ TEST_CASE("aggregate checkpoint: MIN round-trips through save/restore, "
 // "851ms/58k rows") was every restored row paying Value::Hash()'s lazy
 // per-Value cost (a fresh 1-element Vector + VectorOperations::Hash per
 // column) the first time it entered a hash-keyed structure (aggregate
-// states_, join Index/RowWeights, DuckDBZSet) -- exactly the "~2/3 of
-// ingestion time" dbsp_engine_hook.hpp already documents for the same lazy
-// path elsewhere. BlobReader::hashed_row() pre-seeds the hash cache using
+// states_, join Index/RowWeights, DuckDBZSet) -- the same "~2/3 of ingestion
+// time" that made the delta-ingest paths pre-seed their row hashes. BlobReader::hashed_row() pre-seeds the hash cache using
 // hash_row_fast, which calls the same duckdb::Hash<T> primitives
 // VectorOperations::Hash dispatches to per element, without the temporary
 // Vector. These tests are the correctness guard for that invariant: a

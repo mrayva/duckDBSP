@@ -78,8 +78,6 @@
 #include "dbsp_context_state.hpp"
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
-#include "dbsp_engine_hook.hpp"
-#include "dbsp_plan_tee.hpp"
 #include "dbsp_recovery.hpp"
 #include "dbsp_trigger_source.hpp"
 #include "duckdb/main/connection_manager.hpp"
@@ -152,7 +150,22 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  // Which key this call would ADD, read before the call because track_table is
+  // idempotent. A rollback must only drop tracking intent that this
+  // transaction actually created (see DBSPContextState::TransactionRollback).
+  string newly_tracked = CanonicalTableRef(context, data.table_name);
+  if (newly_tracked.empty() || manager.is_table_tracked(newly_tracked)) {
+    newly_tracked.clear();
+  }
   bool ok = manager.track_table(context, data.table_name);
+
+  if (ok && !newly_tracked.empty()) {
+    auto state = context.registered_state->Get<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+    if (state) {
+      state->note_table_tracked(newly_tracked);
+    }
+  }
 
   if (!ok) {
     std::string formatted_error = manager.last_error();
@@ -1054,30 +1067,21 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->metrics = {
-      // commits served by an exact delta instead of scan-and-diff — one
-      // count per applied table delta. Sources: design-1 probes, the plan
-      // tee, G2 LocalStorage, AND (hook builds) the engine-hook commit
-      // path, so this counter does NOT distinguish hook from capture.
+      // Commits served by an exact trigger-fed delta instead of
+      // scan-and-diff — one count per applied table delta, so a commit
+      // touching two tracked tables adds two.
       {"captured_delta_syncs",
        NumericCast<int64_t>(manager.captured_delta_syncs())},
       // scan-and-diff table scans (the fallback path)
       {"scan_syncs", NumericCast<int64_t>(manager.scan_syncs())},
-      // capture commit-guard rejections (each fell back to a scan)
-      {"capture_guard_fallbacks",
-       NumericCast<int64_t>(manager.capture_guard_fallbacks())},
       // monotonic baseline-mutation counter (conflict detection)
       {"commit_seq", NumericCast<int64_t>(manager.commit_seq())},
       {"tracked_tables",
        NumericCast<int64_t>(manager.list_tracked_tables().size())},
-      // Which delta source this process is running (DBSP_DELTA_SOURCE, read
-      // once at load): 0 default, 1 hook, 2 capture, 3 trigger. The env var
-      // is the switch — a host that cannot run SQL before opening the
-      // database still needs a way to VERIFY which mode it got.
-      {"delta_source_mode",
-       static_cast<int64_t>(dbsp_native::delta_source())},
-      // Trigger source (mode 3 only): trigger-body ingest calls served, and
-      // row images they handed to the per-transaction buffer. Both stay 0 in
-      // every other mode, so a mis-set env var is visible here.
+      // Trigger source: ingest calls the trigger bodies made, and row images
+      // they handed to the per-transaction buffer. Both stay 0 until a body
+      // has actually fired, which is what makes "the triggers are live" a
+      // thing a host can VERIFY rather than assume.
       {"trigger_syncs",
        NumericCast<int64_t>(
            dbsp_native::trigger_source_stats().trigger_syncs.load())},
@@ -1151,8 +1155,8 @@ void DropCascadeScalar(DataChunk &args, ExpressionState &state,
 //
 // It is VOLATILE (never constant-folded or cached) and declares SPECIAL_
 // NULL_HANDLING, because row images are full of NULLs and default handling
-// would skip them. It writes into the SAME per-transaction buffer the engine
-// hook fills, so TransactionCommit applies both by one code path.
+// would skip them. It writes into the committing connection's
+// per-transaction buffer, which TransactionCommit applies in one pass.
 // ============================================================================
 
 static unique_ptr<FunctionData>
@@ -1171,22 +1175,11 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
   result.SetVectorType(VectorType::CONSTANT_VECTOR);
   ConstantVector::GetData<int64_t>(result)[0] = NumericCast<int64_t>(n);
   ConstantVector::SetNull(result, false);
-  // MODE GUARD, and it must come first. Triggers are CATALOG objects: a
-  // database tracked once in trigger mode carries them forever, and reopening
-  // it in any other mode would otherwise have the persisted bodies feed the
-  // buffer alongside whatever source that mode runs — measured as
-  // `delta_source_mode 0` with `trigger_syncs 3`, i.e. every row counted twice
-  // on a hook build. The body still binds and still gets its value back; it
-  // just delivers nothing.
-  if (!dbsp_native::trigger_source_enabled()) {
-    return;
-  }
   if (n == 0 || args.ColumnCount() < 3) {
     return;
   }
-  // DBSP's own helper connections: never self-ingest (same guard the engine
-  // hook keeps). Thread-local, so it only covers work executed on the issuing
-  // thread — and trigger bodies run on WORKER threads, so a multi-chunk body
+  // DBSP's own helper connections: never self-ingest. Thread-local, so it
+  // only covers work executed on the issuing thread — and trigger bodies run on WORKER threads, so a multi-chunk body
   // can have some chunks see depth 0. Dropping those silently would leave a
   // PARTIAL delta; poisoning makes the commit reconcile by scan instead.
   //
@@ -1203,7 +1196,7 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
                   .registered_state->Get<dbsp_native::DBSPContextState>(
                       "dbsp_cdc_state");
     if (st) {
-      st->engine_mark_unknown();
+      st->mark_delta_unknown();
     }
   };
   if (dbsp_native::internal_query_depth > 0) {
@@ -1227,7 +1220,7 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
   const Value key_v = args.data[0].GetValue(0);
   const Value weight_v = args.data[1].GetValue(0);
   if (key_v.IsNull() || weight_v.IsNull()) {
-    ctx_state->engine_mark_unknown();
+    ctx_state->mark_delta_unknown();
     return;
   }
   const string key = key_v.ToString();
@@ -1242,13 +1235,11 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
     auto &stats = dbsp_native::trigger_source_stats();
     stats.trigger_syncs.fetch_add(1, std::memory_order_relaxed);
     stats.trigger_rows.fetch_add(n, std::memory_order_relaxed);
-    ctx_state->engine_buffer_delta(key, std::move(delta));
-    dbsp_native::trigger_install_state(context.db)
-        .firings_since_drain.fetch_add(1, std::memory_order_relaxed);
-    // PROOF OF LIFE: the flag that disarms the capture stack flips only here,
-    // on a DELIVERED ingest — never when the triggers are created. Triggers
-    // that exist but never fire leave the capture stack armed rather than
-    // silently degrading every commit.
+    ctx_state->buffer_trigger_delta(key, std::move(delta));
+    // PROOF OF LIFE: the flag flips only here, on a DELIVERED ingest — never
+    // when the triggers are created. Triggers that exist but never fire leave
+    // the commit path's pessimistic net armed rather than letting it assume an
+    // unaccounted commit wrote nothing.
     if (!dbsp_native::trigger_source_flag().load(std::memory_order_relaxed)) {
       dbsp_native::trigger_source_flag().store(true, std::memory_order_relaxed);
     }
@@ -1256,7 +1247,7 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
     // Conversion failed: the buffered picture is incomplete, so make the
     // commit reconcile by scan rather than apply a partial delta. Never let
     // this escape into the user's statement.
-    ctx_state->engine_mark_unknown();
+    ctx_state->mark_delta_unknown();
   }
 }
 
@@ -2472,16 +2463,6 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
 
-  // D2 plan tee: exact captured deltas for DML shapes the design-1
-  // pre-image SELECT declines (docs/DESIGN_WRITE_CAPTURE.md)
-  dbsp_native::register_plan_tee(config);
-
-  // SaaS-fork engine hook: exact commit deltas straight from the patched
-  // engine (patches/v2.0.0-alpha39998-dbsp-txn-callback.patch). Returns false
-  // when built without DBSP_ENGINE_HOOK; while active, the capture stack
-  // above stays disarmed (dbsp_context_state.hpp gates on the flag).
-  dbsp_native::register_engine_hook(instance);
-
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
                            TrackBind);
@@ -2638,10 +2619,10 @@ static void LoadInternal(ExtensionLoader &loader) {
                      LogicalType::VARCHAR, DropCascadeScalar));
   loader.RegisterFunction(drop_cascade_alias_info);
 
-  // Trigger delta source (DBSP_DELTA_SOURCE=trigger): the SQL-side entry
-  // point the generated trigger bodies call. Registered in every mode so a
-  // database written under trigger mode can still be opened in another mode
-  // without its persisted trigger bodies failing to bind.
+  // Trigger delta source: the SQL-side entry point the generated trigger
+  // bodies call. Triggers are catalog objects that outlive any one process, so
+  // this must exist for every database the extension opens or their persisted
+  // bodies would fail to bind.
   ScalarFunction trigger_ingest_fn(
       "dbsp_trigger_ingest", {LogicalType::VARCHAR, LogicalType::BIGINT},
       LogicalType::BIGINT, TriggerIngestScalar, TriggerIngestBind, nullptr,

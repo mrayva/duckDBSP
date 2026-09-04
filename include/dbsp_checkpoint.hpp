@@ -134,8 +134,8 @@ private:
 // Row hash matching ColumnVec::hash()/fold_vector_hashes bit-for-bit, computed
 // from already-decoded Values without paying Value::Hash()'s cost (a fresh
 // 1-element Vector + VectorOperations::Hash dispatch per column — the "lazy
-// per-Value hashing" dbsp_engine_hook.hpp's own comment calls out as ~2/3 of
-// chunk-ingestion time). Every checkpoint-restored row becomes a hash-map key
+// per-Value hashing" measured at ~2/3 of chunk-ingestion time, which is why
+// the delta-ingest paths pre-seed their row hashes too). Every checkpoint-restored row becomes a hash-map key
 // (aggregate states_, join Index/RowWeights) or a DuckDBZSet entry, so a
 // restore built entirely from `row()` pays that lazy cost once per row on
 // first use — and a checkpointed view with many groups/sink rows spends most

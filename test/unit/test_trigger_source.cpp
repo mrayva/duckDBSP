@@ -1,17 +1,19 @@
 // Differential oracle for the trigger-fed delta source
-// (DBSP_DELTA_SOURCE=trigger, include/dbsp_trigger_source.hpp).
+// (include/dbsp_trigger_source.hpp), the extension's only change-capture
+// mechanism. Views must stay current on a STOCK engine, fed only by the
+// generated statement triggers.
 //
-// This binary is built WITHOUT DBSP_ENGINE_HOOK, so nothing here can be served
-// by the patched engine's commit callback — that is the point. Views must stay
-// current fed only by the generated statement triggers, on a stock engine.
+// The oracle: old images at weight -1, new at +1, update-then-delete of one row
+// appears once in the old image and nowhere in the new, insert-then-delete in
+// one transaction nets to zero, multi-table transactions apply in one pass,
+// rollback discards everything. Every case also cross-checks dbsp_query against
+// plain SQL, because a delta source that is self-consistently wrong would pass
+// a weight assertion.
 //
-// The oracle is the engine-hook one (test/unit/test_engine_hook.cpp,
-// test/integration/test_engine_hook_consumer.cpp): old images at weight -1,
-// new at +1, update-then-delete of one row appears once in the old image and
-// nowhere in the new, insert-then-delete in one transaction nets to zero,
-// multi-table transactions apply in one pass, rollback discards everything.
-// Every case also cross-checks dbsp_query against plain SQL, because a delta
-// source that is self-consistently wrong would pass a weight assertion.
+// It also pins what tracking a table COSTS it: the engine refuses MERGE INTO,
+// ON CONFLICT DO UPDATE / INSERT OR REPLACE, and every ALTER but ADD COLUMN on
+// a table carrying a trigger. Those are product constraints now, so they are
+// asserted rather than discovered.
 #include "../test_helpers.hpp"
 #include "catch.hpp"
 #include "dbsp_trigger_source.hpp"
@@ -23,14 +25,6 @@
 #include <fstream>
 
 using namespace dbsp_test;
-
-// Arm trigger mode before ANY harness runs. dbsp_native::delta_source() caches
-// the environment on first call, which happens when the first harness loads the
-// extension — well after this static initializer.
-static const int g_trigger_mode_armed = [] {
-  setenv("DBSP_DELTA_SOURCE", "trigger", 1);
-  return 1;
-}();
 
 namespace {
 
@@ -61,11 +55,8 @@ int64_t sql_count(DuckDBTestHarness &db, const std::string &sql) {
 
 } // namespace
 
-TEST_CASE("trigger source: mode is armed and triggers get installed",
+TEST_CASE("trigger source: tracking a table installs its triggers",
           "[trigger_source]") {
-  REQUIRE(g_trigger_mode_armed == 1);
-  REQUIRE(dbsp_native::trigger_source_enabled());
-
   DuckDBTestHarness db;
   db.createTable("items", "id INTEGER, name VARCHAR, price DOUBLE", {});
   db.exec("SELECT * FROM dbsp_track('items')");
@@ -109,7 +100,7 @@ TEST_CASE("trigger source: insert/update/delete keep the view current",
   REQUIRE(view_sum(db, "total") == sql_sum(db, "SELECT SUM(price) FROM items"));
 
   // PROOF OF LIFE: these commits were served by trigger bodies, and the flag
-  // that disarms the capture stack flipped as a result.
+  // that lets the commit path trust them flipped as a result.
   REQUIRE(dbsp_native::trigger_source_stats().trigger_syncs.load() >
           syncs_before);
   REQUIRE(dbsp_native::trigger_source_active());
@@ -117,9 +108,9 @@ TEST_CASE("trigger source: insert/update/delete keep the view current",
 
 TEST_CASE("trigger source: one insert counts exactly once (no double count)",
           "[trigger_source]") {
-  // The capture stack and the plan tee must NOT also deliver these rows. A
-  // second delivery would double the sum; the row count alone would not show
-  // it, because the view would still hold one distinct row.
+  // Each firing must deliver its rows exactly ONCE. A second delivery would
+  // double the sum; the row count alone would not show it, because the view
+  // would still hold one distinct row.
   DuckDBTestHarness db;
   db.createTable("nums", "id INTEGER, v DOUBLE", {});
   db.exec("SELECT * FROM dbsp_track('nums')");
@@ -259,9 +250,10 @@ TEST_CASE("trigger source: multi-table one-transaction commit",
 
 TEST_CASE("trigger source: the C++ Appender updates the view",
           "[trigger_source]") {
-  // The whole reason the capture stack exists is write paths the binder never
-  // sees. In 2.0 Appender::FlushInternal runs an INSERT ... SELECT, so the
-  // binder — and therefore the trigger — does see it.
+  // The Appender used to be the write path the binder never saw, which is
+  // what forced every earlier delta source to keep a pessimistic fallback.
+  // In 2.0 Appender::FlushInternal runs an INSERT ... SELECT, so the binder —
+  // and therefore the trigger — does see it.
   DuckDBTestHarness db;
   db.createTable("nums", "id INTEGER, v DOUBLE", {});
   db.exec("SELECT * FROM dbsp_track('nums')");
@@ -640,6 +632,15 @@ TEST_CASE("trigger source: CREATE and track inside one transaction",
     REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 0);
     db.exec("SELECT 42");
 
+    // The TRACKING INTENT must roll back with the table. DBSP's tracked-table
+    // set is process state, not transactional state, so it has to be dropped
+    // by hand (DBSPContextState::TransactionRollback). Left standing,
+    // dbsp_tables() went on listing a table that never committed, and the next
+    // table to take the name `u` — of any shape — would silently be handed
+    // trigger bodies and an empty baseline.
+    REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_tables() "
+                          "WHERE table_name LIKE '%.u'") == 0);
+
     // and the connection is still usable for real work
     db.createTable("w", "id INTEGER, v DOUBLE", {});
     db.exec("SELECT * FROM dbsp_track('w')");
@@ -647,4 +648,80 @@ TEST_CASE("trigger source: CREATE and track inside one transaction",
     db.exec("INSERT INTO w VALUES (1, 4.0)");
     REQUIRE(view_sum(db, "tw") == 4.0);
   }
+}
+
+TEST_CASE("trigger source: a triggered catalog can still be DETACHed",
+          "[trigger_source]") {
+  // Reading a catalog's version (the sweep's gate) calls Transaction::Get for
+  // that catalog, which JOINS it to the statement's transaction — and DETACH
+  // refuses to run when the transaction has outstanding work on the target
+  // (duckdb/src/execution/operator/schema/physical_detach.cpp:20-30).
+  //
+  // Measured before the fix: `DETACH m` threw "Cannot detach database m
+  // because the current transaction has outstanding work on it - commit or
+  // rollback first" on a connection that had only ever read from m. NumPad
+  // attaches a database per model, so this was a hard blocker, not a corner.
+  DuckDBTestHarness db;
+  const std::string path =
+      std::string(std::tmpnam(nullptr)) + "_dbsp_detach.duckdb";
+  {
+    duckdb::DuckDB other(path);
+    duckdb::Connection setup(other);
+    REQUIRE_FALSE(setup.Query("CREATE TABLE li (k INTEGER, v DOUBLE)")->HasError());
+    REQUIRE_FALSE(
+        setup.Query("INSERT INTO li VALUES (0, 1.0), (1, 2.0)")->HasError());
+  }
+  db.exec("ATTACH '" + path + "' AS m (READ_WRITE)");
+  db.exec("SELECT * FROM dbsp_track('m.li')");
+  db.exec("SELECT * FROM dbsp_create_view('m_sum', "
+          "'SELECT SUM(v) AS s FROM m.li')");
+  db.exec("INSERT INTO m.li VALUES (2, 4.0)");
+  REQUIRE(view_sum(db, "m_sum") == sql_sum(db, "SELECT SUM(v) FROM m.li"));
+
+  // The statements above have all run the sweep against catalog m.
+  auto res = db.query("DETACH m");
+  INFO("DETACH: " << (res->HasError() ? res->GetError() : std::string("ok")));
+  REQUIRE_FALSE(res->HasError());
+  std::remove(path.c_str());
+}
+
+TEST_CASE("trigger source: an empty install record re-uses the catalog's bodies",
+          "[trigger_source]") {
+  // A fresh process (or a reopened database) starts with NO per-database
+  // install record while the trigger bodies are already in the catalog, since
+  // triggers are catalog objects that outlive any one process.
+  //
+  // Re-issuing CREATE OR REPLACE there is not free: the new bodies commit on
+  // an internal connection AFTER the current statement took its catalog
+  // snapshot, so the sweep has to mark that transaction untrusted and its
+  // commit reconciles by scanning EVERY tracked table. Doing that on the first
+  // statement after every reopen is what fingerprinted trigger names exist to
+  // avoid — the names encode the column fingerprint, so their presence alone
+  // proves the bodies are current.
+  //
+  // dbsp_forget_triggers() is exactly what a process restart does to that
+  // record, which is what makes this testable in one process.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 5.0)");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+  dbsp_native::dbsp_forget_triggers(
+      static_cast<const void *>(db.conn().context->db.get()));
+
+  auto &ctx = *db.conn().context;
+  dbsp_native::ReconcileResult result =
+      dbsp_native::ReconcileResult::DEFERRED;
+  ctx.RunFunctionInTransaction([&] {
+    result = dbsp_native::install_pending_triggers(
+        ctx, dbsp_native::get_cdc_manager(ctx));
+  });
+  REQUIRE(result == dbsp_native::ReconcileResult::UNCHANGED);
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+  // and the source still works afterwards
+  db.exec("INSERT INTO t VALUES (2, 7.0)");
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
 }

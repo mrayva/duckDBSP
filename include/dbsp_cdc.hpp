@@ -3485,7 +3485,7 @@ public:
 
   // Column types of a tracked table (empty when not tracked). Notify-style
   // callers MUST cast raw values to these before building a delta row:
-  // every other ingestion path (scan, write-capture, engine hook) produces
+  // every other ingestion path (scan, trigger source) produces
   // schema-typed rows, and packed arrangements/join indexes encode by
   // schema type — an untyped literal (5000.0 parses as DECIMAL, not
   // DOUBLE) is unencodable, and even boxed, a differently-typed row would
@@ -4826,8 +4826,8 @@ public:
     return true;
   }
 
-  // Multi-table engine-hook commit: apply EVERY captured table's delta to
-  // its baseline first, then run ONE propagation pass over all of them.
+  // Multi-table commit: apply EVERY reported table's delta to its baseline
+  // first, then run ONE propagation pass over all of them.
   // Calling apply_captured_delta per table stepped the circuit once per
   // table — each pass rewrote every downstream view's single-generation
   // delta buffer (a view reading both tables kept only the LAST table's
@@ -4878,28 +4878,15 @@ public:
     return failed;
   }
 
-  // Number of commits served by captured deltas instead of scan-and-diff
-  // (observable so tests can prove the fast path actually ran)
+  // Number of table deltas applied exactly (trigger-fed) instead of
+  // scan-and-diff (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
 
-  // Monotonic count of baseline mutations; UPDATE/DELETE write-capture
-  // snapshots it at transaction begin and falls back when it moved by
-  // commit time (an interleaved commit may have invalidated the capture's
-  // committed-state read). See docs/DESIGN_WRITE_CAPTURE.md.
+  // Monotonic count of baseline mutations, advanced on every propagated
+  // mutation and on full rebuilds.
   uint64_t commit_seq() const { return commit_seq_; }
   bool dirty_since_save() const { return dirty_since_save_.load(); }
   void mark_saved() { dirty_since_save_ = false; }
-
-  // Write-capture commit-guard failures (each one fell back to
-  // scan-and-diff — loud, countable, never silent)
-  uint64_t capture_guard_fallbacks() const { return capture_guard_fallbacks_; }
-  void note_capture_guard_fallback() { capture_guard_fallbacks_++; }
-
-  // Test knob: force the scan-and-diff path for differential comparison
-  bool write_capture_enabled() const { return write_capture_enabled_; }
-  void set_write_capture_enabled(bool enabled) {
-    write_capture_enabled_ = enabled;
-  }
 
   // Live shared join arrangements (I1); lets tests prove sharing happened
   size_t shared_arrangement_count() const {
@@ -6283,9 +6270,7 @@ private:
   size_t last_skipped_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
   std::atomic<uint64_t> scan_syncs_{0};
-  // Write-capture (UPDATE/DELETE) observability + conflict detection:
-  // commit_seq_ advances on every propagated baseline mutation and on
-  // full rebuilds; guard failures fall back to scan-and-diff, loudly.
+  // Advances on every propagated baseline mutation and on full rebuilds.
   std::atomic<uint64_t> commit_seq_{0};
   // Set by anything that changes persistable state (commits, view DDL);
   // cleared by a successful save_checkpoint. The close-time auto-save
@@ -6327,8 +6312,6 @@ private:
   // tables ADOPTS their tables instead of re-backfilling. Cold-created
   // views (no/declined checkpoint) recompute fresh and must backfill.
   std::unordered_set<std::string> ckpt_restored_views_;
-  std::atomic<uint64_t> capture_guard_fallbacks_{0};
-  std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path
   // check), pending full-rebuild flag (out-of-band change detected against
   // a deferred baseline; consumed by rebuild_all_views), and the

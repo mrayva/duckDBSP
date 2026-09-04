@@ -22,15 +22,6 @@ if(NOT TARGET duckdb_static)
     add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 endif()
 
-# SaaS-fork engine hook consumer (see root CMakeLists.txt). ON requires the
-# patched submodule; OFF = stock-mode build (hook test excluded).
-# Deliberately NOT a global compile definition: the hook-active flag is
-# process-sticky, so defining it everywhere would stop the plan-tee and
-# write-capture tests from exercising the legacy capture paths. Only the
-# dedicated consumer test builds with the define (see below); every other
-# binary keeps testing the stock-mode stack.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" ON)
-
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -77,15 +68,9 @@ add_dbsp_test(set_ops unit/test_set_ops.cpp)
 add_dbsp_test(distinct_on unit/test_distinct_on.cpp)
 add_dbsp_test(recursive unit/test_recursive.cpp)
 add_dbsp_test(auto_cdc unit/test_auto_cdc.cpp)
-add_dbsp_test(write_capture unit/test_write_capture.cpp)
 add_dbsp_test(row_hash unit/test_row_hash.cpp)
 add_dbsp_test(window_incremental unit/test_window_incremental.cpp)
 add_dbsp_test(window_packed unit/test_window_packed.cpp)
-# Needs the patched engine's txn-callback symbols — stock-mode builds exclude
-# it, like the integration consumer test below.
-if(DBSP_ENGINE_HOOK)
-    add_dbsp_test(engine_hook unit/test_engine_hook.cpp)
-endif()
 
 # Integration tests (require DuckDB)
 function(add_dbsp_integration_test TEST_NAME SOURCE)
@@ -103,10 +88,6 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
 endfunction()
 
 add_dbsp_integration_test(extension_basic integration/test_extension_basic.cpp)
-if(DBSP_ENGINE_HOOK)
-    add_dbsp_integration_test(engine_hook_consumer integration/test_engine_hook_consumer.cpp)
-    target_compile_definitions(test_engine_hook_consumer PRIVATE DBSP_ENGINE_HOOK)
-endif()
 add_dbsp_integration_test(planner_frontend integration/test_planner_frontend.cpp)
 add_dbsp_integration_test(extension_cdc integration/test_extension_cdc.cpp)
 add_dbsp_integration_test(cascading_views integration/test_cascading_views.cpp)
@@ -128,13 +109,10 @@ add_dbsp_integration_test(distinct_ddl integration/test_distinct_ddl.cpp)
 add_dbsp_integration_test(set_ops_integration integration/test_set_ops.cpp)
 add_dbsp_integration_test(crash_recovery_phase1 integration/test_crash_recovery_phase1.cpp)
 add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_phase2.cpp)
-add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
+add_dbsp_integration_test(dml_shapes integration/test_dml_shapes.cpp)
 add_dbsp_integration_test(case_batch_eval integration/test_case_batch_eval.cpp)
 add_dbsp_integration_test(engine_assumptions integration/test_engine_assumptions.cpp)
-# Trigger delta source. Deliberately built WITHOUT DBSP_ENGINE_HOOK (the
-# default for this helper): the whole claim is that trigger-fed deltas need no
-# patched engine, so nothing here may be served by the engine callback. It gets
-# its own binary because it arms DBSP_DELTA_SOURCE=trigger process-wide.
+# Trigger delta source — the differential oracle for the one delta source.
 add_dbsp_integration_test(trigger_source unit/test_trigger_source.cpp)
 
 # Benchmarks (throughput printed manually: ./bench_planner_eval)
@@ -153,16 +131,6 @@ target_link_libraries(bench_planner_eval catch2_main duckdb_static
 # ~1s; throughput printing is untimed here and ignored.
 add_test(NAME planner_eval_smoke
          COMMAND bench_planner_eval "[planner_eval],[shard_bench]")
-
-# Write-capture perf gate (run manually: ./bench_write_capture)
-add_executable(bench_write_capture
-    benchmarks/bench_write_capture.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp)
-target_link_libraries(bench_write_capture catch2_main duckdb_static
-                      duckdb_generated_extension_loader
-                      core_functions_extension parquet_extension)
 
 # Window-delta throughput gate (in ctest: window_bench asserts O(affected))
 add_executable(bench_window
