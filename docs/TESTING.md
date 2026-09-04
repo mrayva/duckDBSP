@@ -107,6 +107,12 @@ semantics, window frames, self-joins. Close the connection in any script you
 add — an open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha
 (CHANGELOG, "DuckDB 2.0 alpha issues").
 
+`test_trigger_source.py` is the one that has to run here rather than in ctest:
+it checks the trigger delta source inside an **unpatched** wheel straight from
+PyPI, which is the whole claim of that source and something no in-tree binary
+can demonstrate. It re-executes itself with `DBSP_DELTA_SOURCE=trigger` if the
+variable is not already set, because the mode is read once at extension load.
+
 Benchmarks and the soak test build alongside but are not part of ctest:
 
 ```bash
