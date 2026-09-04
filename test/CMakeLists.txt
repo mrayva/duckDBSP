@@ -131,6 +131,11 @@ add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_
 add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
 add_dbsp_integration_test(case_batch_eval integration/test_case_batch_eval.cpp)
 add_dbsp_integration_test(engine_assumptions integration/test_engine_assumptions.cpp)
+# Trigger delta source. Deliberately built WITHOUT DBSP_ENGINE_HOOK (the
+# default for this helper): the whole claim is that trigger-fed deltas need no
+# patched engine, so nothing here may be served by the engine callback. It gets
+# its own binary because it arms DBSP_DELTA_SOURCE=trigger process-wide.
+add_dbsp_integration_test(trigger_source unit/test_trigger_source.cpp)
 
 # Benchmarks (throughput printed manually: ./bench_planner_eval)
 add_executable(bench_planner_eval

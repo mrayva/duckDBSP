@@ -81,6 +81,7 @@
 #include "dbsp_engine_hook.hpp"
 #include "dbsp_plan_tee.hpp"
 #include "dbsp_recovery.hpp"
+#include "dbsp_trigger_source.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
@@ -1068,6 +1069,21 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
       {"commit_seq", NumericCast<int64_t>(manager.commit_seq())},
       {"tracked_tables",
        NumericCast<int64_t>(manager.list_tracked_tables().size())},
+      // Which delta source this process is running (DBSP_DELTA_SOURCE, read
+      // once at load): 0 default, 1 hook, 2 capture, 3 trigger. The env var
+      // is the switch — a host that cannot run SQL before opening the
+      // database still needs a way to VERIFY which mode it got.
+      {"delta_source_mode",
+       static_cast<int64_t>(dbsp_native::delta_source())},
+      // Trigger source (mode 3 only): trigger-body ingest calls served, and
+      // row images they handed to the per-transaction buffer. Both stay 0 in
+      // every other mode, so a mis-set env var is visible here.
+      {"trigger_syncs",
+       NumericCast<int64_t>(
+           dbsp_native::trigger_source_stats().trigger_syncs.load())},
+      {"trigger_rows",
+       NumericCast<int64_t>(
+           dbsp_native::trigger_source_stats().trigger_rows.load())},
   };
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("metric");
@@ -1121,6 +1137,93 @@ void DropCascadeScalar(DataChunk &args, ExpressionState &state,
         }
         return StringVector::AddString(result, msg);
       });
+}
+
+// ============================================================================
+// dbsp_trigger_ingest - the trigger source's hand-off from SQL to C++
+//
+// Only ever called from a generated trigger body (see
+// dbsp_trigger_source.hpp), shaped
+//     INSERT INTO <sink> SELECT max(dbsp_trigger_ingest('<key>', <w>, <cols>))
+//                        FROM <transition table>
+// so the engine evaluates it once per transition-table row, vectorised, and
+// the surrounding aggregate collapses the whole firing to one sink row.
+//
+// It is VOLATILE (never constant-folded or cached) and declares SPECIAL_
+// NULL_HANDLING, because row images are full of NULLs and default handling
+// would skip them. It writes into the SAME per-transaction buffer the engine
+// hook fills, so TransactionCommit applies both by one code path.
+// ============================================================================
+
+static unique_ptr<FunctionData>
+TriggerIngestBind(BindScalarFunctionInput &input) {
+  // Bind runs single-threaded on the writing connection: the one safe moment
+  // to make sure the state the execution-time call needs actually exists.
+  EnsureContextState(input.GetClientContext());
+  return nullptr;
+}
+
+void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
+                         Vector &result) {
+  const idx_t n = args.size();
+  // One value per row is what the aggregate above consumes; the value itself
+  // is never read, so a constant vector is the cheapest correct answer.
+  result.SetVectorType(VectorType::CONSTANT_VECTOR);
+  ConstantVector::GetData<int64_t>(result)[0] = NumericCast<int64_t>(n);
+  ConstantVector::SetNull(result, false);
+  if (n == 0 || args.ColumnCount() < 3) {
+    return;
+  }
+  // DBSP's own helper connections: never self-ingest (same guard the engine
+  // hook keeps). Note it is thread-local, so it only covers work executed on
+  // the issuing thread — which is all DBSP needs, because DBSP never writes a
+  // tracked user table from an internal connection.
+  if (dbsp_native::internal_query_depth > 0) {
+    return;
+  }
+  if (!state.HasContext()) {
+    return;
+  }
+  auto &context = state.GetContext();
+  auto ctx_state =
+      context.registered_state->Get<dbsp_native::DBSPContextState>(
+          "dbsp_cdc_state");
+  if (!ctx_state) {
+    return;
+  }
+  const Value key_v = args.data[0].GetValue(0);
+  const Value weight_v = args.data[1].GetValue(0);
+  if (key_v.IsNull() || weight_v.IsNull()) {
+    return;
+  }
+  const string key = key_v.ToString();
+  const int64_t weight = weight_v.GetValue<int64_t>();
+  try {
+    dbsp_native::DuckDBZSet delta;
+    {
+      dbsp_native::DbspScopeTimer t_ing("trigger_ingest",
+                                        std::to_string(n) + " rows");
+      dbsp_native::trigger_chunk_to_zset(args, 2, weight, delta);
+    }
+    auto &stats = dbsp_native::trigger_source_stats();
+    stats.trigger_syncs.fetch_add(1, std::memory_order_relaxed);
+    stats.trigger_rows.fetch_add(n, std::memory_order_relaxed);
+    ctx_state->engine_buffer_delta(key, std::move(delta));
+    dbsp_native::trigger_install_state(context.db)
+        .firings_since_drain.fetch_add(1, std::memory_order_relaxed);
+    // PROOF OF LIFE: the flag that disarms the capture stack flips only here,
+    // on a DELIVERED ingest — never when the triggers are created. Triggers
+    // that exist but never fire leave the capture stack armed rather than
+    // silently degrading every commit.
+    if (!dbsp_native::trigger_source_flag().load(std::memory_order_relaxed)) {
+      dbsp_native::trigger_source_flag().store(true, std::memory_order_relaxed);
+    }
+  } catch (...) {
+    // Conversion failed: the buffered picture is incomplete, so make the
+    // commit reconcile by scan rather than apply a partial delta. Never let
+    // this escape into the user's statement.
+    ctx_state->engine_mark_unknown();
+  }
 }
 
 // ============================================================================
@@ -2241,6 +2344,10 @@ public:
     // skip recovery entirely. Dropped here rather than after the take()
     // below so a racing close cannot leave the entry behind.
     dbsp_native::dbsp_forget_recovery(static_cast<const void *>(db));
+    // Same law for the trigger source's "these tables already carry triggers"
+    // set: a stale entry at a recycled address would make a new database skip
+    // installing them and go silently stale.
+    dbsp_native::dbsp_forget_triggers(static_cast<const void *>(db));
     // take() is atomic single-flight: a racing close gets nullptr.
     auto manager = dbsp_native::get_cdc_registry().take(db);
     if (!manager) {
@@ -2496,6 +2603,18 @@ static void LoadInternal(ExtensionLoader &loader) {
       ScalarFunction("dbsp_drop_cascade", {LogicalType::VARCHAR},
                      LogicalType::VARCHAR, DropCascadeScalar));
   loader.RegisterFunction(drop_cascade_alias_info);
+
+  // Trigger delta source (DBSP_DELTA_SOURCE=trigger): the SQL-side entry
+  // point the generated trigger bodies call. Registered in every mode so a
+  // database written under trigger mode can still be opened in another mode
+  // without its persisted trigger bodies failing to bind.
+  ScalarFunction trigger_ingest_fn(
+      "dbsp_trigger_ingest", {LogicalType::VARCHAR, LogicalType::BIGINT},
+      LogicalType::BIGINT, TriggerIngestScalar, TriggerIngestBind, nullptr,
+      nullptr, LogicalType::ANY, FunctionStability::VOLATILE,
+      FunctionNullHandling::SPECIAL_HANDLING);
+  CreateScalarFunctionInfo trigger_ingest_info(trigger_ingest_fn);
+  loader.RegisterFunction(trigger_ingest_info);
 
   // Initialize Parser Extension for SQL syntax support
   auto &extension_manager = instance.GetExtensionManager();

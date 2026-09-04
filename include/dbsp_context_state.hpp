@@ -32,6 +32,7 @@
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_recovery.hpp"
+#include "dbsp_trigger_source.hpp"
 #include "dbsp_write_capture.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -74,6 +75,16 @@ inline std::atomic<bool> &engine_hook_flag() {
 }
 inline bool engine_hook_active() {
   return engine_hook_flag().load(std::memory_order_relaxed);
+}
+
+// True while SOME exact external delta source is proven live — the patched
+// engine's commit callback, or (DBSP_DELTA_SOURCE=trigger) the trigger bodies.
+// Both feed the same per-transaction buffer and both flip their flag only on
+// first DELIVERY, so until one of them has actually produced rows the
+// predictive capture stack stays armed and correctness never depends on the
+// new path.
+inline bool exact_delta_source_active() {
+  return engine_hook_active() || trigger_source_active();
 }
 
 /// Tracks which DatabaseInstances have already run recovery, so it runs
@@ -134,7 +145,7 @@ public:
   bool current_stmt_captured() const { return stmt_.captured; }
 
   void arm_tee(const std::string &table_key) {
-    if (engine_hook_active()) {
+    if (exact_delta_source_active()) {
       return; // engine reports exact deltas: the tee would double-count
     }
     std::lock_guard<std::mutex> guard(tee_.mutex);
@@ -185,6 +196,7 @@ public:
   // TransactionCommit, where running SQL is safe. The caller has already
   // filtered untracked tables.
   void engine_buffer_delta(const std::string &table_key, DuckDBZSet &&delta) {
+    std::lock_guard<std::mutex> guard(engine_buffer_mutex_);
     capture_.engine_fed = true;
     if (delta.empty()) {
       return;
@@ -202,6 +214,7 @@ public:
   // Conversion failed mid-buffer: the engine picture is incomplete, so the
   // commit must reconcile by scan instead of applying a partial delta.
   void engine_mark_unknown() {
+    std::lock_guard<std::mutex> guard(engine_buffer_mutex_);
     capture_.engine_fed = true;
     capture_.unknown_writes = true;
   }
@@ -213,6 +226,19 @@ public:
     }
     maybe_run_recovery(context);
     auto &manager = get_cdc_manager(context);
+    // Trigger source: bring the catalog's DBSP triggers in line with the
+    // tracked-table set. This is the only sweep point, so it covers every way
+    // a table becomes tracked (dbsp_track, view-source auto-tracking, a
+    // checkpoint restore) without enumerating entry points. Cost in the steady
+    // state is one shared-lock size comparison per statement.
+    //
+    // The install commits on its own connection, i.e. AFTER this statement's
+    // transaction took its catalog snapshot — so the triggers cannot fire for
+    // THIS transaction. capture_.triggers_installed makes its commit
+    // reconcile by scan; every transaction after it sees the triggers.
+    if (trigger_source_enabled() && install_pending_triggers(context, manager)) {
+      capture_.triggers_installed = true;
+    }
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
     // reconciliation is impossible incrementally, so views rebuild from
     // committed storage at the next statement boundary (here). Runs even
@@ -275,7 +301,7 @@ public:
     // Autocommit statements already run inside their own transaction here
     // (probed empirically), so every capture buffers in capture_ and
     // applies from the TransactionCommit hook.
-    if (!engine_hook_active() &&
+    if (!exact_delta_source_active() &&
         (stmt_.kind == StmtClass::WRITE_KNOWN ||
          (stmt_.kind == StmtClass::INSERT_OK &&
           context.transaction.IsAutoCommit()))) {
@@ -339,7 +365,7 @@ public:
       // the hooks); failed statements never fold — the transaction is
       // invalidated anyway
       fold_into_txn(context, stmt_);
-      if (!engine_hook_active()) {
+      if (!exact_delta_source_active()) {
         classify_and_capture(context); // G2 appends: engine hook covers these
       }
     } catch (const std::exception &) {
@@ -374,7 +400,14 @@ public:
     struct CheckpointGuard {
       CDCManager &m;
       duckdb::ClientContext &ctx;
-      ~CheckpointGuard() { m.maybe_save_checkpoint(ctx); }
+      ~CheckpointGuard() {
+        m.maybe_save_checkpoint(ctx);
+        // Trigger source housekeeping: the one row each trigger firing writes
+        // into its sink is write-only bookkeeping; drain it periodically so a
+        // long-lived process cannot grow the sink without bound. No-op in
+        // every other mode, and an atomic load below the threshold.
+        maybe_drain_trigger_sinks(ctx);
+      }
     } checkpoint_guard{manager, context};
 
     try {
@@ -384,7 +417,11 @@ public:
       // produces no tuple undo entries, so the engine deltas alone can be
       // an incomplete picture of such a transaction.
       if (capture_.engine_fed) {
-        const bool unknown = capture_.unknown_writes;
+        // triggers_installed: some table became tracked under this very
+        // transaction, so its brand-new triggers never fired for it — the
+        // buffered deltas cover the already-triggered tables only.
+        const bool unknown =
+            capture_.unknown_writes || capture_.triggers_installed;
         auto deltas = std::move(capture_.engine_deltas);
         capture_ = {};
         clear_tee();
@@ -467,7 +504,7 @@ public:
       // WRITE_UNKNOWN, so saw_statements is true and the sync below still
       // runs). Stock builds keep the pessimistic net: Appender writes
       // really are invisible to them.
-      if (engine_hook_active() && !saw_statements &&
+      if (exact_delta_source_active() && !saw_statements &&
           stmt_.kind == StmtClass::NONE) {
         return;
       }
@@ -578,8 +615,17 @@ private:
     // during DuckTransaction::Commit; TransactionCommit applies guard-free)
     std::unordered_map<std::string, DuckDBZSet> engine_deltas;
     bool engine_fed = false;
+    // Trigger source: this transaction had DBSP triggers installed under it
+    // (QueryBegin sweep). The install commits on its own connection AFTER
+    // this transaction took its catalog snapshot, so the triggers cannot fire
+    // for it — its picture is incomplete and commit must reconcile by scan.
+    bool triggers_installed = false;
   };
   TxnCapture capture_;
+  // Trigger bodies run on execution threads, and an aggregate over a large
+  // transition table may be parallel — unlike the engine hook, which delivers
+  // from the single committing thread. Guards engine_deltas only.
+  std::mutex engine_buffer_mutex_;
 
   // Classification of one SQL statement (computed at QueryBegin)
   struct StmtClass {

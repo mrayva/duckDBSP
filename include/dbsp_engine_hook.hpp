@@ -170,6 +170,13 @@ inline void ingest_engine_modifications(duckdb::ClientContext &context, duckdb::
 }
 
 inline bool register_engine_hook(duckdb::DatabaseInstance &db) {
+  // DBSP_DELTA_SOURCE picks the source. In trigger or capture mode the hook
+  // must not ALSO deliver: two sources feeding one per-transaction buffer
+  // would double-count every row.
+  if (delta_source() == DeltaSource::TRIGGER ||
+      delta_source() == DeltaSource::CAPTURE) {
+    return false;
+  }
   duckdb::TransactionModificationCallback cb;
   cb.on_commit = [](duckdb::ClientContext &context, duckdb::DataTableInfo &info,
                     duckdb::TransactionModifications &mods) {
