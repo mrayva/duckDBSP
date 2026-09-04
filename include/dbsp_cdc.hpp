@@ -3616,7 +3616,9 @@ public:
   }
 
   // Sync all tracked tables (sequential or parallel based on use_parallel_sync_)
-  void sync_all(duckdb::ClientContext &context,
+  // Returns sync_tables' verdict: false when at least one table was NOT
+  // reconciled (see there).
+  bool sync_all(duckdb::ClientContext &context,
                 duckdb::MetaTransaction *meta_transaction = nullptr) {
     // Snapshot table names and parallel flag under a shared lock, then release
     // before spawning threads. Holding struct_mutex_ while waiting on futures
@@ -3630,13 +3632,22 @@ public:
         table_names.push_back(entry.first);
       }
     }
-    sync_tables(context, table_names, do_parallel, meta_transaction);
+    return sync_tables(context, table_names, do_parallel, meta_transaction);
   }
 
   // Sync only the named tables (H1 touched-table scoping: the transaction
   // hooks know which tables a transaction wrote, so a commit need not scan
   // every tracked table). Unknown names are skipped.
-  void sync_tables(duckdb::ClientContext &context,
+  //
+  // Returns TRUE only when every named table was actually scanned. A scan can
+  // fail (sync_table_scan_and_consume returns nullopt: the table vanished, a
+  // deferred materialization threw, any exception mid-scan) and a name can be
+  // skipped for want of a table lock; both leave that table's baseline where
+  // it was. This used to be silent, which is fatal for a caller that treats
+  // "the commit ran a reconcile" as "the baseline is now seeded" — it left the
+  // baseline empty forever. Every failure is also reported through
+  // record_error_best_effort.
+  bool sync_tables(duckdb::ClientContext &context,
                    const std::vector<std::string> &table_refs,
                    bool do_parallel,
                    duckdb::MetaTransaction *meta_transaction = nullptr) {
@@ -3656,6 +3667,7 @@ public:
     // LAST table's effects for dbsp_changes consumers, and a join both of
     // whose sides changed in the commit missed its both-shared correction.
     std::vector<std::optional<DuckDBZSet>> deltas(table_names.size());
+    std::vector<std::string> worker_errors;
     if (do_parallel) {
       // TRUE parallelism: each thread acquires its own per-table lock.
       // DB scans for different tables run simultaneously.
@@ -3675,7 +3687,18 @@ public:
         }));
       }
       for (auto &f : futures) {
-        f.wait();
+        // get(), not wait(): the worker's own scan errors are caught inside
+        // sync_table_scan_and_consume, but anything thrown by the lock
+        // acquisition or by std::async itself would otherwise be swallowed
+        // by the future's destructor and the caller would see a clean run.
+        try {
+          f.get();
+        } catch (const std::exception &e) {
+          worker_errors.push_back(std::string("parallel sync worker: ") +
+                                  e.what());
+        } catch (...) {
+          worker_errors.push_back("parallel sync worker: unknown exception");
+        }
       }
     } else {
       // Sequential: hold struct_mutex_ shared for the entire loop so the
@@ -3705,6 +3728,30 @@ public:
         propagate_changes_multi(sources);
       }
     }
+
+    // Report AFTER the locks above are released: record_error_best_effort
+    // takes struct_mutex_ exclusively, and try-locking a shared_mutex this
+    // thread already holds shared is undefined behaviour.
+    // Read once, before the first record_error_best_effort overwrites it with
+    // one of these messages.
+    const std::string scan_error = last_error();
+    bool all_ok = worker_errors.empty();
+    for (const auto &msg : worker_errors) {
+      record_error_best_effort("DBSP: " + msg);
+      std::cerr << "DBSP: " << msg << "\n";
+    }
+    for (size_t i = 0; i < table_names.size(); i++) {
+      if (!deltas[i].has_value()) {
+        all_ok = false;
+        const std::string msg = "DBSP: reconcile scan did not run for '" +
+                                table_names[i] +
+                                "'; its baseline is unchanged. Last error: " +
+                                scan_error;
+        record_error_best_effort(msg);
+        std::cerr << msg << "\n";
+      }
+    }
+    return all_ok;
   }
 
   // Enable/disable baseline spilling (Phase K1). Existing tables migrate
@@ -4880,6 +4927,16 @@ public:
     if (it == tracked_tables_.end()) {
       return false;
     }
+    // An UNSEEDED baseline is empty because nothing has scanned it yet, not
+    // because the table is empty (TrackedTable::baseline_seeded). Applying an
+    // exact delta onto it produces a view holding only the delta — measured
+    // across connections, `view 1.0 / sql 11.0`. The debt belongs to whichever
+    // connection deferred the seed, but the baseline is per-INSTANCE, so any
+    // connection's commit can walk into it. Refuse the fast path and let the
+    // caller reconcile this table by scan at this commit.
+    if (!it->second->baseline_seeded()) {
+      return false;
+    }
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end()) {
       return false;
@@ -4921,6 +4978,13 @@ public:
       }
       auto it = tracked_tables_.find(table_name);
       if (it == tracked_tables_.end()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      // Same rule as apply_captured_delta above: an unseeded baseline is
+      // empty only because nothing has scanned it, and an exact delta applied
+      // onto it makes the view hold the delta alone. Reconcile by scan.
+      if (!it->second->baseline_seeded()) {
         failed.push_back(table_name);
         continue;
       }

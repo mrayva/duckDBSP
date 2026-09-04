@@ -215,6 +215,96 @@ with tempfile.TemporaryDirectory() as tmp:
                     else os.path.join(tmp, f"d_{n}.duckdb"))
             auto_sync_off_case(f"{mode}/auto_sync_off_{repair}", path, repair)
 
+
+# ---------------------------------------------------------------------------
+# Part 3: the deferral window is visible to OTHER connections.
+#
+# The deferred-seeding debt is per-connection; the baseline it refers to is
+# per-INSTANCE. While connection A holds the transaction that deferred the
+# seed, connection B's commits took the trigger-fed fast path and applied their
+# exact deltas onto A's still-EMPTY baseline, so B read the deltas alone —
+# measured `view 1.0 / sql 11.0`, `2.0 / 12.0`, `3.0 / 13.0` over three of B's
+# commits and `100.0 / 110.0` for one. Transient (A's commit healed it) but a
+# wrong answer with no error, which the invariant forbids.
+#
+# File-backed only: DuckDB's `:memory:` is per-connection, so two connections
+# over one instance need a file. C++ sibling: `cdc: an unseeded baseline is
+# never served to another connection`.
+# ---------------------------------------------------------------------------
+
+
+def _deferred_window(a):
+    """Leave `t` tracked, triggers installed, baseline UNSEEDED, on conn a."""
+    a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+    a.execute("INSERT INTO t VALUES (1, 10.0)")
+    a.execute("SELECT * FROM dbsp_auto_sync(false)").fetchall()
+    a.execute("BEGIN TRANSACTION")
+    a.execute("SELECT * FROM dbsp_track('t')").fetchall()
+    a.execute("COMMIT")
+    a.execute("SELECT 1").fetchall()
+    a.execute("SELECT * FROM dbsp_auto_sync(true)").fetchall()
+
+
+def cross_connection_case(label, path, shape):
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        _deferred_window(a)
+        b.execute("SELECT 1").fetchall()
+
+        def agree(who, tag):
+            v = who.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+            s = who.execute("SELECT SUM(v) FROM t").fetchall()
+            assert v == s, f"{label}/{tag}: view {v} != SQL {s}"
+            return v
+
+        a.execute("BEGIN TRANSACTION")
+        if shape == "a_writes_too":
+            a.execute("INSERT INTO t VALUES (2, 3.0)")
+        a.execute(
+            "SELECT * FROM dbsp_create_view('tv','SELECT SUM(v) AS s FROM t')"
+        ).fetchall()
+
+        if shape == "repeated":
+            for i in range(3):
+                b.execute(f"INSERT INTO t VALUES ({20 + i}, 1.0)")
+                agree(b, f"B write {i}")     # 11.0, 12.0, 13.0
+            a.execute("COMMIT")
+        elif shape == "b_in_txn":
+            b.execute("BEGIN TRANSACTION")
+            b.execute("INSERT INTO t VALUES (5, 100.0)")
+            b.execute("COMMIT")
+            agree(b, "B explicit commit")    # 110.0
+            a.execute("COMMIT")
+        elif shape == "rollback":
+            b.execute("INSERT INTO t VALUES (5, 100.0)")
+            agree(b, "B write while A open")  # 110.0
+            a.execute("ROLLBACK")
+            b.execute("SELECT 1").fetchall()
+            agree(b, "after A rollback")
+            b.execute("INSERT INTO t VALUES (6, 1.0)")
+            agree(b, "next B write")
+        else:  # a_writes_too / plain
+            b.execute("INSERT INTO t VALUES (5, 100.0)")
+            agree(b, "B write while A open")  # 110.0
+            a.execute("COMMIT")
+        v = agree(a, "final")
+        a.execute("INSERT INTO t VALUES (7, 4.0)")  # no constant offset
+        agree(a, "after a later edit")
+        print(f"ok: {label} — view matches SQL at every step ({v})", flush=True)
+    finally:
+        a.close()
+        b.close()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    for i, shape in enumerate(("a_writes_too", "plain", "repeated",
+                               "b_in_txn", "rollback")):
+        cross_connection_case(f"cross/{shape}",
+                              os.path.join(tmp, f"x_{i}.duckdb"), shape)
+
 drain = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
 drain.execute(f"LOAD '{EXT}'")
 drain.execute("SELECT * FROM dbsp_wait_teardown()").fetchall()

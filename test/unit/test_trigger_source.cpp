@@ -1185,6 +1185,10 @@ TEST_CASE("cdc: a deferred baseline is reconciled on EVERY commit path",
   }
 
   SECTION("an explicit dbsp_sync repairs it while auto-sync stays off") {
+    // Non-discriminating: this route already worked before the fix, and it
+    // passes with the fix reverted. It pins that the explicit repair keeps
+    // working; the discriminating coverage is the two sections above and
+    // test/python/test_create_view_seeding.py.
     DuckDBTestHarness db;
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     db.exec("SELECT * FROM dbsp_auto_sync(false)");
@@ -1256,4 +1260,192 @@ TEST_CASE("cdc: an uncommitted source table is named as such, not 'missing'",
     db.exec("CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) AS s FROM t");
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
   }
+}
+
+TEST_CASE("cdc: an unseeded baseline is never served to another connection",
+          "[trigger_source][create_view]") {
+  // The deferred-seeding debt is per-CONNECTION, but the baseline it refers to
+  // is per-INSTANCE. While connection A holds the transaction that deferred
+  // the seed, connection B's commits used to take the trigger-fed fast path
+  // and apply their exact deltas onto A's still-EMPTY baseline, so B read the
+  // deltas alone — measured `view 1.0 / sql 11.0`, `2.0 / 12.0`, `3.0 / 13.0`
+  // over three of B's commits, and `100.0 / 110.0` for one. Transient and
+  // self-healing at A's commit, but an incremental view returning a wrong
+  // answer with no error is exactly what the invariant forbids.
+  //
+  // The fix is on the APPLY path, where the per-instance signal already lives:
+  // apply_captured_delta[s] refuse an exact delta onto a table whose
+  // TrackedTable::baseline_seeded() is false and hand it back to the caller,
+  // which reconciles that table by scan at that same commit.
+
+  // Leaves `t` tracked, its triggers installed, and its baseline UNSEEDED.
+  auto tracked_but_unseeded = [](DuckDBTestHarness &db) {
+    db.exec("SELECT * FROM dbsp_auto_sync(false)");
+    db.exec("BEGIN TRANSACTION");
+    db.exec("SELECT * FROM dbsp_track('t')"); // seeding deferred: txn is open
+    db.exec("COMMIT");                        // auto-sync off: no reconcile
+    db.exec("SELECT 1");                      // statement boundary: triggers
+    db.exec("SELECT * FROM dbsp_auto_sync(true)");
+  };
+  // Read a view / plain SQL on a connection that is not the harness's.
+  auto sum_on = [](duckdb::Connection &c, const std::string &sql) -> double {
+    auto r = c.Query(sql);
+    INFO("query failed: " << (r->HasError() ? r->GetError() : std::string()));
+    REQUIRE_FALSE(r->HasError());
+    auto v = r->GetValue(0, 0);
+    return v.IsNull() ? 0.0 : v.GetValue<double>();
+  };
+  // Separate readers, so a failure prints the two NUMBERS (100.0 == 110.0)
+  // rather than a bare `false`.
+  auto b_view = [&](duckdb::Connection &b) {
+    return sum_on(b, "SELECT * FROM dbsp_query('tv')");
+  };
+  auto b_sql = [&](duckdb::Connection &b) {
+    return sum_on(b, "SELECT SUM(v) FROM t");
+  };
+
+  SECTION("B commits inside the window, then A commits") {
+    // Does NOT discriminate in this harness: with the apply-path gate removed
+    // it still passes, because a statement-less commit lands between A's write
+    // and its create and its pessimistic sync_all seeds the table by accident
+    // (DBSP_DEBUG_SYNC: know_all=0 touched=0 stmt_kind=0). The Python client
+    // does not emit that commit and this shape WAS wrong there, so the guard
+    // for it is test/python/test_create_view_seeding.py. Kept because the
+    // accident is not a guarantee.
+    DuckDBTestHarness db; // connection A
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    duckdb::Connection b(db.instance());
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
+    REQUIRE(b_view(b) == b_sql(b)); // 110.0, not 100.0
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t")); // 113
+    db.exec("INSERT INTO t VALUES (7, 4.0)"); // and no constant offset
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("three B commits inside the window") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    duckdb::Connection b(db.instance());
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    for (int i = 0; i < 3; i++) {
+      REQUIRE_FALSE(
+          b.Query("INSERT INTO t VALUES (" + std::to_string(20 + i) + ", 1.0)")
+              ->HasError());
+      REQUIRE(b_view(b) == b_sql(b)); // 11.0, 12.0, 13.0 — never 1.0, 2.0, 3.0
+    }
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("B commits inside the window, then A ROLLS BACK") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    duckdb::Connection b(db.instance());
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
+    REQUIRE(b_view(b) == b_sql(b)); // 110.0, not 100.0
+    db.exec("ROLLBACK");
+    db.exec("SELECT 1"); // statement boundary: the rebuild runs here
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (6, 1.0)")->HasError());
+    REQUIRE(b_view(b) == b_sql(b));
+  }
+
+  SECTION("B is inside its own explicit transaction") {
+    // B's own commit is the one that must reconcile, and B's connection is
+    // NOT the one holding the deferral — the scan it runs at commit time sees
+    // committed state, which is what the reconcile wants.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    duckdb::Connection b(db.instance());
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    REQUIRE_FALSE(b.Query("BEGIN TRANSACTION")->HasError());
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
+    REQUIRE_FALSE(b.Query("COMMIT")->HasError());
+    REQUIRE(b_view(b) == b_sql(b)); // 110.0
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("A abandons its transaction; B keeps writing") {
+    // Also non-discriminating here, for the same reason as the first section;
+    // guarded file-backed in test/python/test_create_view_seeding.py.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    tracked_but_unseeded(db);
+    duckdb::Connection b(db.instance());
+
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("ROLLBACK"); // the harness owns A; abandoning it leaks the txn
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
+    REQUIRE(b_view(b) == b_sql(b));
+    REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (6, 1.0)")->HasError());
+    REQUIRE(b_view(b) == b_sql(b));
+  }
+}
+
+TEST_CASE("cdc: a failed reconcile scan keeps the debt and says so",
+          "[trigger_source][create_view]") {
+  // The deferred-seeding debt used to be cleared at the TOP of
+  // TransactionCommit, before the scan that pays it. That scan can fail —
+  // CDCManager reports it by returning, not by throwing — and the result was a
+  // baseline that stayed empty for the life of the connection with nothing
+  // owed and nothing said. The debt is now settled only by a sync that reports
+  // success, and a reconcile scan that does not run is reported through
+  // record_error_best_effort and on stderr.
+  //
+  // The failure is induced by dropping the source out from under the deferral
+  // inside the same transaction, which is the only way to make the commit's
+  // own scan fail on demand here.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+  db.exec("BEGIN TRANSACTION");
+  db.exec("INSERT INTO t VALUES (2, 3.0)");
+  db.exec("SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("DROP TABLE t");
+  db.exec("COMMIT"); // the reconcile scan fails here
+
+  REQUIRE(db.manager().last_error().find("reconcile scan did not run") !=
+          std::string::npos);
+
+  // The debt is still OWED, and that is observable: a pure read's commit
+  // early-returns ("read-only commit: nothing can have changed") unless the
+  // debt widens it, so scan_syncs moving on a bare SELECT is the proof. It
+  // moves even though the scan fails again — scan_syncs_ is incremented before
+  // the scan throws. With the flag cleared before the scan that pays it, this
+  // is the assertion that goes red.
+  const auto scans = db.manager().scan_syncs();
+  db.exec("SELECT 1");
+  REQUIRE(db.manager().scan_syncs() > scans);
+
+  // The source comes back and the view heals — it is not stuck on the empty
+  // baseline, and it does not carry a constant offset afterwards.
+  db.exec("CREATE TABLE t (id INTEGER, v DOUBLE)");
+  db.exec("INSERT INTO t VALUES (1, 10.0)");
+  db.exec("INSERT INTO t VALUES (2, 3.0)");
+  REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  db.exec("INSERT INTO t VALUES (3, 4.0)");
+  REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
 }

@@ -325,11 +325,27 @@ public:
     // dbsp_sync() that already repaired the baseline costs one extra
     // no-difference scan here. That is the price of not plumbing sync
     // observation back into the connection state; it is paid once.
+    //
+    // The flag is NOT cleared here. A reconcile scan can fail — the source
+    // was dropped, a deferred materialization threw — and CDCManager returns
+    // that as `false` rather than by throwing. Clearing the debt before the
+    // scan that pays it meant one failed scan left the baseline empty for the
+    // life of the connection, with nothing owed and nothing said. settle()
+    // below clears it only on a sync that reports success.
     if (unseeded_baseline_) {
-      unseeded_baseline_ = false;
       capture_.unknown_writes = true;
       capture_.saw_statements = true;
     }
+    // Only a FULL reconcile settles the debt: the flag names no table, so a
+    // scoped sync_tables cannot prove it covered the unseeded one. In
+    // practice a scoped sync never runs while the debt stands, because the
+    // widening above forces unknown_writes and every branch below then takes
+    // sync_all.
+    auto settle = [this](bool sync_ok) {
+      if (sync_ok) {
+        unseeded_baseline_ = false;
+      }
+    };
 
     // Auto-persist checkpoint interval (dbsp_autopersist_interval): fires a
     // piggybacked save_checkpoint() once enough commits have accumulated
@@ -365,7 +381,7 @@ public:
         // undo.
         if (capture_.triggers_installed) {
           capture_ = {};
-          manager.sync_all(context, &transaction);
+          settle(manager.sync_all(context, &transaction));
           return;
         }
         const bool unknown = capture_.unknown_writes;
@@ -379,7 +395,7 @@ public:
         std::vector<std::string> failed =
             manager.apply_captured_deltas(deltas, &context);
         if (unknown) {
-          manager.sync_all(context, &transaction);
+          settle(manager.sync_all(context, &transaction));
         } else if (!failed.empty()) {
           manager.sync_tables(context, failed,
                               manager.parallel_sync_enabled() &&
@@ -438,7 +454,7 @@ public:
       } else {
         // Writes we could not attribute (multi-statement, unparseable SQL):
         // scan everything, as before H1
-        manager.sync_all(context, &transaction);
+        settle(manager.sync_all(context, &transaction));
       }
     } catch (const std::exception &ex) {
       std::cerr << "DBSP Auto-CDC error: " << ex.what() << "\n";
