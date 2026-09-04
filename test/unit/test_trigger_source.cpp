@@ -939,6 +939,18 @@ TEST_CASE("cdc: create_view seeds its source baseline, not an empty one",
   // construction, and the reviewer found the defect on a file-backed database.
 }
 
+// The sweep's own storage-version check — the branch that RECORDS an unusable
+// catalog and lets the defer/throw happen below — has no test here, and
+// cannot have one through any entry point this suite can reach: both routes
+// into the tracked set (dbsp_track and create_view's auto-tracking) now
+// refuse BEFORE tracking, so a tracked table in a pre-v2.0.0 database can
+// only arrive from a
+// checkpoint restore of a database that was tracked under an older build. That
+// path needs a saved _dbsp_views table inside a v1.0.0 file, which this
+// harness cannot produce (ATTACH ... STORAGE_VERSION 'v1.0.0' gives a fresh
+// empty database). The branch is kept because a restore CAN reach it, and it
+// is the reason the sweep records rather than throws.
+
 TEST_CASE("trigger source: create_view over a pre-v2.0.0 source is refused",
           "[trigger_source]") {
   // dbsp_track is not the only way into the tracked set: create_view
@@ -975,4 +987,105 @@ TEST_CASE("trigger source: create_view over a pre-v2.0.0 source is refused",
 
   db.exec("DETACH old");
   std::remove(path.c_str());
+}
+
+TEST_CASE("cdc: a view created inside a transaction sees its uncommitted rows",
+          "[trigger_source][create_view]") {
+  // Seeding a baseline runs a scan on an INTERNAL connection, which by
+  // construction cannot see the user transaction's uncommitted rows. Trusting
+  // it there produced a permanently wrong view — measured before the fix:
+  //   BEGIN; INSERT INTO t VALUES (2, 3.0);
+  //   CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t; COMMIT;
+  //   -> view 3.0 where SQL read 13.0, and 7.0 against 17.0 after the next
+  //      edit: it never healed.
+  // Same law as the trigger sweep's: never read committed-only state on an
+  // internal connection while the user holds a transaction open.
+
+  SECTION("source first tracked INSIDE the transaction, DDL syntax") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec("CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) AS s FROM t");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (3, 4.0)"); // and no constant offset
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("source first tracked INSIDE the transaction, dbsp_create_view") {
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    db.exec("INSERT INTO t VALUES (3, 4.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  }
+
+  SECTION("source tracked BEFORE the transaction stays on the fast path") {
+    // The reconcile is only for a baseline that could not be established.
+    // A source already seeded must not start paying a scan per view.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("SELECT * FROM dbsp_track('t')");
+    db.exec("SELECT * FROM dbsp_sync('t')");
+    const auto scans = db.manager().scan_syncs();
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(db.manager().scan_syncs() == scans);
+  }
+
+  SECTION("ROLLBACK leaves a correct view, not one over an empty baseline") {
+    // There is no commit to reconcile an unseeded baseline, so the rollback
+    // asks for a rebuild from committed storage instead. DBSP's view and
+    // tracked-table state was never transactional — a view created in a
+    // rolled-back transaction has always survived it — so the guarantee here
+    // is that whatever survives READS CORRECTLY, which is the half that was
+    // broken.
+    DuckDBTestHarness db;
+    db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+    db.exec("BEGIN TRANSACTION");
+    db.exec("INSERT INTO t VALUES (2, 3.0)");
+    db.exec(
+        "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+    db.exec("ROLLBACK");
+    db.exec("SELECT 1"); // statement boundary: the rebuild runs here
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(sql_count(db, "SELECT count(*) FROM t") ==
+            1); // the INSERT rolled back
+    db.exec("INSERT INTO t VALUES (9, 5.0)");
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(sql_count(db, "SELECT 1") == 1);
+  }
+}
+
+TEST_CASE(
+    "cdc: a failed seeding scan fails the create, it does not replay empty",
+    "[trigger_source][create_view]") {
+  // The seeding scan can fail (sync_table_internal swallows its exceptions and
+  // returns false). Falling through to the replay would then build the view
+  // over the empty baseline — the exact defect the seeding exists to
+  // prevent — so the create must fail instead. Provoked by dropping the
+  // source out from under a tracked-but-unseeded table.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_tables()") == 1);
+  db.exec("DROP TABLE t");
+
+  auto res = db.query(
+      "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+  REQUIRE(res->HasError());
+  // and no half-built view is left behind claiming an answer
+  REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_views() "
+                        "WHERE view_name = 'tv'") == 0);
+  REQUIRE(sql_count(db, "SELECT 1") == 1);
 }

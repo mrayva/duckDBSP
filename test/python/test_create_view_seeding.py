@@ -47,20 +47,29 @@ def run_case(label, path, prelude, prelude_before_table):
         con.execute(f"LOAD '{EXT}'")
         if prelude and prelude_before_table:
             try:
-                con.execute(prelude)
+                con.execute(prelude).fetchall()
             except Exception:
                 pass  # the failure IS the setup
         con.execute("CREATE TABLE fresh (id INTEGER, v DOUBLE)")
         con.execute("INSERT INTO fresh VALUES (1, 3.0)")
         if prelude and not prelude_before_table:
             try:
-                con.execute(prelude)
+                con.execute(prelude).fetchall()
             except Exception:
                 pass
-        con.execute("SELECT * FROM dbsp_track('fresh')")
+        # .fetchall() is LOAD-BEARING here, not style. A table function that
+        # does its work in the execute callback does NOTHING until its result
+        # is consumed: an unfetched dbsp_track leaves the table UNTRACKED —
+        # measured, dbsp_tables() returns [] without the fetch and
+        # [('…main.t', 2)] with it. Without these fetches every case below
+        # exercised create_view's auto-track route and never the public-track
+        # route this file is named for.
+        con.execute("SELECT * FROM dbsp_track('fresh')").fetchall()
+        tracked = con.execute("SELECT * FROM dbsp_tables()").fetchall()
+        assert tracked, f"{label}: dbsp_track tracked nothing (unfetched?)"
         con.execute(
             "SELECT * FROM dbsp_create_view('tf', 'SELECT SUM(v) AS s FROM fresh')"
-        )
+        ).fetchall()
 
         def both():
             v = con.execute("SELECT * FROM dbsp_query('tf')").fetchall()
