@@ -25,16 +25,23 @@ mode is read ONCE at extension load and cannot be changed afterwards.
 import os
 import pathlib
 import signal
+import subprocess
 import sys
 import tempfile
 
-if os.environ.get("DBSP_DELTA_SOURCE") != "trigger":
+# The child phase below runs with the variable DELIBERATELY unset, so it must
+# be handled before the re-exec that arms trigger mode for everything else.
+CHILD_FLAG = "--default-mode-child"
+IS_CHILD = len(sys.argv) > 1 and sys.argv[1] == CHILD_FLAG
+
+if not IS_CHILD and os.environ.get("DBSP_DELTA_SOURCE") != "trigger":
     os.environ["DBSP_DELTA_SOURCE"] = "trigger"
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 import duckdb  # noqa: E402  (must be imported with the variable already set)
 
-EXT = sys.argv[1] if len(sys.argv) > 1 else "build/dbsp.duckdb_extension"
+EXT = (sys.argv[2] if IS_CHILD else
+       (sys.argv[1] if len(sys.argv) > 1 else "build/dbsp.duckdb_extension"))
 TIMEOUT_S = 120
 
 
@@ -56,6 +63,41 @@ def connect(path):
 def stats(con):
     return dict(con.execute("SELECT * FROM dbsp_stats()").fetchall())
 
+
+# ---- child phase: the same database, opened WITHOUT the variable ------------
+# Triggers are catalog objects and outlive the mode that created them. Opening
+# such a database in any other mode must NOT have the persisted bodies deliver
+# alongside that mode's own source — measured before the guard as
+# `delta_source_mode 0` with `trigger_syncs 3`, i.e. every row counted twice on
+# a hook build.
+if IS_CHILD:
+    db_path = sys.argv[3]
+    conn = connect(db_path)
+    try:
+        s = stats(conn)
+        assert s["delta_source_mode"] != 3, "child still in trigger mode"
+        assert s["trigger_syncs"] == 0, (
+            f"persisted triggers delivered in mode {s['delta_source_mode']}: "
+            f"trigger_syncs={s['trigger_syncs']} — double counting"
+        )
+        conn.execute("INSERT INTO t VALUES (3, 11.0)")
+        s2 = stats(conn)
+        assert s2["trigger_syncs"] == 0, (
+            f"persisted triggers delivered on a write in mode "
+            f"{s2['delta_source_mode']}: trigger_syncs={s2['trigger_syncs']}"
+        )
+        got = conn.execute("SELECT * FROM dbsp_query('tot')").fetchall()[0][0]
+        want = conn.execute("SELECT SUM(v) FROM t").fetchone()[0]
+        assert got == want, f"default-mode view {got} != SQL {want}"
+        print(
+            f"ok: mode {s2['delta_source_mode']} ignored the persisted triggers "
+            f"(trigger_syncs=0) and the view is correct: {got}",
+            flush=True,
+        )
+    finally:
+        conn.close()
+    print("CHILD PASS", flush=True)
+    sys.exit(0)
 
 # Every connection is closed in a finally: the 2.0 alpha SIGSEGVs at
 # interpreter exit if an instance holding DBSP views is destroyed during static
@@ -160,5 +202,17 @@ with tempfile.TemporaryDirectory() as tmp:
               flush=True)
     finally:
         conn.close()
+
+    # Same database, a child interpreter, no DBSP_DELTA_SOURCE at all.
+    child_env = {k: v for k, v in os.environ.items()
+                 if k != "DBSP_DELTA_SOURCE"}
+    proc = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), CHILD_FLAG, EXT, db_path],
+        env=child_env, capture_output=True, text=True, timeout=TIMEOUT_S,
+    )
+    sys.stdout.write(proc.stdout)
+    if proc.returncode != 0 or "CHILD PASS" not in proc.stdout:
+        sys.stderr.write(proc.stderr)
+        raise AssertionError("default-mode child failed — see output above")
 
 print("PASS", flush=True)

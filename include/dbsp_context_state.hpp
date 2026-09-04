@@ -236,8 +236,21 @@ public:
     // transaction took its catalog snapshot — so the triggers cannot fire for
     // THIS transaction. capture_.triggers_installed makes its commit
     // reconcile by scan; every transaction after it sees the triggers.
-    if (trigger_source_enabled() && install_pending_triggers(context, manager)) {
-      capture_.triggers_installed = true;
+    if (trigger_source_enabled()) {
+      if (install_pending_triggers(context, manager)) {
+        capture_.triggers_installed = true;
+      }
+      // Arm the NEXT statement's sweep if this one is DDL. A trigger body
+      // pins its table's column list at generation time, and the tracked-table
+      // COUNT — the cheap steady-state check above — cannot see an
+      // `ALTER TABLE ... ADD COLUMN` (schema moved, count unchanged) or a
+      // `DROP TABLE` + recreate + re-track (triggers gone, count unchanged).
+      // Both were measured producing wrong view answers with no scan to catch
+      // them. Sniffing the leading keyword costs a few bytes and is
+      // deliberately over-inclusive.
+      if (looks_like_ddl(context.GetCurrentQuery())) {
+        request_trigger_recheck(context.db);
+      }
     }
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
     // reconciliation is impossible incrementally, so views rebuild from

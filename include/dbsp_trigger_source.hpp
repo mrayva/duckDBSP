@@ -113,6 +113,13 @@ inline TriggerSourceStats &trigger_source_stats() {
   return stats;
 }
 
+// Cheap process-wide gate for the sink drain, so the common commit path never
+// touches the per-database map (see maybe_drain_trigger_sinks).
+inline std::atomic<uint64_t> &trigger_firings_total() {
+  static std::atomic<uint64_t> n{0};
+  return n;
+}
+
 // ---------------------------------------------------------------------------
 // Row images: chunk columns [first_col, end) -> signed Z-set
 // ---------------------------------------------------------------------------
@@ -141,7 +148,7 @@ inline void trigger_chunk_to_zset(duckdb::DataChunk &args,
   for (duckdb::idx_t c = first_col; c < ncols; c++) {
     cols.push_back(c);
     auto &vec = args.data[c];
-    vec.Flatten(n);
+    vec.Flatten();
     const auto &type = vec.GetType();
     auto &validity = duckdb::FlatVector::Validity(vec);
     switch (type.id()) {
@@ -210,9 +217,20 @@ struct TriggerInstallState {
   // Holding a weak reference makes the check exact instead of hopeful.
   duckdb::weak_ptr<duckdb::DatabaseInstance> owner;
   std::mutex mutex;
-  std::unordered_set<std::string> installed; // canonical table keys
-  std::unordered_set<std::string> sinks;     // quoted sink table names
+  // canonical table key -> the COLUMN FINGERPRINT the installed trigger
+  // bodies encode. Not a bare set: a trigger body pins the column list at
+  // install time, so `ALTER TABLE ... ADD COLUMN` leaves a body that emits
+  // the OLD width while the commit still takes the exact-delta fast path —
+  // measured as a view reading 5.0 where SQL read 12.0. The fingerprint is
+  // what makes that visible.
+  std::unordered_map<std::string, std::string> installed;
+  std::unordered_set<std::string> sinks; // quoted sink table names
   std::atomic<uint64_t> firings_since_drain{0};
+  // Force the next sweep to do the full catalog reconcile rather than trust
+  // the tracked-table count. Armed after any DDL statement, because DDL is
+  // exactly what a count cannot see: ADD COLUMN changes a schema, DROP TABLE
+  // takes the triggers with it, and neither moves the count by one.
+  std::atomic<bool> recheck{true};
 };
 
 inline std::mutex &trigger_states_mutex() {
@@ -380,6 +398,72 @@ inline std::vector<std::string> trigger_drop_ddl_for(const std::string &key) {
 }
 
 // ---------------------------------------------------------------------------
+// Live schema + fingerprint
+// ---------------------------------------------------------------------------
+
+// The columns the table has RIGHT NOW, read from the catalog rather than from
+// the manager's cached TableSchema. The cache is what the trigger bodies were
+// generated from; comparing it against itself would never detect an ALTER.
+inline bool live_table_columns(duckdb::ClientContext &context,
+                               const std::string &key, TableSchema &out) {
+  auto entry = resolve_table_entry(context, key);
+  if (!entry) {
+    return false; // dropped, renamed, or in a detached catalog
+  }
+  out.table_name = key;
+  out.columns.clear();
+  for (auto &col : entry->GetColumns().Logical()) {
+    ColumnInfo info;
+    info.name = col.Name().GetIdentifierName();
+    info.type = col.Type();
+    out.columns.push_back(info);
+  }
+  return !out.columns.empty();
+}
+
+// Name and type of every column, in order — everything a generated body
+// depends on. A change here means the installed bodies are stale.
+inline std::string schema_fingerprint(const TableSchema &schema) {
+  std::string fp;
+  for (const auto &col : schema.columns) {
+    fp += col.name;
+    fp += ':';
+    fp += col.type.ToString();
+    fp += '|';
+  }
+  return fp;
+}
+
+/// Arm a full catalog reconcile on this database's next statement.
+inline void request_trigger_recheck(
+    const duckdb::shared_ptr<duckdb::DatabaseInstance> &db) {
+  if (!trigger_source_enabled()) {
+    return;
+  }
+  trigger_install_state(db).recheck.store(true, std::memory_order_relaxed);
+}
+
+/// Cheap first-keyword test: is this statement DDL, i.e. could it have moved
+/// a tracked table's schema or taken its triggers away? Deliberately
+/// over-inclusive — a false positive costs one catalog reconcile, a false
+/// negative costs silent wrong answers.
+inline bool looks_like_ddl(const std::string &sql) {
+  size_t i = 0;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
+    i++;
+  }
+  const char *kw[] = {"alter", "drop", "create", "attach", "detach"};
+  for (const char *k : kw) {
+    const size_t n = std::strlen(k);
+    if (sql.size() - i >= n &&
+        duckdb::StringUtil::CIEquals(sql.substr(i, n), k)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Install / reconcile
 // ---------------------------------------------------------------------------
 
@@ -399,49 +483,83 @@ inline bool install_pending_triggers(duckdb::ClientContext &context,
     return false;
   }
   auto &st = trigger_install_state(context.db);
+  const bool forced = st.recheck.exchange(false, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> g(st.mutex);
-    if (manager.tracked_table_total() == st.installed.size()) {
-      return false; // steady state: nothing tracked since the last pass
+    if (!forced && manager.tracked_table_total() == st.installed.size()) {
+      return false; // steady state: no DDL since the last pass, nothing new
     }
   }
   const std::vector<std::string> keys = manager.list_tracked_tables();
   const std::unordered_set<std::string> tracked(keys.begin(), keys.end());
 
-  std::vector<std::string> to_install;
-  std::vector<std::string> to_drop;
-  {
-    std::lock_guard<std::mutex> g(st.mutex);
-    for (const auto &key : keys) {
-      if (!st.installed.count(key)) {
-        to_install.push_back(key);
-      }
-    }
-    for (const auto &key : st.installed) {
-      if (!tracked.count(key)) {
-        to_drop.push_back(key);
-      }
-    }
-  }
-  if (to_install.empty() && to_drop.empty()) {
-    return false;
-  }
-
   InternalQueryGuard guard;
   duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-  std::unordered_set<std::string> made_sinks;
-  for (const auto &key : to_install) {
-    const TableSchema *schema = manager.get_table_schema(key);
-    if (!schema || schema->columns.empty()) {
+
+  // What the catalog ACTUALLY holds. Counting tracked tables cannot see a
+  // DROP TABLE (which takes the triggers with it) followed by a recreate and
+  // a re-track: the count comes back to where it was and the table is left
+  // permanently triggerless. One query answers it for every table at once.
+  std::unordered_set<std::string> live_triggers; // "catalog.schema.name"
+  {
+    auto r = con.Query("SELECT database_name, schema_name, trigger_name "
+                       "FROM duckdb_triggers()");
+    if (r->HasError()) {
       throw duckdb::InvalidInputException(
-          "DBSP trigger source: no schema for tracked table '%s'", key);
+          "DBSP trigger source: could not read duckdb_triggers(): %s",
+          r->GetError());
     }
+    for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
+      live_triggers.insert(r->GetValue(0, i).ToString() + "." +
+                           r->GetValue(1, i).ToString() + "." +
+                           r->GetValue(2, i).ToString());
+    }
+  }
+
+  bool changed = false;
+  std::unordered_set<std::string> made_sinks;
+  for (const auto &key : keys) {
     std::string catalog, schema_name, table;
     if (!split_table_key(key, catalog, schema_name, table)) {
       throw duckdb::InvalidInputException(
           "DBSP trigger source: table key '%s' is not catalog.schema.table",
           key);
     }
+    // The LIVE columns, not the manager's cached ones: the cache is what the
+    // installed bodies were generated from, so comparing it with itself could
+    // never detect an ALTER.
+    TableSchema live;
+    if (!live_table_columns(context, key, live)) {
+      // Tracked but not in the catalog right now (dropped, or its catalog
+      // detached). Forget it rather than fail: if it comes back, the next
+      // reconcile installs fresh triggers on it.
+      std::lock_guard<std::mutex> g(st.mutex);
+      if (st.installed.erase(key)) {
+        changed = true;
+      }
+      continue;
+    }
+    const std::string fp = schema_fingerprint(live);
+
+    bool need = false;
+    {
+      std::lock_guard<std::mutex> g(st.mutex);
+      auto it = st.installed.find(key);
+      need = (it == st.installed.end()) || (it->second != fp);
+    }
+    if (!need) {
+      for (const char *op : {"ins", "del", "upd"}) {
+        if (!live_triggers.count(catalog + "." + schema_name + "." +
+                                 trigger_name_for(table, op))) {
+          need = true; // the catalog lost them (DROP TABLE, manual DROP)
+          break;
+        }
+      }
+    }
+    if (!need) {
+      continue;
+    }
+
     const std::string sink = sink_name_for(catalog, schema_name);
     if (made_sinks.insert(sink).second) {
       auto r = con.Query("CREATE TABLE IF NOT EXISTS " + sink + "(v BIGINT)");
@@ -451,17 +569,30 @@ inline bool install_pending_triggers(duckdb::ClientContext &context,
             r->GetError());
       }
     }
-    for (const auto &sql : trigger_ddl_for(key, *schema)) {
+    // CREATE OR REPLACE rewrites a stale body in place, so no drop is needed
+    // for the ALTER case; the drop only matters if a name ever changes.
+    for (const auto &sql : trigger_ddl_for(key, live)) {
       auto r = con.Query(sql);
       if (r->HasError()) {
-        throw duckdb::InvalidInputException(
-            "DBSP trigger source: %s [%s]", r->GetError(), sql);
+        throw duckdb::InvalidInputException("DBSP trigger source: %s [%s]",
+                                            r->GetError(), sql);
       }
     }
     {
       std::lock_guard<std::mutex> g(st.mutex);
-      st.installed.insert(key);
+      st.installed[key] = fp;
       st.sinks.insert(sink);
+    }
+    changed = true;
+  }
+
+  std::vector<std::string> to_drop;
+  {
+    std::lock_guard<std::mutex> g(st.mutex);
+    for (const auto &entry : st.installed) {
+      if (!tracked.count(entry.first)) {
+        to_drop.push_back(entry.first);
+      }
     }
   }
   for (const auto &key : to_drop) {
@@ -470,8 +601,9 @@ inline bool install_pending_triggers(duckdb::ClientContext &context,
     }
     std::lock_guard<std::mutex> g(st.mutex);
     st.installed.erase(key);
+    changed = true;
   }
-  return true;
+  return changed;
 }
 
 // One sink row accumulates per statement firing. Drain them periodically so a
@@ -482,10 +614,19 @@ inline void maybe_drain_trigger_sinks(duckdb::ClientContext &context) {
   if (!trigger_source_enabled()) {
     return;
   }
+  // The counter is consulted through a process-wide atomic BEFORE the
+  // per-database map is touched. Going to trigger_install_state() first would
+  // take a global mutex and do a map insert on EVERY commit, and would
+  // resurrect an entry for a database that dbsp_forget_triggers() had just
+  // pruned at close.
+  if (trigger_firings_total().load(std::memory_order_relaxed) < kDrainEvery) {
+    return;
+  }
   auto &st = trigger_install_state(context.db);
   if (st.firings_since_drain.load(std::memory_order_relaxed) < kDrainEvery) {
     return;
   }
+  trigger_firings_total().store(0, std::memory_order_relaxed);
   st.firings_since_drain.store(0, std::memory_order_relaxed);
   std::vector<std::string> sinks;
   {

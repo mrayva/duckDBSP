@@ -1171,29 +1171,63 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
   result.SetVectorType(VectorType::CONSTANT_VECTOR);
   ConstantVector::GetData<int64_t>(result)[0] = NumericCast<int64_t>(n);
   ConstantVector::SetNull(result, false);
+  // MODE GUARD, and it must come first. Triggers are CATALOG objects: a
+  // database tracked once in trigger mode carries them forever, and reopening
+  // it in any other mode would otherwise have the persisted bodies feed the
+  // buffer alongside whatever source that mode runs — measured as
+  // `delta_source_mode 0` with `trigger_syncs 3`, i.e. every row counted twice
+  // on a hook build. The body still binds and still gets its value back; it
+  // just delivers nothing.
+  if (!dbsp_native::trigger_source_enabled()) {
+    return;
+  }
   if (n == 0 || args.ColumnCount() < 3) {
     return;
   }
   // DBSP's own helper connections: never self-ingest (same guard the engine
-  // hook keeps). Note it is thread-local, so it only covers work executed on
-  // the issuing thread — which is all DBSP needs, because DBSP never writes a
-  // tracked user table from an internal connection.
+  // hook keeps). Thread-local, so it only covers work executed on the issuing
+  // thread — and trigger bodies run on WORKER threads, so a multi-chunk body
+  // can have some chunks see depth 0. Dropping those silently would leave a
+  // PARTIAL delta; poisoning makes the commit reconcile by scan instead.
+  //
+  // Every early exit below poisons for the same reason: this function is the
+  // only thing that knows the rows existed, so "return without buffering" is
+  // indistinguishable from "there was nothing to buffer" by the time
+  // TransactionCommit looks. Silence is the one outcome this source must not
+  // have.
+  auto poison = [&state]() {
+    if (!state.HasContext()) {
+      return; // nothing reachable to poison; see the throw below
+    }
+    auto st = state.GetContext()
+                  .registered_state->Get<dbsp_native::DBSPContextState>(
+                      "dbsp_cdc_state");
+    if (st) {
+      st->engine_mark_unknown();
+    }
+  };
   if (dbsp_native::internal_query_depth > 0) {
+    poison();
     return;
   }
   if (!state.HasContext()) {
-    return;
+    // No context means no buffer and no way to reach one: failing the
+    // statement is the only loud option left.
+    throw duckdb::InternalException(
+        "dbsp_trigger_ingest: no ClientContext available to deliver a delta");
   }
   auto &context = state.GetContext();
   auto ctx_state =
       context.registered_state->Get<dbsp_native::DBSPContextState>(
           "dbsp_cdc_state");
   if (!ctx_state) {
-    return;
+    throw duckdb::InternalException(
+        "dbsp_trigger_ingest: no DBSP state on this connection");
   }
   const Value key_v = args.data[0].GetValue(0);
   const Value weight_v = args.data[1].GetValue(0);
   if (key_v.IsNull() || weight_v.IsNull()) {
+    ctx_state->engine_mark_unknown();
     return;
   }
   const string key = key_v.ToString();
@@ -1211,6 +1245,8 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
     ctx_state->engine_buffer_delta(key, std::move(delta));
     dbsp_native::trigger_install_state(context.db)
         .firings_since_drain.fetch_add(1, std::memory_order_relaxed);
+    dbsp_native::trigger_firings_total().fetch_add(1,
+                                                   std::memory_order_relaxed);
     // PROOF OF LIFE: the flag that disarms the capture stack flips only here,
     // on a DELIVERED ingest — never when the triggers are created. Triggers
     // that exist but never fire leave the capture stack armed rather than

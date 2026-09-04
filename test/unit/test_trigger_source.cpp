@@ -39,7 +39,8 @@ namespace {
 // duplicates.
 double view_sum(DuckDBTestHarness &db, const std::string &view) {
   auto rows = db.getViewRows(view);
-  if (rows.empty()) {
+  // SUM over no rows is NULL, not 0 — which is what an emptied table gives.
+  if (rows.empty() || rows[0][0].IsNull()) {
     return 0.0;
   }
   return rows[0][0].GetValue<double>();
@@ -360,4 +361,177 @@ TEST_CASE("trigger source: NULLs survive the round trip", "[trigger_source]") {
   db.exec("DELETE FROM t WHERE name IS NULL");
   REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 1);
   REQUIRE(db.getViewRows("nulls")[0][0].GetValue<int64_t>() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1: the cases the review found. Each of these FAILED before the
+// schema-keyed reconcile and the scalar's mode guard landed.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("trigger source: ALTER TABLE ADD COLUMN regenerates the bodies",
+          "[trigger_source]") {
+  // C1. A trigger body pins its table's column list at generation time, and
+  // the old sweep skipped whenever the tracked-table COUNT was unchanged —
+  // which an ALTER never changes. The body kept emitting the old width, the
+  // new column arrived NULL, and the commit took the exact-delta fast path
+  // with no scan to catch it. Measured before the fix: view 5.0, SQL 12.0.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 5.0)");
+  REQUIRE(view_sum(db, "tot") == 5.0);
+
+  db.exec("ALTER TABLE t ADD COLUMN note VARCHAR");
+  db.exec("INSERT INTO t VALUES (2, 7.0, 'hello')");
+
+  REQUIRE(sql_sum(db, "SELECT SUM(v) FROM t") == 12.0);
+  REQUIRE(view_sum(db, "tot") == 12.0);
+
+  // and the added column is really carried, not silently NULL
+  db.exec("SELECT * FROM dbsp_create_view('byw', "
+          "'SELECT note, COUNT(*) AS c FROM t GROUP BY note')");
+  db.exec("INSERT INTO t VALUES (3, 1.0, 'world')");
+  auto rows = db.getViewRows("byw");
+  int64_t named = 0;
+  for (auto &r : rows) {
+    if (!r[0].IsNull() && r[0].ToString() == "world") {
+      named = r[1].GetValue<int64_t>();
+    }
+  }
+  REQUIRE(named == 1);
+  REQUIRE(sql_count(db, "SELECT COUNT(*) FROM t WHERE note = 'world'") == 1);
+}
+
+TEST_CASE("trigger source: DROP TABLE and recreate gets its triggers back",
+          "[trigger_source]") {
+  // I1. DROP TABLE takes the triggers with it (verified against the engine),
+  // and the count-equality shortcut meant they were never reinstalled: the
+  // table stayed tracked and permanently triggerless, so every commit fell
+  // through to a full scan. Views stayed right; incrementality was silently
+  // gone.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 5.0)");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+  db.exec("DROP TABLE t");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 0);
+  db.exec("CREATE TABLE t (id INTEGER, v DOUBLE)");
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot2', 'SELECT SUM(v) AS s FROM t')");
+
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+  db.exec("INSERT INTO t VALUES (9, 4.0)");
+  REQUIRE(view_sum(db, "tot2") == sql_sum(db, "SELECT SUM(v) FROM t"));
+}
+
+TEST_CASE("trigger source: upsert forms are rejected on a tracked table",
+          "[trigger_source]") {
+  // I2. `MERGE INTO` is NOT the only thing tracking costs: the engine refuses
+  // ON CONFLICT DO UPDATE and INSERT OR REPLACE on a table carrying a
+  // NEW-TABLE trigger. Both work in default and capture mode. Pinned with the
+  // engine's own wording so a future engine that lifts it says so loudly.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER PRIMARY KEY, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 1.0)");
+
+  auto r1 = db.query("INSERT INTO t VALUES (1, 2.0) "
+                     "ON CONFLICT (id) DO UPDATE SET v = 2.0");
+  REQUIRE(r1->HasError());
+  REQUIRE(r1->GetError().find("ON CONFLICT DO UPDATE is not yet supported") !=
+          std::string::npos);
+
+  auto r2 = db.query("INSERT OR REPLACE INTO t VALUES (1, 3.0)");
+  REQUIRE(r2->HasError());
+  REQUIRE(r2->GetError().find("ON CONFLICT DO UPDATE is not yet supported") !=
+          std::string::npos);
+
+  // DO NOTHING has no such restriction, and must keep working
+  db.exec("INSERT INTO t VALUES (1, 9.0) ON CONFLICT DO NOTHING");
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+}
+
+TEST_CASE("trigger source: schema-changing ALTERs are refused by the engine",
+          "[trigger_source]") {
+  // I3. Everything except ADD COLUMN throws on a table carrying a trigger,
+  // because the trigger is a catalog dependency. All four succeed in default
+  // mode. Documented in DESIGN_TRIGGER_SOURCE.md; one form pinned here.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 1.0)");
+
+  auto r = db.query("ALTER TABLE t RENAME COLUMN v TO w");
+  REQUIRE(r->HasError());
+  REQUIRE(r->GetError().find("because there are entries that depend on it") !=
+          std::string::npos);
+}
+
+TEST_CASE("trigger source: INSERT ... SELECT and TRUNCATE", "[trigger_source]") {
+  // Both were measured by a throwaway shell probe and never pinned.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("SELECT * FROM dbsp_create_view('cnt', 'SELECT COUNT(*) AS c FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 1.0), (2, 2.0)");
+
+  db.exec("INSERT INTO t SELECT id + 10, v * 10 FROM t");
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 4);
+
+  db.exec("TRUNCATE t");
+  REQUIRE(sql_count(db, "SELECT COUNT(*) FROM t") == 0);
+  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 0);
+  REQUIRE(view_sum(db, "tot") == 0.0);
+}
+
+TEST_CASE("trigger source: multi-chunk DML under parallelism",
+          "[trigger_source]") {
+  // Bodies run on worker threads and an aggregate over a big transition table
+  // may be parallel, so the buffer takes a mutex. >1 chunk (2048 rows) with
+  // threads=8 is the shape that would expose a lost or doubled chunk.
+  DuckDBTestHarness db;
+  db.exec("SET threads=8");
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("SELECT * FROM dbsp_create_view('cnt', 'SELECT COUNT(*) AS c FROM t')");
+  db.exec("INSERT INTO t VALUES (0, 1.0)"); // arms the triggers
+
+  db.exec("INSERT INTO t SELECT i, 1.0 FROM range(1, 20001) tbl(i)");
+  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 20001);
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+
+  db.exec("UPDATE t SET v = 2.0 WHERE id % 2 = 0");
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+
+  db.exec("DELETE FROM t WHERE id > 10000");
+  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() ==
+          sql_count(db, "SELECT COUNT(*) FROM t"));
+  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+}
+
+TEST_CASE("trigger source: a user's own trigger coexists", "[trigger_source]") {
+  // Tracking must not disturb a trigger the user already had, and the user's
+  // trigger must not be mistaken for one of ours by the reconcile.
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.createTable("audit", "id INTEGER", {});
+  db.exec("CREATE TRIGGER user_audit AFTER INSERT ON t "
+          "REFERENCING NEW TABLE AS n FOR EACH STATEMENT "
+          "INSERT INTO audit SELECT id FROM n");
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+
+  db.exec("INSERT INTO t VALUES (1, 5.0), (2, 6.0)");
+  REQUIRE(view_sum(db, "tot") == 11.0);
+  REQUIRE(sql_count(db, "SELECT COUNT(*) FROM audit") == 2);
+  REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 4);
 }
