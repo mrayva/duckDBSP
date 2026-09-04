@@ -693,7 +693,8 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 // Enabling backfills a __mv_ table per registered view and keeps them in
 // sync per commit (one internal transaction per propagation pass, plus a
 // __dbsp_mv_meta watermark row per view). Disabling stops mirroring and
-// leaves the tables as-is (stale until re-enabled).
+// leaves the tables as-is (stale until re-enabled), and the disable is STICKY
+// — see CDCManager::mv_tables_user_disabled_.
 // ============================================================================
 
 struct MvTablesBindData : public TableFunctionData {

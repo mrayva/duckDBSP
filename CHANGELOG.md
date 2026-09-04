@@ -1,5 +1,38 @@
 # Changelog
 
+## `dbsp_mv_tables(false)` actually stops mirroring — 2026-09-04
+
+`test/python/test_mv_tables.py` had a standing red on `disable must stop
+mirroring`: after `dbsp_mv_tables(false)`, an `UPDATE` still moved the
+`__mv_mv_agg` backing table (group 1 went `99700.0` → `100477.0` in lockstep
+with the view). The FUNCTION was wrong, not the test — `docs/API.md` says
+"Disabling stops mirroring and leaves the tables stale" and the comment over
+`MvTablesBind` says the same.
+
+Root cause, traced by instrumenting both toggles and both load paths on one
+manager:
+
+```
+[maybe_autoload -> load_from_duck_table]   enabled mv_tables, marked=7
+[set_mv_tables(false)]                     disabled
+[recovery load_views -> load_from_duck_table]  enabled mv_tables, marked=7
+```
+
+`load_from_duck_table` runs MORE THAN ONCE per manager — `maybe_autoload` fires
+it on the first DBSP call, and `DBSPRecoveryManager::load_views` fires it again
+from the crash-recovery pass — and its `__dbsp_mv_meta` block unconditionally
+re-enabled mirroring and re-marked every view table-backed. A disable landing
+between the two was silently undone.
+
+`mv_tables_user_disabled_` is now a separate sticky flag: only an explicit
+`dbsp_mv_tables(false)` sets it and only an explicit `dbsp_mv_tables(true)`
+clears it, and `load_from_duck_table` skips the whole meta block while it is
+set. It is deliberately NOT `mv_tables_enabled_`, which several internal error
+paths also clear on their own — those are failures, not user intent, and must
+not stop a later reattach from adopting its tables.
+
+All 30 `test/python/*.py` scripts now exit 0. There are no known reds.
+
 ## `captured_delta_syncs` is now `exact_delta_syncs` — 2026-09-04
 
 **Renamed, not aliased.** The old name carried the vocabulary of the deleted

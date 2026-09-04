@@ -2140,7 +2140,15 @@ public:
     // declines (fingerprint mismatch) is cold-created below; create_view's
     // own mirror block then REWRITES its table from the fresh result
     // (the adopted-view guard there keys on ckpt_restored_views_).
-    try {
+    //
+    // NOT after the user has said `dbsp_mv_tables(false)`. This function runs
+    // more than once per manager: once from maybe_autoload, and again from
+    // crash recovery's load_views. A disable landing between the two was
+    // silently undone — measured, the __mv_ table went on tracking the view
+    // through the very edit that was supposed to leave it stale, which is the
+    // opposite of what dbsp_mv_tables(false) documents.
+    if (!mv_tables_user_disabled_.load()) {
+      try {
       InternalQueryGuard meta_guard;
       duckdb::Connection meta_con(
           duckdb::DatabaseInstance::GetDatabase(context));
@@ -2160,8 +2168,9 @@ public:
           mv_tables_enabled_ = true;
         }
       }
-    } catch (...) {
-      // no meta table = not a disk-backed database; nothing to mark
+      } catch (...) {
+        // no meta table = not a disk-backed database; nothing to mark
+      }
     }
 
     // Fast path (D3b): when a circuit-state checkpoint exists and every
@@ -4509,6 +4518,9 @@ public:
       return true;
     }
     if (!enable) {
+      // Sticky: an explicit disable outlives any later load_from_duck_table,
+      // which would otherwise re-enable mirroring off __dbsp_mv_meta.
+      mv_tables_user_disabled_ = true;
       mv_tables_enabled_ = false;
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
       std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
@@ -4561,6 +4573,7 @@ public:
         }
       }
       mv_tables_enabled_ = true;
+      mv_tables_user_disabled_ = false;
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("mv_tables enable failed: ") + e.what();
@@ -6868,6 +6881,12 @@ private:
   // (full write at create/enable, per-commit delta apply after each
   // propagation). Reads still come from circuit state until Phase 1c.
   std::atomic<bool> mv_tables_enabled_{false};
+  // The USER said dbsp_mv_tables(false). Distinct from mv_tables_enabled_,
+  // which several error paths also clear on their own: only an explicit
+  // disable sets this, and only an explicit enable clears it. It is what
+  // load_from_duck_table's __dbsp_mv_meta block honours, so a reattach or a
+  // crash-recovery load cannot resurrect mirroring the user turned off.
+  std::atomic<bool> mv_tables_user_disabled_{false};
   duckdb::DatabaseInstance *mv_db_ = nullptr; // captured at create_view
   // F9: persistent mirror connection + per-view stage/SQL cache. A fresh
   // Connection per commit made every mirror pass recreate its stage and

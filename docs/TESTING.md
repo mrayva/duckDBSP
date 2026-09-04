@@ -251,9 +251,9 @@ both ways out of the window (COMMIT and ROLLBACK) and then compares the view
 against plain SQL through a later edit on each connection, so a baseline short
 by the deferred rows cannot hide as a constant offset.
 
-**Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
-`test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
-to the delta source. 29 of the 30 scripts exit 0.
+**Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** none. All 30
+scripts exit 0. (`test_mv_tables.py` was the standing red until
+`dbsp_mv_tables(false)` was made sticky — see the CHANGELOG.)
 
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown

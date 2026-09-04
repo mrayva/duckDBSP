@@ -896,7 +896,11 @@ backfilled on enable and at view creation, then kept in sync with one
 internal transaction per propagation pass. `__dbsp_mv_meta(view_name,
 commit_seq)` records the watermark of each table's last write. Backing
 tables are ordinary tables: durable across reopen and readable without any
-DBSP state. Disabling stops mirroring and leaves the tables stale.
+DBSP state. Disabling stops mirroring and leaves the tables stale, and the
+disable is STICKY: `load_from_duck_table` runs more than once per manager (once
+from the auto-load, again from crash recovery's `load_views`) and its
+`__dbsp_mv_meta` block would otherwise re-enable mirroring behind the user's
+back. Only an explicit `dbsp_mv_tables(true)` turns it back on.
 
 ```sql
 SELECT * FROM dbsp_mv_tables(true);
