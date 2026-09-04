@@ -33,6 +33,7 @@
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_qualified_name.hpp"
+#include "dbsp_trigger_capability.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -313,24 +314,6 @@ inline std::string trigger_name_for(const std::string &table,
 // Every DBSP trigger name starts with this, whatever the table or fingerprint.
 inline const char *trigger_name_prefix() { return "dbsp_trg_"; }
 
-// catalog.schema.table -> the three parts. Keys are produced by
-// canonical_table_key, so exactly two dots separate three non-empty parts.
-inline bool split_table_key(const std::string &key, std::string &catalog,
-                            std::string &schema, std::string &table) {
-  const size_t d1 = key.find('.');
-  if (d1 == std::string::npos) {
-    return false;
-  }
-  const size_t d2 = key.find('.', d1 + 1);
-  if (d2 == std::string::npos) {
-    return false;
-  }
-  catalog = key.substr(0, d1);
-  schema = key.substr(d1 + 1, d2 - d1 - 1);
-  table = key.substr(d2 + 1);
-  return !catalog.empty() && !schema.empty() && !table.empty();
-}
-
 // The sink every trigger body writes its one aggregate row into. A trigger
 // body MUST be a DML statement (the engine has no procedural body), so the
 // ingest scalar rides an `INSERT INTO <sink> SELECT max(...) FROM <transition>`
@@ -527,72 +510,6 @@ inline bool triggers_present(
   return true;
 }
 
-/// Can this catalog hold the change-capture triggers at all?
-///
-/// `CREATE TRIGGER` needs storage version v2.0.0 or higher — the engine's own
-/// test is duckdb/src/planner/binder/statement/bind_create.cpp:680-692, and
-/// this mirrors it exactly (in-memory and temporary databases are exempt
-/// there, so they are exempt here). On false, `version_out` carries the
-/// version the file actually has, for the error message.
-///
-/// It is mirrored rather than left to the engine because of WHERE the engine's
-/// error lands: the install runs from the sweep, i.e. from the QueryBegin of
-/// some LATER statement, so `dbsp_track` on a v1.0.0 file used to SUCCEED and
-/// every statement afterwards — reads included — threw
-/// `Binder Error: CREATE TRIGGER is only supported for storage versions
-/// v2.0.0 and higher` with the table left tracked and the connection wedged.
-inline bool catalog_supports_triggers(duckdb::ClientContext &context,
-                                      const std::string &catalog_name,
-                                      std::string &version_out) {
-  try {
-    auto &catalog =
-        duckdb::Catalog::GetCatalog(context, duckdb::Identifier(catalog_name));
-    auto &attached = catalog.GetAttached();
-    if (attached.IsTemporary() || !attached.HasStorageManager()) {
-      return true;
-    }
-    auto &storage = attached.GetStorageManager();
-    if (storage.InMemory() || !storage.HasStorageVersion()) {
-      return true;
-    }
-    if (storage.GetStorageVersion() >= duckdb::StorageVersion::V2_0_0) {
-      return true;
-    }
-    version_out =
-        duckdb::GetStorageVersionName(storage.GetStorageVersion(), true);
-    return false;
-  } catch (...) {
-    // Not a DuckDB catalog, detached mid-flight, or an API that moved: say
-    // nothing and let the engine's own refusal speak.
-    return true;
-  }
-}
-
-/// Throw ONE readable error, naming the migration, if `key` lives in a
-/// database too old to carry the triggers. Callers use this BEFORE tracking or
-/// installing, so the refusal arrives at the statement that asked for it.
-inline void require_trigger_capable_catalog(duckdb::ClientContext &context,
-                                            const std::string &key) {
-  std::string catalog, schema_name, table;
-  if (!split_table_key(key, catalog, schema_name, table)) {
-    return;
-  }
-  std::string version;
-  if (catalog_supports_triggers(context, catalog, version)) {
-    return;
-  }
-  throw duckdb::InvalidInputException(
-      "DBSP cannot track '%s': its database is at storage version %s, and the "
-      "change-capture triggers require v2.0.0 or higher. Rewrite the file "
-      "first:\n"
-      "  ATTACH '<old>.duckdb' AS src (READ_ONLY);\n"
-      "  ATTACH '<new>.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');\n"
-      "  COPY FROM DATABASE src TO dst;\n"
-      "then move the '<old>.duckdb.dbsp_spill' directory alongside the new "
-      "file. The table has NOT been tracked.",
-      key, version);
-}
-
 /// True for a statement the sweep must keep its hands off entirely.
 ///
 /// Reading a catalog's version (catalog_version_of, below) calls
@@ -746,6 +663,8 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     TableSchema live;
     std::string fingerprint;
   };
+  bool unsupported_catalog = false; // a tracked table in a pre-v2.0.0 database
+  std::string unsupported_key;
   std::vector<Candidate> unproven; // process record disagrees; ask the catalog
   std::vector<Pending> to_install;
   std::vector<std::string> now_missing;
@@ -760,11 +679,18 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
           key);
     }
     catalogs.insert(catalog);
-    // A table can reach the tracked set by routes other than dbsp_track
-    // (view-source auto-tracking, a checkpoint restore). Refuse here too, with
-    // the same readable error, rather than letting the DDL below fail with the
-    // engine's message on every statement.
-    require_trigger_capable_catalog(context, key);
+    // A table can reach the tracked set by routes other than dbsp_track and
+    // create_view (a checkpoint restore, say). RECORD an unusable catalog here
+    // — do not throw here: this loop runs above the defer check, and throwing
+    // above it meant a user holding a transaction open got the error out of
+    // their own COMMIT and ROLLBACK, with no way out but DETACH.
+    if (!unsupported_catalog) {
+      std::string version;
+      if (!catalog_supports_triggers(context, catalog, version)) {
+        unsupported_catalog = true;
+        unsupported_key = key;
+      }
+    }
     TableSchema live;
     if (!live_table_columns(context, key, live)) {
       // Tracked but not in the catalog from here: dropped, or created inside a
@@ -850,8 +776,8 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   // created and tracked a table in one transaction. The caller poisons this
   // transaction instead, so its commit reconciles by scan, and `recheck` stays
   // armed for the first statement after the transaction ends.
-  const bool work_pending =
-      !to_install.empty() || !to_drop.empty() || !now_missing.empty();
+  const bool work_pending = !to_install.empty() || !to_drop.empty() ||
+                            !now_missing.empty() || unsupported_catalog;
   if (user_transaction_open(context)) {
     if (work_pending) {
       st.recheck.store(true, std::memory_order_relaxed);
@@ -860,6 +786,17 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     // Nothing to do — and the bookkeeping above is pure memory, so it is safe
     // to bank it and stop re-deriving it on every statement of a long
     // transaction. `armed` alone is not a reason to defer any more.
+  }
+
+  // A tracked table in a database too old to carry triggers is refused HERE,
+  // below the defer check: inside an open user transaction it is a deferral
+  // (their COMMIT and ROLLBACK must never throw for this), and outside one it
+  // is a single readable error naming the migration. Both entry points that
+  // can create the situation — dbsp_track and create_view's auto-tracking —
+  // refuse before tracking, so reaching this is a table that arrived by some
+  // other route.
+  if (unsupported_catalog) {
+    require_trigger_capable_catalog(context, unsupported_key);
   }
 
   // ---- act --------------------------------------------------------------

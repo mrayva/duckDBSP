@@ -879,3 +879,100 @@ TEST_CASE("trigger source: a racing sink CREATE does not fail the statement",
   db.exec("INSERT INTO t VALUES (2, 7.0)");
   REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
 }
+
+TEST_CASE("cdc: create_view seeds its source baseline, not an empty one",
+          "[trigger_source][create_view]") {
+  // The public dbsp_track() creates a TrackedTable with an EMPTY baseline on
+  // purpose ("Initial table sync deferred... call dbsp_sync() after
+  // dbsp_track()"), and create_view's replay streams that baseline. It looked
+  // correct only by accident: some unrelated commit normally ran a scan-sync
+  // between the track and the create, and seeded it.
+  //
+  // Remove the accident — any earlier FAILED DBSP call shifts the commit
+  // sequencing — and the view is built over NOTHING: a permanently wrong
+  // answer, no error, no counter moving, and no self-healing. Measured before
+  // the fix: view 0.0 where SQL read 3.0; after one insert view 3.0 / SQL 6.0;
+  // after another view 7.0 / SQL 10.0 — the same constant offset forever.
+  auto check_seeded = [](DuckDBTestHarness &db) {
+    db.exec("SELECT * FROM dbsp_track('fresh')");
+    db.exec("SELECT * FROM dbsp_create_view('tf', 'SELECT SUM(v) AS s FROM "
+            "fresh')");
+    REQUIRE(view_sum(db, "tf") == sql_sum(db, "SELECT SUM(v) FROM fresh"));
+    // and it tracks edits from there, rather than carrying a constant offset
+    db.exec("INSERT INTO fresh VALUES (2, 3.0)");
+    REQUIRE(view_sum(db, "tf") == sql_sum(db, "SELECT SUM(v) FROM fresh"));
+    db.exec("INSERT INTO fresh VALUES (3, 4.0)");
+    REQUIRE(view_sum(db, "tf") == sql_sum(db, "SELECT SUM(v) FROM fresh"));
+  };
+
+  SECTION("happy path, unchanged") {
+    DuckDBTestHarness db;
+    db.createTable("fresh", "id INTEGER, v DOUBLE", {"(1, 3.0)"});
+    check_seeded(db);
+  }
+
+  SECTION("after a failed dbsp_track") {
+    DuckDBTestHarness db;
+    REQUIRE(db.query("SELECT * FROM dbsp_track('no_such_table')")->HasError());
+    db.createTable("fresh", "id INTEGER, v DOUBLE", {"(1, 3.0)"});
+    check_seeded(db);
+  }
+
+  SECTION("after a failed dbsp_create_view") {
+    DuckDBTestHarness db;
+    REQUIRE(db.query("SELECT * FROM dbsp_create_view('bad', "
+                     "'SELECT 1 FROM no_such_table')")
+                ->HasError());
+    db.createTable("fresh", "id INTEGER, v DOUBLE", {"(1, 3.0)"});
+    check_seeded(db);
+  }
+
+  SECTION("failure AFTER the table exists") {
+    DuckDBTestHarness db;
+    db.createTable("fresh", "id INTEGER, v DOUBLE", {"(1, 3.0)"});
+    REQUIRE(db.query("SELECT * FROM dbsp_track('no_such_table')")->HasError());
+    check_seeded(db);
+  }
+
+  // The FILE-BACKED reproduction lives in
+  // test/python/test_create_view_seeding.py: this harness is in-memory by
+  // construction, and the reviewer found the defect on a file-backed database.
+}
+
+TEST_CASE("trigger source: create_view over a pre-v2.0.0 source is refused",
+          "[trigger_source]") {
+  // dbsp_track is not the only way into the tracked set: create_view
+  // auto-tracks its sources. Before the precheck reached that route, a
+  // CREATE MATERIALIZED VIEW over a v1.0.0 source SUCCEEDED and tracked the
+  // table, and every statement afterwards — including COMMIT and ROLLBACK —
+  // threw the sweep's error, with DETACH the only escape.
+  DuckDBTestHarness db;
+  const std::string path =
+      std::string(std::tmpnam(nullptr)) + "_dbsp_v1v.duckdb";
+  db.exec("ATTACH '" + path + "' AS old (STORAGE_VERSION 'v1.0.0')");
+  db.exec("CREATE TABLE old.t (id INTEGER, v DOUBLE)");
+  db.exec("INSERT INTO old.t VALUES (1, 5.0)");
+
+  auto res = db.query("SELECT * FROM dbsp_create_view('vold', 'SELECT SUM(v) "
+                      "AS s FROM old.t')");
+  REQUIRE(res->HasError());
+  const std::string err = res->GetError();
+  INFO(err);
+  REQUIRE(err.find("storage version") != std::string::npos);
+  REQUIRE(err.find("STORAGE_VERSION 'v2.0.0'") != std::string::npos);
+
+  // Nothing tracked, and the connection is still usable — including a
+  // transaction that opens and closes cleanly, which is what the sweep's
+  // throw used to break.
+  REQUIRE(sql_count(db, "SELECT count(*) FROM dbsp_tables() "
+                        "WHERE table_name LIKE '%.t'") == 0);
+  REQUIRE(sql_count(db, "SELECT 1") == 1);
+  db.exec("BEGIN TRANSACTION");
+  REQUIRE(sql_count(db, "SELECT count(*) FROM old.t") == 1);
+  db.exec("COMMIT");
+  db.exec("BEGIN TRANSACTION");
+  db.exec("ROLLBACK");
+
+  db.exec("DETACH old");
+  std::remove(path.c_str());
+}

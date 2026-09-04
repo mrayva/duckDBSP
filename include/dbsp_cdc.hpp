@@ -5,8 +5,9 @@
 #pragma once
 
 #include "dbsp_duckdb_types.hpp"
-#include "dbsp_qualified_name.hpp"
 #include "dbsp_plan_translator.hpp"
+#include "dbsp_qualified_name.hpp"
+#include "dbsp_trigger_capability.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -2694,6 +2695,26 @@ public:
           if (tracked_tables_.at(source)->is_deferred()) {
             materialize_deferred_locked(context, source, nullptr,
                                         /*view_lock_held=*/true);
+          }
+          // A source tracked through the PUBLIC track_table() has an EMPTY
+          // baseline by design — that entry point defers the initial scan and
+          // tells the caller to run dbsp_sync(). Replaying it here would build
+          // the view over nothing and return a permanently wrong answer, with
+          // no error and no counter moving.
+          //
+          // It normally looked fine only by accident: some unrelated commit
+          // usually ran a scan-sync between the track and the create. Measured
+          // with that accident removed (a prior FAILED dbsp_track shifts the
+          // commit sequencing): view 0.0 where SQL read 3.0, and it never
+          // self-healed — every later edit kept the same constant offset.
+          //
+          // So establish it here instead of hoping, exactly as
+          // track_table_internal does for auto-tracked sources: scan, then
+          // discard the pending changes, because the replay below IS the
+          // initialization and the delta must not be applied twice.
+          if (!tracked_tables_.at(source)->baseline_seeded()) {
+            sync_table_internal(context, source);
+            tracked_tables_.at(source)->consume_changes();
           }
           // Stream the baseline in bounded chunks: deltas are additive,
           // so N smaller applies equal one big one — and spill mode never
@@ -5535,6 +5556,14 @@ private:
     if (tracked_tables_.count(table_name)) {
       return true;
     }
+
+    // Change capture is statement triggers, and CREATE TRIGGER needs storage
+    // version v2.0.0 or higher. Refuse BEFORE the table joins the tracked set,
+    // so `CREATE MATERIALIZED VIEW` over a source in an older database fails
+    // with one readable error naming the migration. Without this the view was
+    // created, the source was tracked, and every later statement on that
+    // connection — including COMMIT and ROLLBACK — threw from the sweep.
+    require_trigger_capable_catalog(context, table_name);
 
     TableSchema schema;
     if (!get_table_schema(context, table_name, schema)) {

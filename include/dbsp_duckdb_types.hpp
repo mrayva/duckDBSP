@@ -661,6 +661,9 @@ public:
     deferred_ = true;
     deferred_weight_ = expected_weight;
     deferred_hash_ = std::move(row_hash);
+    // A deferred baseline IS the committed table content by construction —
+    // the restore verified the save-time watermark against live storage.
+    baseline_seeded_ = true;
   }
 
   bool is_deferred() const { return deferred_; }
@@ -670,7 +673,19 @@ public:
   // Install the rows fed through begin_rebuild()/add_scanned_row() as the
   // baseline WITHOUT diffing against the previous one (there is none: the
   // table was deferred). Clears the deferred flag.
+  // Has this baseline ever been established from committed storage?
+  //
+  // FALSE means "empty because nothing has scanned it yet", which is NOT the
+  // same as "empty because the table is empty" — and the two are
+  // indistinguishable from the Z-set alone. The public dbsp_track() creates a
+  // TrackedTable with an empty baseline on purpose and leaves the seeding to a
+  // later dbsp_sync(); anything that replays a baseline as if it were table
+  // content (CDCManager::create_view) has to know the difference, or it builds
+  // a view over nothing and returns a permanently wrong answer with no error.
+  bool baseline_seeded() const { return baseline_seeded_; }
+
   void install_rebuild() {
+    baseline_seeded_ = true;
     if (spill_) {
       // No diff wanted: swap the generation in directly. The end_rebuild
       // diff path reads every added payload back from disk — hours at
@@ -687,6 +702,7 @@ public:
   }
 
   DuckDBZSet finish_rebuild() {
+    baseline_seeded_ = true;
     DuckDBZSet delta;
     if (spill_) {
       spill_->end_rebuild(
@@ -860,6 +876,9 @@ private:
   // Deferred baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan.
   bool deferred_ = false;
+  // See baseline_seeded(): false until a scan (or a verified deferred restore)
+  // has established this baseline from committed storage.
+  bool baseline_seeded_ = false;
   int64_t deferred_weight_ = 0; // restore-time COUNT(*)
   std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };
