@@ -155,9 +155,12 @@ has to be able to choose.
 | `trigger` | generated statement-level `AFTER` triggers | **stock** |
 
 `trigger` is the spike documented in `docs/DESIGN_TRIGGER_SOURCE.md`: exact
-deltas with no forked engine. Its price is that `MERGE INTO` becomes an error
-on any tracked table, and that the triggers plus a small `dbsp_trigger_sink`
-table are visible in the user's catalog. Not the default.
+deltas with no forked engine. Not the default, and the price is paid by every
+table it tracks — on a tracked table the engine then refuses `MERGE INTO`,
+`INSERT ... ON CONFLICT DO UPDATE` and `INSERT OR REPLACE`, and every
+`ALTER TABLE` form except `ADD COLUMN`. The generated triggers and a small
+`dbsp_trigger_sink` table are also visible in the user's catalog. The full
+list, with the engine's own error messages, is in the design doc.
 
 Verify which mode a process actually got — mis-set variables are otherwise
 invisible:

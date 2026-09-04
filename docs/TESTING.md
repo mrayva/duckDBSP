@@ -85,10 +85,20 @@ DBSP_DELTA_SOURCE=trigger ./test_...       # redundant: the binary sets it
 
 It ports the engine-hook differential oracle (old images −1, new +1,
 insert-then-delete nets to zero, update chains, rollback, multi-table commits)
-and adds the paths specific to this source: the C++ `Appender`, `COPY FROM`, a
-double-count guard that asserts a **sum** rather than a row count, and a pin on
-`MERGE INTO` being rejected outright on a tracked table. See
+and adds the paths specific to this source: the C++ `Appender`, `COPY FROM`,
+`INSERT ... SELECT`, `TRUNCATE`, multi-chunk DML under `threads=8`, a user's own
+trigger coexisting on a tracked table, a double-count guard that asserts a
+**sum** rather than a row count, `ALTER TABLE ... ADD COLUMN` regenerating the
+bodies, `DROP TABLE` + recreate reinstalling them, and pins on every statement
+the engine refuses on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`,
+`INSERT OR REPLACE`, `ALTER TABLE ... RENAME COLUMN`). 18 cases. See
 `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+One thing it cannot cover: a database created in trigger mode and then reopened
+WITHOUT the variable, where the persisted trigger bodies must deliver nothing.
+The mode is process-wide, so that check lives in
+`test/python/test_trigger_source.py`, which forks a child interpreter with the
+variable removed.
 
 ### Python scripts (`test/python/`)
 

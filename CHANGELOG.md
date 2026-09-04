@@ -100,12 +100,17 @@ below. Pinned by `test/python/test_ddl_syntax.py`.
   disarms, so no row is delivered twice. Pinned by a test that inserts once and
   asserts a **sum**, not a row count — a doubled delivery is invisible to a row
   count.
-- `MERGE INTO` on a tracked table becomes a hard engine error
-  (`bind_merge_into.cpp:226-233`). Pinned by a test rather than worked around:
-  it is the price of this source, and it must stay visible.
+- Tracking a table in this mode COSTS that table several statements, all of
+  them engine behaviour and all pinned by tests: `MERGE INTO`
+  (`bind_merge_into.cpp:226-233`), `INSERT ... ON CONFLICT DO UPDATE` and
+  `INSERT OR REPLACE` ("not yet supported with REFERENCING NEW TABLE AS
+  triggers"), and every `ALTER TABLE` form except `ADD COLUMN` (dependency
+  error). All of them work normally in default and capture mode.
 - New suite `trigger_source` (`test/unit/test_trigger_source.cpp`), built
-  WITHOUT `DBSP_ENGINE_HOOK` on purpose. ctest 48/48 in default mode and under
-  `DBSP_TEST_VERIFY_VECTORS=1`; the new suite is 11 cases / 211 assertions.
+  WITHOUT `DBSP_ENGINE_HOOK` on purpose. It brings ctest to 46 entries on a
+  hook-OFF tree and 48 on the hook-ON tree this repo builds by default; both
+  were 48/48 here, plain and under `DBSP_TEST_VERIFY_VECTORS=1`. The suite
+  itself is 18 cases / 318 assertions.
 - Two of those tests failed at first for one reason, worth recording again: the
   per-database install record was keyed on the raw `DatabaseInstance` address,
   and DuckDB reuses freed addresses, so consecutive harnesses in one process

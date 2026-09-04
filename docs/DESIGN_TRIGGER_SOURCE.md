@@ -105,16 +105,13 @@ untouched.
 
 ## Write-path coverage
 
-Measured on this build, not inferred. Rows marked "C++ suite" are pinned by
-`test/unit/test_trigger_source.cpp` and will stay pinned. Two rows —
-`INSERT ... SELECT` and `TRUNCATE` — were verified only by a one-off shell probe
-(`.scratch/trigger_ddl_probe.sql`, disposable scratch): they are **measured but
-not pinned**, and the first thing to add if this source goes any further.
+Measured on this build, not inferred. Every row is pinned by
+`test/unit/test_trigger_source.cpp`.
 
 | Write path | Covered? | Evidence |
 |---|---|---|
 | `INSERT ... VALUES` (multi-row) | Yes | `insert/update/delete keep the view current` |
-| `INSERT ... SELECT` | Yes | shell probe, sink row per statement (NOT pinned by a test) |
+| `INSERT ... SELECT` | Yes | C++ suite |
 | `UPDATE` (both images) | Yes | `update chain collapses to first-old / last-new` |
 | `DELETE` | Yes | `insert/update/delete keep the view current` |
 | Multi-statement single transaction | Yes | `multi-statement single transaction` (4 sections) |
@@ -122,25 +119,79 @@ not pinned**, and the first thing to add if this source goes any further.
 | `BEGIN ... ROLLBACK` | Yes | `explicit rollback discards everything` |
 | C++ `Appender` | Yes | `the C++ Appender updates the view` (3 rows, sum 61.0) |
 | `COPY ... FROM` (CSV) | Yes | `COPY FROM a CSV updates the view` (sum 111.0) |
-| `TRUNCATE` | Yes, as a full delete | shell probe, 3 old-image rows (NOT pinned by a test) |
+| `TRUNCATE` | Yes, as a full delete | C++ suite |
 | NULL-bearing rows | Yes | `NULLs survive the round trip` |
+| Multi-chunk DML under `threads=8` | Yes | C++ suite (20,001 rows, INSERT/UPDATE/DELETE) |
+| A user's own trigger on the same table | Yes, coexists | C++ suite |
+| `ALTER TABLE ... ADD COLUMN` then write | Yes, bodies regenerate | C++ suite |
+| `DROP TABLE` + recreate + re-track | Yes, triggers reinstalled | C++ suite |
+| `INSERT ... ON CONFLICT DO NOTHING` | Yes | C++ suite |
 | **`MERGE INTO` a tracked table** | **NO — hard engine error** | `MERGE INTO on a tracked table is rejected` |
+| **`INSERT ... ON CONFLICT DO UPDATE`** | **NO — hard engine error** | C++ suite |
+| **`INSERT OR REPLACE`** | **NO — hard engine error** | C++ suite |
+| **`ALTER TABLE` other than ADD COLUMN** | **NO — hard engine error** | C++ suite (RENAME COLUMN pinned) |
 | `InternalAppender` (engine-internal) | No | `appender.cpp:747-750` calls `LocalAppend`, bypassing the binder |
 
-### The MERGE constraint
+### What tracking a table COSTS it
 
-`duckdb/src/planner/binder/statement/bind_merge_into.cpp:226-233` throws
-`Not implemented Error: MERGE INTO is not supported on tables with triggers`.
-Tracking a table in trigger mode therefore **removes a working DuckDB feature
-from the user's table**. Neither the engine hook nor the capture stack has that
-cost. It is pinned by a test rather than worked around, because it is the one
-real price of this source and it must stay visible.
+This is the price of the source, and it is bigger than one statement. Every
+item below is an engine behaviour, measured on this build and pinned by a test;
+all of them work normally in default and capture mode.
+
+| On a tracked (triggered) table | Engine response |
+|---|---|
+| `MERGE INTO <t> ...` | `Not implemented Error: MERGE INTO is not supported on tables with triggers` |
+| `INSERT ... ON CONFLICT DO UPDATE` | `Not implemented Error: ON CONFLICT DO UPDATE is not yet supported with REFERENCING NEW TABLE AS triggers` |
+| `INSERT OR REPLACE` (same path) | same error |
+| `ALTER TABLE ... DROP COLUMN` | `Dependency Error: Cannot alter entry "t" because there are entries that depend on it.` |
+| `ALTER TABLE ... RENAME COLUMN` | same dependency error |
+| `ALTER TABLE ... ALTER COLUMN ... TYPE` | same dependency error |
+| `ALTER TABLE ... RENAME TO` | same dependency error |
+| `ALTER TABLE ... ADD COLUMN` | **allowed** — and handled: the sweep regenerates the bodies (below) |
+| `INSERT ... ON CONFLICT DO NOTHING` | allowed |
+| `DROP TABLE` | allowed; takes the triggers with it, and a recreate + re-track reinstalls them |
+
+Sources: `duckdb/src/planner/binder/statement/bind_merge_into.cpp:226-233` for
+MERGE; the other two messages are the engine's own, reproduced in the shell on
+this build.
+
+So trigger mode does not merely add a delta source — it **removes upserts and
+most schema changes from every table NumPad tracks**. Neither the engine hook
+nor the capture stack costs anything like that. An earlier draft of this
+document called MERGE "the one real price"; that was wrong, and the full list
+is the thing to weigh.
 
 For NumPad specifically: the single `MERGE INTO` site is
 `api/integration/transforms/service.py:371`, targeting `land.<relation>` in the
-data-integration landing schema, and nothing tracks `land.*`. So it does not
-bite today — but no DBSP-tracked table could ever be a `MERGE INTO` target
-while trigger mode is on.
+data-integration landing schema, and nothing tracks `land.*`. So none of this
+bites today — but it is a standing constraint on every tracked table.
+
+### Keeping the bodies in step with the table
+
+A generated body encodes the column list literally, so anything that moves a
+tracked table's schema makes every installed body stale. Most such statements
+the engine refuses outright (above); `ADD COLUMN` does not, and `DROP TABLE`
+silently takes the triggers away.
+
+Neither moves the tracked-table **count**, which is what the cheap steady-state
+check compares — so the first version of this sweep missed both, and both
+produced wrong answers with no scan to catch them: a view read 5.0 where SQL
+read 12.0 after an `ADD COLUMN`, and a dropped-and-recreated table stayed
+tracked but permanently triggerless.
+
+The sweep therefore keys its install record on a **column fingerprint** (name
+and type of every column, in order) taken from the LIVE catalog — not from the
+manager's cached schema, which is what the bodies were generated from and so
+could never disagree with itself — and additionally verifies against
+`duckdb_triggers()` that all three triggers are still there. A full reconcile
+runs when the tracked-table count changes, and whenever the previous statement
+began with `ALTER`, `DROP`, `CREATE`, `ATTACH` or `DETACH`. That keyword sniff
+is deliberately over-inclusive: a false positive costs one catalog query, a
+false negative costs silent wrong answers.
+
+Regeneration lands the same way a first install does — `CREATE OR REPLACE`,
+with the regenerating transaction marked so its commit reconciles by scan,
+which is also what re-reads the table at its new width.
 
 ### Other standing costs
 
@@ -149,8 +200,10 @@ while trigger mode is on.
   WAL-logged, and appear in `EXPORT DATABASE`.
 - A bulk Appender fires once per flush chunk (~2048 rows), not once per
   transaction. Z-set additivity makes that correct, but it is many firings.
-- `ALTER TABLE` on a tracked table changes the column list the generated DDL
-  encodes. The sweep does not currently notice; a re-track regenerates it.
+- `dbsp_untrack` does not exist as an extension function, so the sweep's
+  drop-DDL branch (triggers removed when a table stops being tracked) is
+  **unreachable today** and therefore untested. It runs only if such an entry
+  point is added.
 - Tracking a table in a **read-only** attached catalog cannot work — the sink
   cannot be created. The install throws rather than going quietly stale.
 - The `internal_query_depth` self-ingest guard is thread-local, so it only
