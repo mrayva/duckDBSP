@@ -1,5 +1,57 @@
 # Changelog
 
+## Baselines are never seeded from a stale read — 2026-09-04
+
+**Fixes a second silent wrong answer, on an idiom NumPad's own code shape uses**
+(though NumPad turns out not to hit it — see below).
+
+```sql
+BEGIN; INSERT INTO t VALUES (2, 3.0);
+CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t; COMMIT;
+```
+
+read `3.0` where plain SQL read `13.0`, and never healed — `7.0` against `17.0`
+after the next edit. Specific to a source FIRST TRACKED inside that transaction;
+a source tracked beforehand was always fine.
+
+Same law as the two rounds before it: **never read committed-only state on an
+internal connection while the user holds a transaction open.** Seeding a
+baseline scans through `stream_table_rows`, which opens its own connection and
+therefore cannot see the transaction's uncommitted rows.
+
+`CDCManager::seed_baseline` is now the single place a baseline is established,
+used by both `track_table_internal` and `create_view`. Inside a user
+transaction it does NOT scan: it leaves the baseline unseeded and asks the
+transaction to reconcile the table at commit, where the scan-and-diff delta
+(committed content − empty baseline) propagates into the view and makes it
+exact from that commit on. A ROLLBACK has no commit to do that, so it requests
+a view rebuild from committed storage instead. Views created in a rolled-back
+transaction still survive — DBSP view state has never been transactional — but
+they now READ CORRECTLY, which is the half that was broken.
+
+The CDC core reaches the per-connection state through two callbacks the
+extension installs at load (`dbsp_native::txn_bookkeeping()`), because
+`dbsp_context_state.hpp` includes `dbsp_cdc.hpp` and the edge must stay
+one-way.
+
+Also in this round:
+
+- `create_view` now CHECKS the seeding result. `sync_table_internal` swallows
+  its exceptions and returns false; ignoring that let a failed scan fall
+  through to the replay over the empty baseline — the very defect the seeding
+  exists to prevent. It now fails the create with `last_error_`.
+- The checkpoint-restore loop (`load_from_duck_table`) catches per view. Its
+  contract is "continue on individual failures", but `create_view` can now
+  THROW (a pre-v2.0.0 source, a failed seeding scan) and one such view aborted
+  the whole restore mid-loop, taking every later view with it.
+- `DBSP_DEBUG_SEED=1` prints one line per baseline seeding with
+  `user_txn_open=`, which is how a host can answer "am I exposed to this?"
+  rather than guess.
+
+**NumPad is not exposed** (measured, not assumed): attaching the wfp-review MV
+backend, three authority edits and `build_pending_views()` materialising 121
+views produced 25 seedings, all `user_txn_open=0`.
+
 ## create_view seeds its source baselines — 2026-09-04
 
 **Fixes a silent wrong answer on the fork's public API** (pre-existing; not
@@ -74,7 +126,7 @@ wheel, and a CI that can build against a public one.
   so a zero-row write evaluates it zero times and "fired, nothing changed" is
   indistinguishable from "did not fire".
 
-**Deleted** (`git diff --shortstat 7549a02..HEAD`, this commit included: 44 files, +2,118 / −6,158, net −4,040)
+**Deleted** (`git diff --shortstat 7549a02..HEAD`, this commit included: 44 files, +2,495 / −6,197, net −3,702)
 
 | File | Lines |
 |---|---:|

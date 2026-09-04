@@ -77,7 +77,7 @@ self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source       # 27 cases, 575 assertions
+./test_trigger_source       # 29 cases, 642 assertions
 ```
 
 Beyond the oracle it pins the paths specific to this source: the C++
@@ -137,6 +137,16 @@ one argument and prints `PASS` (exit 0) or fails loudly:
 uv run --isolated --with 'duckdb==1.6.0.dev379' --with pyarrow \
   python test/python/test_ddl_syntax.py build/dbsp.duckdb_extension
 ```
+
+**Fetch every table function.** `con.execute("SELECT * FROM dbsp_track('t')")`
+without a `.fetchall()` does NOTHING: a table function that acts in its execute
+callback never runs if its result is not consumed. Measured — `dbsp_tables()`
+returns `[]` without the fetch and `[('…main.t', 2)]` with it. `dbsp_create_view`
+happens to act in BIND, so it works either way, which is exactly what makes the
+trap quiet: a script can look like it tracks and creates, and only the create
+actually happened. `test_create_view_seeding.py` was written that way and could
+not fail until it was corrected. Fetch, and assert on what the call was supposed
+to change.
 
 They exercise what only the loadable extension on a real Python client can
 reach: the SQL DDL front door (`test_ddl_syntax.py`), `dbsp_mv_tables`

@@ -312,9 +312,9 @@ Correctness, on this tree (`ninja` build, `-j8`, stock engine
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 61.0 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.3 s |
-| `test_trigger_source` alone | **27 cases, 575 assertions** |
+| `ctest -j4` | **45/45 passed**, 57.4 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.5 s |
+| `test_trigger_source` alone | **29 cases, 642 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`
@@ -354,8 +354,8 @@ one, and the other two were deleted:
 | capture/tee state in `dbsp_context_state.hpp` | ~700 of 1321 | `TeeCapture`, `try_write_capture`, `apply_captured`, the commit guard, the G2 LocalStorage scan |
 | capture-mechanics tests | ~930 | `test_write_capture.cpp`, `test_engine_hook.cpp`, `test_engine_hook_consumer.cpp`, `bench_write_capture.cpp`, and the plan-shape canaries in `test_engine_assumptions.cpp` |
 
-Net over the whole transition: **−4,040 lines** across 44 files
-(`git diff --shortstat 7549a02..HEAD`: +2,118 / −6,158, taken with this
+Net over the whole transition: **−3,702 lines** across 44 files
+(`git diff --shortstat 7549a02..HEAD`: +2,495 / −6,197, taken with this
 commit itself in the range — a SHA cannot be quoted here without going stale
 the moment it is written), and the fork stopped being a fork of DuckDB — stock engine, stock
 PyPI wheel, a CI that can build against a public one.
@@ -394,6 +394,14 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
   unreachable — and forcing a scan on every transaction that saw a trigger
   install was rejected because it would make each `dbsp_track` cost a full
   `sync_all`.
+- **Never seed a baseline from a read the user's transaction cannot see.** The
+  seeding scan opens its own connection, so inside an open user transaction it
+  misses their uncommitted rows. `CDCManager::seed_baseline` leaves the
+  baseline unseeded there and lets the commit reconcile it by scan (a rollback
+  asks for a view rebuild instead). This is the third defect of the same
+  family in this work — the sweep's DDL, the sweep's catalog-version read, and
+  now the seeding scan. Anything the extension does on an internal connection
+  has to answer the same question first.
 - **A baseline is only "seeded" once something has scanned it.** The public
   `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
   `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
