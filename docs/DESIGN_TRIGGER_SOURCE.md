@@ -468,29 +468,59 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 - **`dbsp_untrack` does not exist**, so the sweep's drop-DDL branch runs only
   when a table stops being tracked some other way (rollback of a `dbsp_track`),
   and is otherwise unexercised.
-- **A table tracked while ANOTHER connection holds a write open is missed —
-  permanently.** Still open; it needs its own unit. It is NOT the
-  cross-connection defect the apply-path gate closed, and the two look alike:
-  there, the baseline was UNSEEDED and another connection's delta was applied
-  onto nothing; here, the baseline is seeded correctly and it is the other
-  connection's PRE-TRACKING write that no one ever accounts for. Re-measured
-  after the gate landed (`.scratch/r5_followup_i.py`): still `10.0` against
-  `13.0`, then `14.0` against `17.0`. The shape, measured:
-  connection 1 runs `BEGIN; INSERT` on an UNTRACKED table and leaves the
-  transaction open; connection 2 tracks the table (or creates a view over it)
-  and seeds the baseline from committed state — correctly, since connection 2
-  has no transaction of its own and cannot see connection 1's rows; connection
-  1 then commits. No trigger fired for that INSERT (there were no triggers when
-  it ran) and connection 1's own `touched` never named the table, so the delta
-  never happens: the view reads `10.0` against SQL `13.0`, then `14.0` against
-  `17.0`, and never heals. It is pre-existing and it is invisible to
-  `DBSP_DEBUG_SEED`, which is per-context and reports `user_txn_open=0` for
-  connection 2 — the honest answer to the wrong question. This matters to any
-  host that keeps concurrent connections against one database while an
-  authority connection holds explicit `BEGIN`s, which is how NumPad runs.
-  Candidate fixes, neither costed: a newly seeded table forces one
-  scan-reconcile at the next commit on EVERY connection of the instance; or
-  seeding waits until the instance has no open write transactions.
+- **A table tracked while ANOTHER connection holds a write open.** Closed by a
+  per-INSTANCE transaction watermark. The shape, measured: connection 1 runs
+  `BEGIN; INSERT` on an UNTRACKED table and leaves the transaction open;
+  connection 2 tracks the table (or creates a view over it) and seeds the
+  baseline from committed state — correctly, since connection 2 has no
+  transaction of its own and cannot see connection 1's rows; connection 1 then
+  commits. No trigger fired for that INSERT (there were no triggers when it
+  ran) and connection 1's own `touched` never named the table, so the delta
+  never happened: the view read `10.0` against SQL `13.0`, then `14.0` against
+  `17.0`, and never healed. It was NOT the cross-connection defect the
+  apply-path gate closed, and the two looked alike: there the baseline was
+  UNSEEDED and another connection's delta was applied onto nothing; here the
+  baseline is seeded correctly and it is the other connection's PRE-TRACKING
+  write that no one accounted for. It was also invisible to `DBSP_DEBUG_SEED`,
+  which is per-context and reported `user_txn_open=0` for connection 2 — the
+  honest answer to the wrong question.
+
+  DuckDB's transaction manager publishes what is needed:
+  `DuckTransactionManager::LowestActiveStart()`, the smallest start timestamp
+  among a database's ACTIVE transactions (and a value larger than any real
+  start once none are left). At seed time `mark_provisional_if_concurrent`
+  compares it against the seeding transaction's own `start_time`; a lower value
+  means a transaction OLDER than this one is open, so the table is marked
+  PROVISIONAL with a watermark taken by starting a transaction on the spot and
+  rolling it straight back — a start timestamp newer than every transaction
+  alive at that moment.
+
+  While provisional, both apply paths refuse the table exactly as they refuse
+  an unseeded one, so it rides the `failed` → scan-reconcile route on every
+  connection's commit. The retirement is a sweep in the commit hook
+  (`reconcile_ready_provisional`, guarded so it runs AFTER this commit's own
+  deltas were handled and cannot double-count): once `LowestActiveStart()` has
+  risen to the watermark, every transaction that existed at seed time has ended
+  and one scan pays the debt. It has to be a sweep and not just the apply path,
+  because in the reproduction the connection that repairs the view is the one
+  that writes NOTHING — at connection 1's own commit, connection 1's
+  transaction is still active, so the repair falls to the next statement on
+  connection 2, a bare `SELECT 1`.
+
+  Cost when nothing else is open: `LowestActiveStart()` is the seeding
+  transaction's own start, the comparison is false, the table is never
+  provisional, and the sweep's steady state is one atomic load per commit.
+  Pinned both ways by `test/python/test_provisional_baseline.py`, which asserts
+  six later edits cost **0** scans and **6** exact deltas in the solo case.
+  `dbsp_stats()` reports the live count as `provisional_tables`.
+
+  Residual, stated rather than hidden: a transaction that BEGINS during the
+  seeding statement is not covered by "older than mine". Its writes to a
+  still-untriggered table are the trigger-install window, which the sweep
+  already answers by marking that transaction's own commit untrusted
+  (`capture_.triggers_installed` → scan). A catalog served by a non-DuckDB
+  transaction manager has no watermark to take; the table is never marked
+  there, which is exactly the behaviour before this gate.
 - **Nothing enforces the internal-connection law.** The concrete proposal is
   NOT an assertion inside `InternalQueryGuard` — it has 39 call sites, no
   `ClientContext` to ask, and three legitimate exceptions that would

@@ -681,6 +681,32 @@ public:
   // a view over nothing and returns a permanently wrong answer with no error.
   bool baseline_seeded() const { return baseline_seeded_; }
 
+  // ---- provisional baseline (concurrent pre-tracking write) --------------
+  //
+  // A baseline seeded while ANOTHER connection held a transaction open is
+  // correct for committed storage and may still be short: that transaction
+  // could already have written this table while it was untracked and
+  // untriggered, so its commit reports nothing and those rows are never
+  // accounted for. Measured before this flag: `view 10.0 / sql 13.0`, then
+  // `14.0 / 17.0`, and it never healed.
+  //
+  // The table is marked PROVISIONAL with a transaction-manager watermark: a
+  // start timestamp newer than every transaction active at seed time. While
+  // provisional no exact delta is applied to it — every commit that would have
+  // hands it to the scan-reconcile instead. It is retired by the first
+  // successful reconcile scan taken once the watermark has cleared
+  // (`LowestActiveStart() >= watermark`: every transaction that existed at
+  // seed time has ended), which is the scan that finally sees those rows.
+  //
+  // Zero means "not provisional" — which is also what a catalog with no DuckDB
+  // transaction manager gets, since there is no watermark there to wait on.
+  void mark_provisional(uint64_t watermark) {
+    provisional_watermark_ = watermark;
+  }
+  bool is_provisional() const { return provisional_watermark_ != 0; }
+  uint64_t provisional_watermark() const { return provisional_watermark_; }
+  void clear_provisional() { provisional_watermark_ = 0; }
+
   // Install the rows fed through begin_rebuild()/add_scanned_row() as the
   // baseline WITHOUT diffing against the previous one (there is none: the
   // table was deferred). Clears the deferred flag.
@@ -879,6 +905,10 @@ private:
   // See baseline_seeded(): false until a scan (or a verified deferred restore)
   // has established this baseline from committed storage.
   bool baseline_seeded_ = false;
+  // See mark_provisional(): 0 = not provisional. Atomic because the reconcile
+  // that retires it runs under a SHARED struct lock, having already released
+  // the per-table lock the scan held.
+  std::atomic<uint64_t> provisional_watermark_{0};
   int64_t deferred_weight_ = 0; // restore-time COUNT(*)
   std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };

@@ -26,6 +26,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -146,6 +147,95 @@ struct InternalQueryGuard {
   InternalQueryGuard(const InternalQueryGuard &) = delete;
   InternalQueryGuard &operator=(const InternalQueryGuard &) = delete;
 };
+
+// ---- instance transaction watermark ---------------------------------------
+//
+// A table is seeded from COMMITTED storage. Another connection holding a
+// transaction open at that moment may already have written the table while it
+// was untracked and untriggered — invisible to the seeding scan, and no
+// trigger fired for it because there were no triggers when the statement ran.
+// Its commit then applies nothing and the view is short by those rows forever
+// (measured: `view 10.0 / sql 13.0`, then `14.0 / 17.0`).
+//
+// DuckDB's transaction manager publishes exactly the two numbers needed to
+// bound that window: `LowestActiveStart()` (the smallest start timestamp among
+// the catalog's ACTIVE transactions, and a value larger than any real start
+// once none are left) and, through a transaction started on the spot, a start
+// timestamp NEWER than every transaction currently active. A table seeded
+// while an older transaction was open is marked PROVISIONAL with the second
+// number as its watermark; the watermark has cleared once `LowestActiveStart()`
+// has risen to it, which means every transaction that existed at seed time has
+// ended.
+//
+// The transaction manager is DuckDB's own; an attached catalog served by an
+// extension (`IsDuckTransactionManager()` false) has no such watermark. Both
+// helpers return 0 there, which every caller reads as "no watermark to take",
+// leaving behaviour on those catalogs exactly as it was.
+
+// The attached database holding a canonical `catalog.schema.table` key, or
+// nullptr.
+//
+// Resolved through the DATABASE MANAGER, never through the ClientContext.
+// `resolve_table_entry` needs the transaction's catalog SNAPSHOT, and inside
+// the commit hook that snapshot is already gone: it returned nullptr on every
+// commit and the provisional sweep below never found its table (measured —
+// `cannot resolve fi.main.t` on all seven commits of the reproduction). This
+// lookup only maps a name to an attached database, which the instance owns
+// outside any transaction. The shared_ptr keeps it alive across the call, so a
+// concurrent DETACH cannot pull the transaction manager out from under it.
+// (`Catalog::GetCatalog(DatabaseInstance &, ...)` is declared in the 2.0 alpha
+// header but never defined — it does not link.)
+inline duckdb::shared_ptr<duckdb::AttachedDatabase>
+attached_of_table_key(duckdb::ClientContext &context, const std::string &key) {
+  std::string catalog_name, schema, table;
+  if (!split_table_key(key, catalog_name, schema, table)) {
+    return nullptr;
+  }
+  try {
+    auto &manager = duckdb::DatabaseManager::Get(
+        duckdb::DatabaseInstance::GetDatabase(context));
+    return manager.GetDatabase(duckdb::Identifier(catalog_name));
+  } catch (...) {
+    return nullptr; // detached, or not a name the instance knows
+  }
+}
+
+// The database's lowest active start timestamp, or 0 when it has no DuckDB
+// transaction manager.
+inline uint64_t lowest_active_start(duckdb::AttachedDatabase &attached) {
+  auto &tm = duckdb::TransactionManager::Get(attached);
+  if (!tm.IsDuckTransactionManager()) {
+    return 0;
+  }
+  return static_cast<uint64_t>(
+      duckdb::DuckTransactionManager::Get(attached).LowestActiveStart());
+}
+
+// A start timestamp strictly newer than every transaction active on `attached`
+// right now, taken by starting one and rolling it straight back. Returns 0 when
+// the database has no DuckDB transaction manager, or when the probe throws.
+//
+// It reads no data and no catalog entries — only the transaction manager's own
+// counter — so it does not fall under "never read committed-only state on an
+// internal connection while the user's transaction is open".
+inline uint64_t probe_new_start_timestamp(duckdb::ClientContext &context,
+                                          duckdb::AttachedDatabase &attached) {
+  auto &tm = duckdb::TransactionManager::Get(attached);
+  if (!tm.IsDuckTransactionManager()) {
+    return 0;
+  }
+  InternalQueryGuard guard;
+  try {
+    duckdb::Connection probe(duckdb::DatabaseInstance::GetDatabase(context));
+    probe.BeginTransaction();
+    const uint64_t start = static_cast<uint64_t>(
+        duckdb::DuckTransaction::Get(*probe.context, attached).start_time);
+    probe.Rollback();
+    return start;
+  } catch (...) {
+    return 0;
+  }
+}
 
 // Security validation functions
 
@@ -3727,6 +3817,26 @@ public:
       if (!sources.empty()) {
         propagate_changes_multi(sources);
       }
+      // Retire a PROVISIONAL baseline: this scan SUCCEEDED (it produced a
+      // delta, empty or not) and the watermark has cleared, so every
+      // transaction that was open when the table was seeded has ended and
+      // whatever it wrote is in committed storage — which is what this scan
+      // just read. Retiring on a FAILED scan would drop the debt without
+      // paying it, the same mistake the unseeded flag made once already.
+      for (size_t i = 0; i < table_names.size(); i++) {
+        if (!deltas[i].has_value()) {
+          continue;
+        }
+        auto it = tracked_tables_.find(table_names[i]);
+        if (it == tracked_tables_.end() || !it->second->is_provisional()) {
+          continue;
+        }
+        if (provisional_watermark_cleared(context, table_names[i],
+                                          *it->second)) {
+          it->second->clear_provisional();
+          provisional_count_--;
+        }
+      }
     }
 
     // Report AFTER the locks above are released: record_error_best_effort
@@ -4962,6 +5072,13 @@ public:
     if (!it->second->baseline_seeded()) {
       return false;
     }
+    // Same refusal for a PROVISIONAL baseline: seeded, correct for committed
+    // storage, and possibly short by what a concurrently open transaction had
+    // already written before the table was tracked. Reconcile by scan until
+    // the watermark clears (TrackedTable::mark_provisional).
+    if (it->second->is_provisional()) {
+      return false;
+    }
     auto lock_it = table_locks_.find(table_name);
     if (lock_it == table_locks_.end()) {
       return false;
@@ -5013,6 +5130,14 @@ public:
         failed.push_back(table_name);
         continue;
       }
+      // Same refusal for a PROVISIONAL baseline: seeded, correct for committed
+      // storage, and possibly short by what a concurrently open transaction had
+      // already written before the table was tracked. Reconcile by scan until
+      // the watermark clears (TrackedTable::mark_provisional).
+      if (it->second->is_provisional()) {
+        failed.push_back(table_name);
+        continue;
+      }
       auto lock_it = table_locks_.find(table_name);
       if (lock_it == table_locks_.end()) {
         failed.push_back(table_name);
@@ -5043,6 +5168,47 @@ public:
   // Number of table deltas applied exactly (trigger-fed) instead of
   // scan-and-diff (observable so tests can prove the fast path actually ran)
   uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
+
+  // Tables currently held PROVISIONAL (TrackedTable::mark_provisional). Zero
+  // in the ordinary single-writer session, and tests assert that.
+  uint64_t provisional_tables() const { return provisional_count_.load(); }
+
+  // Scan any table whose provisional watermark has cleared, once, and retire
+  // it. Runs from the commit hook AFTER this commit's own deltas were handled,
+  // so a table that is still provisional had its delta refused and scanned
+  // already — the scan here can never double-count.
+  //
+  // This is the step that repairs a view no later commit happens to touch: in
+  // the reproduction, connection A's pre-tracking INSERT commits and it is the
+  // NEXT statement on B — a bare `SELECT 1` — whose commit finds the watermark
+  // clear and pays the scan.
+  //
+  // Steady-state cost: one relaxed atomic load. The count is zero unless a
+  // table was seeded while another transaction was open.
+  void reconcile_ready_provisional(duckdb::ClientContext &context) {
+    if (provisional_count_.load() == 0) {
+      return;
+    }
+    if (std::getenv("DBSP_DEBUG_SEED")) {
+      std::cerr << "[dbsp] provisional sweep: count="
+                << provisional_count_.load() << "\n";
+    }
+    std::vector<std::string> ready;
+    {
+      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+      for (const auto &[name, table] : tracked_tables_) {
+        if (table->is_provisional() &&
+            provisional_watermark_cleared(context, name, *table)) {
+          ready.push_back(name);
+        }
+      }
+    }
+    if (ready.empty()) {
+      return;
+    }
+    // sync_tables retires each one whose scan succeeded.
+    sync_tables(context, ready, /*do_parallel=*/false);
+  }
 
   // Monotonic count of baseline mutations, advanced on every propagated
   // mutation and on full rebuilds.
@@ -5755,8 +5921,97 @@ private:
     auto it = tracked_tables_.find(table_name);
     if (it != tracked_tables_.end()) {
       it->second->consume_changes();
+      mark_provisional_if_concurrent(context, table_name, *it->second);
     }
     return true;
+  }
+
+  // A baseline scanned from committed storage is short by whatever an ALREADY
+  // OPEN transaction on another connection wrote to this table before it was
+  // tracked: the scan cannot see those rows, and no trigger fired for them
+  // because there were no triggers when the statement ran. That commit reports
+  // nothing, and the view stays short forever (`10.0` against `13.0`, then
+  // `14.0` against `17.0`).
+  //
+  // So: if any transaction OLDER than this one is active on the table's
+  // catalog, mark the table provisional and record a watermark newer than
+  // every transaction alive right now. TrackedTable::mark_provisional explains
+  // what the flag costs and what retires it.
+  //
+  // "Older than this one" is what `LowestActiveStart() < my start` says, and it
+  // is the shape that produced the defect. A transaction that begins DURING
+  // this seeding statement is not covered here — its writes to a still-
+  // untriggered table are the trigger-install window, which the sweep already
+  // answers by marking that transaction's own commit untrusted
+  // (`capture_.triggers_installed` → scan).
+  //
+  // Cost when nothing else is open: `LowestActiveStart()` is this transaction's
+  // own start, the comparison is false, and the table is never provisional —
+  // no extra scan, ever. That is the ordinary single-writer case.
+  void mark_provisional_if_concurrent(duckdb::ClientContext &context,
+                                      const std::string &table_name,
+                                      TrackedTable &table) {
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return;
+      }
+      const uint64_t lowest = lowest_active_start(*attached);
+      if (lowest == 0) {
+        return; // catalog has no DuckDB transaction manager
+      }
+      const uint64_t mine = static_cast<uint64_t>(
+          duckdb::DuckTransaction::Get(context, *attached).start_time);
+      if (lowest >= mine) {
+        return; // nothing older than this transaction is open
+      }
+      const uint64_t watermark = probe_new_start_timestamp(context, *attached);
+      if (watermark == 0) {
+        return;
+      }
+      if (!table.is_provisional()) {
+        provisional_count_++;
+      }
+      table.mark_provisional(watermark);
+      if (std::getenv("DBSP_DEBUG_SEED")) {
+        std::cerr << "[dbsp] provisional " << table_name
+                  << " lowest_active_start=" << lowest << " mine=" << mine
+                  << " watermark=" << watermark << "\n";
+      }
+    } catch (const std::exception &e) {
+      // A watermark that cannot be taken must not fail the seeding: the table
+      // stays non-provisional, which is exactly the behaviour before this gate.
+      record_error_best_effort(std::string("DBSP: could not take a seed "
+                                           "watermark for '") +
+                               table_name + "': " + e.what());
+    }
+  }
+
+  // Has every transaction that was active when `table` was seeded ended?
+  // Zero watermark (not provisional, or no DuckDB transaction manager) reads
+  // as cleared.
+  bool provisional_watermark_cleared(duckdb::ClientContext &context,
+                                     const std::string &table_name,
+                                     const TrackedTable &table) {
+    const uint64_t watermark = table.provisional_watermark();
+    if (watermark == 0) {
+      return true;
+    }
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return false;
+      }
+      const uint64_t lowest = lowest_active_start(*attached);
+      if (std::getenv("DBSP_DEBUG_SEED")) {
+        std::cerr << "[dbsp] provisional check " << table_name
+                  << " lowest=" << lowest << " watermark=" << watermark
+                  << "\n";
+      }
+      return lowest == 0 || lowest >= watermark;
+    } catch (...) {
+      return false;
+    }
   }
 
   bool track_table_internal(duckdb::ClientContext &context,
@@ -6520,6 +6775,9 @@ private:
   // was already loaded by an earlier call".
   size_t last_skipped_count_ = 0;
   std::atomic<uint64_t> captured_delta_syncs_{0};
+  // Tables currently PROVISIONAL. The commit hook's sweep loads this and
+  // returns when it is zero, which is every commit of an ordinary session.
+  std::atomic<uint64_t> provisional_count_{0};
   std::atomic<uint64_t> scan_syncs_{0};
   // Advances on every propagated baseline mutation and on full rebuilds.
   std::atomic<uint64_t> commit_seq_{0};

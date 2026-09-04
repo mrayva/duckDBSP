@@ -190,9 +190,16 @@ SELECT * FROM dbsp_stats();
 -- trigger_rows          12   row images buffered
 -- captured_delta_syncs   4   table deltas applied exactly (no scan)
 -- scan_syncs             2   scan-and-diff reconciles
+-- provisional_tables     0   baselines awaiting a concurrency watermark
 ```
 
 With `DBSP_TIMING=1` the trigger path prints `[dbsp-timing] trigger_ingest`.
+
+`provisional_tables` is 0 in a single-writer session. It counts tables seeded
+while ANOTHER connection had a transaction open: that transaction may already
+have written the table before it was tracked — invisible to the seeding scan
+and reported by no trigger — so the table takes no exact deltas and is
+reconciled by scan until every transaction alive at seed time has ended.
 
 ### Python probe scripts
 

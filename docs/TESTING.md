@@ -160,6 +160,14 @@ whole claim of that source and something no in-tree binary can demonstrate. It
 also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
 suffice) and that an attached catalog holding a triggered table still detaches.
 
+`test_provisional_baseline.py` is the concurrency sibling: connection A holds
+`BEGIN; INSERT` on an UNTRACKED table while connection B tracks it and seeds
+from committed state. It asserts the reproduction heals (both backends, and
+with A ending in COMMIT and in ROLLBACK), that `provisional_tables` goes 1 then
+back to 0, and — the half that keeps the fix from being a tax — that a seeding
+with no other transaction open is never provisional and that six later edits
+then cost **0** scans and **6** exact deltas.
+
 `test_unseeded_read.py` pins the read surfaces against a baseline nothing has
 scanned. It needs two connections against one database, which is why it lives
 here: connection A holds `BEGIN; dbsp_create_view(...)` open, and `dbsp_query`
@@ -170,7 +178,7 @@ by the deferred rows cannot hide as a constant offset.
 
 **Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** one.
 `test_mv_tables.py` (`disable must stop mirroring`), pre-existing and unrelated
-to the delta source. 27 of the 28 scripts exit 0.
+to the delta source. 28 of the 29 scripts exit 0.
 
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown

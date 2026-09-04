@@ -366,6 +366,33 @@ public:
       }
     } checkpoint_guard{manager, context};
 
+    // A table seeded while ANOTHER connection held a transaction open is
+    // PROVISIONAL: that transaction may already have written it before it was
+    // tracked, and neither the seeding scan nor any trigger saw those rows.
+    // The repair is one scan, taken once every transaction alive at seed time
+    // has ended, on whichever connection commits next — including a commit
+    // that touched nothing at all, which is the case the reproduction needs
+    // (at connection A's own commit, A's transaction is still active).
+    //
+    // It runs AFTER the branches below, so a table that is still provisional
+    // has had this commit's delta refused and scanned already and this scan
+    // cannot double-count. Declared after checkpoint_guard so it destructs
+    // FIRST: the piggybacked checkpoint save must see the repaired state.
+    struct ProvisionalGuard {
+      CDCManager &m;
+      duckdb::ClientContext &ctx;
+      ~ProvisionalGuard() {
+        try {
+          m.reconcile_ready_provisional(ctx);
+        } catch (const std::exception &ex) {
+          std::cerr << "DBSP provisional reconcile error: " << ex.what()
+                    << "\n";
+        } catch (...) {
+          std::cerr << "DBSP provisional reconcile unknown error\n";
+        }
+      }
+    } provisional_guard{manager, context};
+
     try {
       // Trigger-fed fast path: the bodies reported this transaction's exact
       // per-table images — facts need no guards. unknown_writes still forces

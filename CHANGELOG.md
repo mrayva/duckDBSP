@@ -1,5 +1,63 @@
 # Changelog
 
+## A baseline seeded beside an open transaction is PROVISIONAL — 2026-09-04
+
+The seeding scan reads COMMITTED storage. If another connection already holds a
+transaction that wrote the table while it was UNTRACKED, that write is invisible
+to the scan and fired no trigger — there were no triggers when the statement
+ran. Its commit reported nothing and the view stayed short forever:
+
+```
+after A commit:      view 10.0   sql 13.0
+after a later edit:  view 14.0   sql 17.0
+```
+
+Pre-existing, and not the cross-connection defect the apply-path gate closed:
+there the baseline was UNSEEDED, here it is seeded correctly and it is the other
+connection's PRE-TRACKING write that nobody accounted for.
+
+DuckDB's transaction manager publishes what is needed.
+`mark_provisional_if_concurrent` compares `DuckTransactionManager::
+LowestActiveStart()` — the smallest start timestamp among the database's active
+transactions — against the seeding transaction's own `start_time`. A lower value
+means a transaction OLDER than this one is open, so the table is marked
+PROVISIONAL with a watermark taken by starting a transaction on the spot and
+rolling it straight back: a start timestamp newer than every transaction alive
+then.
+
+While provisional, both apply paths refuse the table exactly as they refuse an
+unseeded one, so it rides the `failed` → scan-reconcile route on every
+connection's commit. Retirement is a sweep in the commit hook
+(`reconcile_ready_provisional`, ordered AFTER this commit's own deltas so it
+cannot double-count): once `LowestActiveStart()` has risen to the watermark,
+every transaction that existed at seed time has ended and one scan pays the
+debt. It has to be a sweep and not just the apply path — in the reproduction the
+connection that repairs the view writes NOTHING. At connection A's own commit
+A's transaction is still active, so the repair falls to the next statement on B,
+a bare `SELECT 1`.
+
+The lookup goes through the DATABASE MANAGER, not the ClientContext:
+`resolve_table_entry` needs the transaction's catalog snapshot, and inside the
+commit hook that snapshot is gone — it returned nullptr on all seven commits of
+the reproduction and the sweep never found its table.
+(`Catalog::GetCatalog(DatabaseInstance &, ...)` is declared in the 2.0 alpha
+header but never defined; it does not link.)
+
+Costs nothing when nothing else is open: `LowestActiveStart()` is the seeding
+transaction's own start, the table is never provisional, and the sweep's steady
+state is one atomic load per commit. `test/python/test_provisional_baseline.py`
+asserts six later edits cost **0** scans and **6** exact deltas in that case,
+and covers the reproduction and its ROLLBACK variant on both backends plus a
+NumPad-shaped reader control. New `dbsp_stats()` row `provisional_tables`
+reports the live count.
+
+Residual, stated rather than hidden: a transaction that BEGINS during the
+seeding statement is not covered by "older than mine" — its writes to a
+still-untriggered table are the trigger-install window, which the sweep already
+answers by marking that transaction's own commit untrusted. A catalog served by
+a non-DuckDB transaction manager has no watermark to take and is never marked,
+which is the behaviour before this gate.
+
 ## A read surface refuses an unseeded baseline — 2026-09-04
 
 The apply-path gate below closed the case where a delta is applied onto a

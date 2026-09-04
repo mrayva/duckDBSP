@@ -1139,6 +1139,14 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
       {"trigger_rows",
        NumericCast<int64_t>(
            dbsp_native::trigger_source_stats().trigger_rows.load())},
+      // Tables held PROVISIONAL: seeded while another connection had a
+      // transaction open, so an exact delta is refused and the table is
+      // reconciled by scan until every transaction alive at seed time has
+      // ended (TrackedTable::mark_provisional). Zero in an ordinary
+      // single-writer session — a non-zero value that never falls is a
+      // connection sitting on an open transaction.
+      {"provisional_tables",
+       NumericCast<int64_t>(manager.provisional_tables())},
   };
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("metric");

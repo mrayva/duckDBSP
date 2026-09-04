@@ -845,6 +845,7 @@ SELECT * FROM dbsp_stats();
 -- tracked_tables        | 4
 -- trigger_syncs         | 1310   -- trigger-body ingest calls served
 -- trigger_rows          | 5218   -- row images they buffered
+-- provisional_tables    | 0      -- baselines awaiting a concurrency watermark
 ```
 
 `trigger_syncs` is the proof of life: it stays 0 until a generated trigger body
@@ -852,6 +853,15 @@ has actually delivered, so a database whose triggers never fire is
 distinguishable from one with nothing to report. An UPDATE fires ONE trigger
 whose body evaluates the ingest scalar TWICE — the two arms of a UNION ALL over
 the old and new transition tables — so it adds 2.
+
+`provisional_tables` counts tables seeded while ANOTHER connection had a
+transaction open. Such a transaction may already have written the table before
+it was tracked — invisible to the seeding scan and reported by no trigger — so
+the table takes no exact deltas and is reconciled by scan until every
+transaction alive at seed time has ended, at which point one scan retires it.
+It is 0 in an ordinary single-writer session. A value that never falls means a
+connection is sitting on an open transaction; every commit is paying a scan of
+those tables until it ends.
 
 ### dbsp_parallel(enable)
 
