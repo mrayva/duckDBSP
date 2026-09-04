@@ -79,6 +79,8 @@
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
 #include "dbsp_recovery.hpp"
+
+#include "duckdb/main/settings.hpp"
 #include "dbsp_trigger_source.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
@@ -484,38 +486,80 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   data.done = true;
 }
 
-// A read surface must not serve a view standing on a baseline nothing has
-// scanned. Seeding is DEFERRED while a user transaction is open — the seeding
+// A read surface must not serve a view whose answer may be wrong. Two ways
+// that happens, and this gate asks about both.
+//
+// UNSEEDED. Seeding is DEFERRED while a user transaction is open — the seeding
 // scan runs on an internal connection and cannot see that transaction's own
 // rows — so between `BEGIN; dbsp_create_view(...)` and that transaction's end
 // the view holds the empty answer. Measured before this gate: `dbsp_query`
 // returned NULL where plain SQL read 10.0, on the deferring connection and on
 // every other connection of the instance, on :memory: and on a file.
 //
-// It REFUSES rather than reconciling. Reconciling here would mean scanning the
-// table on an internal connection while the reader's own transaction is open,
-// which is exactly the read that produced the empty baseline in the first
-// place; and on the deferring connection that transaction is open by
-// construction. The debt is paid where it can be: at the deferring
-// transaction's COMMIT (which widens itself to a scan-and-diff), by an
-// explicit `dbsp_sync()`, or by a ROLLBACK's view rebuild.
+// PROVISIONAL. The baseline was seeded correctly and may still be short by
+// what a concurrently open transaction had written before the table was
+// tracked. The repair runs from the COMMIT hook, which fires AFTER the bind
+// that serves a read — so the FIRST read after the deferring transaction
+// committed, with no statement in between, was served from the short baseline:
+// measured `view 10.0 / sql 13.0` on both backends, the next read returning
+// 13.0. Transient, no error, wrong.
 //
-// `dbsp_view_state` is deliberately NOT gated: it reports row counts as
-// DIAGNOSTICS, and a diagnostic that refuses while the state is broken is
-// useless precisely when it is needed.
-static void RefuseIfUnseeded(dbsp_native::CDCManager &manager,
-                             const string &fn, const string &view_name) {
-  const string bad = manager.unseeded_source_of_view(view_name);
-  if (bad.empty()) {
+// A PROVISIONAL block is REPAIRABLE, so this tries the repair before refusing:
+// once every transaction that was alive at seed time has ended, one scan of
+// committed storage is exactly what the baseline is missing.
+// `reconcile_ready_provisional` does that and retires the flag. It is only
+// legal when the READER holds no transaction of its own — the scan opens an
+// internal connection, and running it inside the reader's transaction is the
+// very read that produces a wrong baseline. In autocommit (every ordinary
+// `SELECT * FROM dbsp_query(...)`) it is legal, which is why the first read
+// now answers correctly instead of refusing.
+//
+// An UNSEEDED block is NOT repairable here: the rows that are missing live in
+// another connection's UNCOMMITTED transaction, so no scan can find them. It
+// refuses. So does a PROVISIONAL block the repair could not clear — the
+// watermark has not cleared yet, the reader is inside its own transaction, or
+// the scan failed.
+//
+// `dbsp_view_state()` is not gated. It takes no view argument — it reports
+// row counts for every registered view — so there is no view for this gate to
+// ask about, and its numbers are diagnostics: a diagnostic that refuses while
+// the state is broken is useless exactly when it is needed.
+static void EnsureViewReadable(ClientContext &context,
+                               dbsp_native::CDCManager &manager,
+                               const string &fn, const string &view_name) {
+  using Block = dbsp_native::CDCManager::ViewReadBlock;
+  auto block = manager.view_read_block(view_name);
+  if (block.kind == Block::Kind::None) {
     return;
   }
+  if (block.kind == Block::Kind::Provisional &&
+      !dbsp_native::user_transaction_open(context)) {
+    manager.reconcile_ready_provisional(
+        context, dbsp_native::InternalReadPolicy::Forbidden,
+        "provisional reconcile at read");
+    block = manager.view_read_block(view_name);
+    if (block.kind == Block::Kind::None) {
+      return;
+    }
+  }
+  if (block.kind == Block::Kind::Unseeded) {
+    throw InvalidInputException(
+        fn + "('" + view_name + "'): source table '" + block.table +
+        "' has an UNSEEDED baseline — its seeding scan was deferred because a "
+        "transaction was open when the view was created, and nothing has "
+        "scanned the table since. Reading now would return the unseeded "
+        "(empty) answer, not the table's content. End that transaction (COMMIT "
+        "or ROLLBACK), or run dbsp_sync(), and read again.");
+  }
   throw InvalidInputException(
-      fn + "('" + view_name + "'): source table '" + bad +
-      "' has an UNSEEDED baseline — its seeding scan was deferred because a "
-      "transaction was open when the view was created, and nothing has "
-      "scanned the table since. Reading now would return the unseeded "
-      "(empty) answer, not the table's content. End that transaction (COMMIT "
-      "or ROLLBACK), or run dbsp_sync(), and read again.");
+      fn + "('" + view_name + "'): source table '" + block.table +
+      "' has a PROVISIONAL baseline — it was seeded while another connection "
+      "held a transaction open, and that transaction may already have written "
+      "the table before it was tracked. Those rows are not in committed "
+      "storage yet, so no scan can recover them and this view may be short by "
+      "them. It clears once every transaction that was open at seed time has "
+      "ended; `SELECT * FROM dbsp_stats()` reports the count as "
+      "`provisional_tables`.");
 }
 
 // ============================================================================
@@ -545,7 +589,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
-  RefuseIfUnseeded(manager, "dbsp_query", data->view_name);
+  EnsureViewReadable(context, manager, "dbsp_query", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -637,7 +681,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
-  RefuseIfUnseeded(manager, "dbsp_changes", data->view_name);
+  EnsureViewReadable(context, manager, "dbsp_changes", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   bool found = manager.scan_view_delta(
@@ -1119,8 +1163,9 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
 // the extension never sees. It is NULL on every numeric row.
 struct StatsMetric {
   string name;
-  int64_t value;
-  string detail;      // empty -> NULL
+  int64_t value = 0;
+  bool has_value = true; // false -> NULL, for a row that is text-only
+  string detail;         // empty -> NULL
   bool has_detail = false;
 };
 
@@ -1173,9 +1218,11 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
       {"reconcile_failures",
        NumericCast<int64_t>(manager.reconcile_failures())},
   };
+  // value is NULL on this row: it is a TEXT metric, and repeating the
+  // reconcile_failures count there just invited it to be read as something of
+  // its own.
   const string last_reconcile = manager.last_reconcile_error();
-  data->metrics.push_back({"last_reconcile_error",
-                           NumericCast<int64_t>(manager.reconcile_failures()),
+  data->metrics.push_back({"last_reconcile_error", 0, /*has_value=*/false,
                            last_reconcile, !last_reconcile.empty()});
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("metric");
@@ -1193,7 +1240,9 @@ void StatsFunc(ClientContext &context, TableFunctionInput &input,
   while (data.current < data.metrics.size() && count < STANDARD_VECTOR_SIZE) {
     const auto &m = data.metrics[data.current];
     output.SetValue(0, count, Value(m.name));
-    output.SetValue(1, count, Value::BIGINT(m.value));
+    output.SetValue(1, count,
+                    m.has_value ? Value::BIGINT(m.value)
+                                : Value(LogicalType::BIGINT));
     output.SetValue(2, count,
                     m.has_detail ? Value(m.detail) : Value(LogicalType::VARCHAR));
     data.current++;

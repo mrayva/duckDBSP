@@ -84,12 +84,15 @@ def repro(label, a, b, end):
           f"{label}: the seed was marked provisional")
 
     a.execute(end)
-    # A statement on B whose commit finds the watermark clear: this is the one
-    # that pays the repair scan. It writes nothing.
-    b.execute("SELECT 1").fetchall()
-    agree(f"{label}/after A {end}", b)
+    # THE FIRST READ, with no statement in between. This is the assertion that
+    # matters: the repair runs from the COMMIT hook, which fires AFTER the bind
+    # that serves a read, so stepping over the window with a `SELECT 1` first
+    # would make this test unable to fail. Measured before the read gate
+    # learned about PROVISIONAL: first read 10.0 against sql 13.0, second read
+    # 13.0 — transient, no error, wrong.
+    agree(f"{label}/FIRST read after A {end}", b)
     check(stats(b)["provisional_tables"] == 0,
-          f"{label}: the flag was retired after the repair scan")
+          f"{label}: the flag was retired by the first read")
 
     # And it stays exact through later edits from both connections.
     b.execute("INSERT INTO t VALUES (3, 4.0)")

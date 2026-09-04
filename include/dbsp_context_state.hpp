@@ -383,7 +383,27 @@ public:
       duckdb::ClientContext &ctx;
       ~ProvisionalGuard() {
         try {
-          m.reconcile_ready_provisional(ctx);
+          // FORBIDDEN, on a measurement rather than an assumption. This runs
+          // from TransactionCommit, which fires AFTER Commit() has succeeded,
+          // so the rows this scan reads are committed — including the ones
+          // this very transaction just wrote. The open question was whether
+          // the ClientContext still reports an open user transaction here,
+          // which would make a Forbidden policy throw on exactly the commit
+          // that repairs the view. It does NOT: with this set to Forbidden,
+          // the strict-mode case below commits an EXPLICIT transaction while a
+          // table is provisional-and-ready and passes (26 assertions), so
+          // user_transaction_open(context) is false by the time the hook runs.
+          //
+          // Forbidden and not whitelisted, because that is the honest state:
+          // if the engine ever starts reporting the transaction as open here,
+          // DBSP_STRICT_INTERNAL_QUERY=1 says so instead of a comment quietly
+          // going stale. Pinned by `cdc: a provisional baseline retires under
+          // the strict internal-query switch` in
+          // test/unit/test_trigger_source.cpp, which is the only case in the
+          // suite where provisional_tables is ever non-zero.
+          m.reconcile_ready_provisional(
+              ctx, dbsp_native::InternalReadPolicy::Forbidden,
+              "provisional reconcile at commit");
         } catch (const std::exception &ex) {
           std::cerr << "DBSP provisional reconcile error: " << ex.what()
                     << "\n";

@@ -895,6 +895,17 @@ public:
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
 
     try {
+      // WHITELISTED for the DDL below AND the per-source watermark reads
+      // further down. The DDL creates DBSP's OWN bookkeeping tables
+      // (_dbsp_ckpt*), never the user's, so it never needs to see their
+      // uncommitted catalog — the hazard the sweep's DDL hit. The watermarks
+      // describe COMMITTED storage and are compared against committed storage
+      // at restore, beside circuit state that is likewise committed-only
+      // (deltas apply at commit), so a reader that cannot see an open
+      // transaction's rows is reading exactly the right thing.
+      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                   "save_checkpoint (bookkeeping DDL + "
+                                   "source watermarks)");
       DbspScopeTimer t_write("ckpt_write", "tables+watermarks");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
@@ -1317,6 +1328,12 @@ public:
 
   bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out,
                         const std::string &catalog = "") {
+    // WHITELISTED. Restore-time verification: it compares the SAVED watermark
+    // against live COMMITTED storage, which is the state the saved circuit
+    // corresponds to. Reached from load_from_duck_table, which can run inside
+    // an open user transaction.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "checkpoint_valid (restore watermarks)");
     const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
     const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
@@ -1984,6 +2001,11 @@ public:
     }
     try {
       // Fresh connection: `context` is mid-query inside a table function.
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                   "save_view_definitions");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("BEGIN");
@@ -2729,6 +2751,12 @@ public:
 
         // Use a fresh connection: `context` is mid-query (we run inside a table
         // function on it), so context.Query() would block on the context lock.
+        // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the
+        // user's, so it never needs to see their uncommitted catalog — the
+        // hazard the sweep's DDL hit.
+        enforce_internal_read_policy(context,
+                                     InternalReadPolicy::AllowedInTxn,
+                                     "create_view _dbsp_views upsert");
         InternalQueryGuard guard;
         duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
         con.Query("CREATE TABLE IF NOT EXISTS _dbsp_views (name VARCHAR "
@@ -3000,6 +3028,13 @@ public:
   // must materialize first (D3c).
   void register_arrangements(duckdb::ClientContext &context,
                              PlannedCircuitView &pview, bool cold) {
+    // WHITELISTED for the sidecar watermark read below. It stamps a shared
+    // arrangement's on-disk index with the COMMITTED state that arrangement
+    // was built from, and it is compared against committed storage when the
+    // sidecar is adopted. Reached from create_view, which can run inside an
+    // open user transaction.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "register_arrangements (sidecar watermark)");
     for (const auto &req : pview.arrangement_requests()) {
       const bool source_is_table = tracked_tables_.count(req.table) > 0;
       const bool source_is_view = views_.count(req.table) > 0;
@@ -4396,25 +4431,45 @@ public:
     return it->second.get();
   }
 
-  // Name of a source TABLE this view transitively reads whose baseline has
-  // never been established, or "" when every source is seeded.
+  // Why a READ of this view cannot be served, if it cannot.
   //
-  // An unseeded baseline is EMPTY because nothing has scanned it yet, not
+  // UNSEEDED: the baseline is EMPTY because nothing has scanned it yet, not
   // because the table is empty (TrackedTable::baseline_seeded). A view
-  // replayed over one holds the empty answer: measured, `dbsp_query` returned
-  // NULL where SQL read 10.0, on the connection holding
+  // replayed over one holds the empty answer — measured, `dbsp_query`
+  // returned NULL where SQL read 10.0, on the connection holding
   // `BEGIN; dbsp_create_view(...)` open AND on every other connection, until
-  // that transaction ended. The apply path already refuses to apply an exact
-  // delta onto such a baseline; this is what the READ surfaces ask.
+  // that transaction ended.
+  //
+  // PROVISIONAL: the baseline was seeded correctly from committed storage
+  // while ANOTHER connection held a transaction open, so it may be short by
+  // what that transaction had already written to the table before it was
+  // tracked (TrackedTable::mark_provisional). The repair is a scan taken once
+  // that transaction ends, and it runs from the COMMIT hook — which fires
+  // AFTER the bind that serves a read. So the FIRST read after the deferring
+  // transaction's commit, with no statement in between, was served from the
+  // short baseline: measured `view 10.0 / sql 13.0` on both backends, with
+  // the very next read returning 13.0. A transiently wrong answer with no
+  // error is the one thing the design does not allow, so the read surfaces
+  // ask this question too.
   //
   // Sources can be other views, so the walk is transitive. A cyclic definition
   // cannot be created (create_view rejects cycles), but `seen` keeps a
-  // corrupted one from looping.
-  std::string unseeded_source_of_view(const std::string &view_name) {
+  // corrupted one from looping. UNSEEDED is reported in preference to
+  // PROVISIONAL: it is the stricter condition and it cannot be repaired by a
+  // scan at all.
+  struct ViewReadBlock {
+    enum class Kind { None, Unseeded, Provisional };
+    Kind kind = Kind::None;
+    std::string table;
+  };
+
+  ViewReadBlock view_read_block(const std::string &view_name) {
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
     std::unordered_set<std::string> seen;
-    return unseeded_source_locked(view_name, seen);
+    ViewReadBlock out;
+    view_read_block_locked(view_name, seen, out);
+    return out;
   }
 
   // Scan a view's rows under shared locks: safe against concurrent
@@ -5236,13 +5291,15 @@ public:
   //
   // Steady-state cost: one relaxed atomic load. The count is zero unless a
   // table was seeded while another transaction was open.
-  void reconcile_ready_provisional(duckdb::ClientContext &context) {
+  void reconcile_ready_provisional(duckdb::ClientContext &context,
+                                   InternalReadPolicy policy,
+                                   const char *site) {
     if (provisional_count_.load() == 0) {
       return;
     }
     if (std::getenv("DBSP_DEBUG_SEED")) {
       std::cerr << "[dbsp] provisional sweep: count="
-                << provisional_count_.load() << "\n";
+                << provisional_count_.load() << " site=" << site << "\n";
     }
     std::vector<std::string> ready;
     {
@@ -5258,7 +5315,7 @@ public:
       return;
     }
     // sync_tables retires each one whose scan succeeded.
-    sync_tables(context, ready, /*do_parallel=*/false);
+    sync_tables(context, ready, /*do_parallel=*/false, nullptr, policy, site);
   }
 
   // Monotonic count of baseline mutations, advanced on every propagated
@@ -5580,10 +5637,16 @@ private:
 
   // Live COUNT(*) + bit_xor(hash) of a table, matching the watermark format
   // written by save_checkpoint. Returns false on query failure.
+  // Committed COUNT + row-hash of a USER table, on a fresh internal
+  // connection. Same hazard shape as stream_table_rows — it reads
+  // committed-only state — so it carries the caller's policy rather than
+  // deciding for itself.
   static bool live_watermark(duckdb::ClientContext &context,
                              const std::string &table_key, int64_t &count,
-                             std::string &hash) {
+                             std::string &hash, InternalReadPolicy policy,
+                             const char *site) {
     try {
+      enforce_internal_read_policy(context, policy, site);
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       // Shadow-proof alias — see save_checkpoint's watermark loop.
@@ -5631,7 +5694,8 @@ private:
     if (it->second->is_deferred()) {
       int64_t live_count = 0;
       std::string live_hash;
-      if (live_watermark(context, table_name, live_count, live_hash) &&
+      if (live_watermark(context, table_name, live_count, live_hash, policy,
+                         site) &&
           live_count == it->second->deferred_weight() &&
           live_hash == it->second->deferred_hash()) {
         return DuckDBZSet(); // unchanged since restore: stay lazy
@@ -5948,28 +6012,38 @@ private:
     last_reconcile_error_ = message;
   }
 
-  // Caller holds struct_mutex_ and view_mutex_ shared. See
-  // unseeded_source_of_view().
-  std::string unseeded_source_locked(const std::string &name,
-                                     std::unordered_set<std::string> &seen) {
+  // Caller holds struct_mutex_ and view_mutex_ shared. See view_read_block().
+  // Keeps walking after finding a PROVISIONAL source so an UNSEEDED one
+  // anywhere in the tree wins.
+  void view_read_block_locked(const std::string &name,
+                              std::unordered_set<std::string> &seen,
+                              ViewReadBlock &out) {
+    if (out.kind == ViewReadBlock::Kind::Unseeded) {
+      return; // nothing outranks this
+    }
     if (!seen.insert(name).second) {
-      return "";
+      return;
     }
     auto tbl = tracked_tables_.find(name);
     if (tbl != tracked_tables_.end()) {
-      return tbl->second->baseline_seeded() ? "" : name;
+      if (!tbl->second->baseline_seeded()) {
+        out = {ViewReadBlock::Kind::Unseeded, name};
+      } else if (tbl->second->is_provisional() &&
+                 out.kind == ViewReadBlock::Kind::None) {
+        out = {ViewReadBlock::Kind::Provisional, name};
+      }
+      return;
     }
     auto vw = views_.find(name);
     if (vw == views_.end()) {
-      return "";
+      return;
     }
     for (const auto &src : vw->second->source_tables()) {
-      const std::string bad = unseeded_source_locked(src, seen);
-      if (!bad.empty()) {
-        return bad;
+      view_read_block_locked(src, seen, out);
+      if (out.kind == ViewReadBlock::Kind::Unseeded) {
+        return;
       }
     }
-    return "";
   }
 
   bool seed_baseline(duckdb::ClientContext &context,

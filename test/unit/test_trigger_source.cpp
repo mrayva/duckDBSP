@@ -1329,6 +1329,68 @@ TEST_CASE("cdc: an uncommitted source table is named as such, not 'missing'",
   }
 }
 
+TEST_CASE("cdc: a provisional baseline retires under the strict internal-query "
+          "switch",
+          "[trigger_source][provisional]") {
+  // Two things at once.
+  //
+  // (1) The provisional repair runs from the COMMIT hook and opens an internal
+  //     connection to scan. Whether that is legal turns on one question nobody
+  //     had asked: does the ClientContext still report the user's transaction
+  //     as OPEN inside TransactionCommit? If it did, the `Forbidden` policy on
+  //     reconcile_ready_provisional would throw on exactly the commit that
+  //     repairs the view. MEASURED here, with an EXPLICIT BEGIN/COMMIT on
+  //     connection b while the table is provisional-and-ready: it does not —
+  //     this case passes under `DBSP_STRICT_INTERNAL_QUERY=1` with the policy
+  //     set to Forbidden. So Forbidden is what the call site says, and the
+  //     switch will report it loudly if the engine ever changes that, instead
+  //     of a whitelist comment quietly going stale.
+  //
+  // (2) `provisional_tables` was 0 in every other case in the suite, so the
+  //     sweep's scan was never reached under the strict switch at all.
+  arm_trigger_source();
+
+  DuckDBTestHarness db; // connection A
+  db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+  duckdb::Connection b(db.instance());
+
+  // A holds a transaction with a PRE-TRACKING write; B tracks and seeds from
+  // committed state, which cannot see it.
+  db.exec("BEGIN TRANSACTION");
+  db.exec("INSERT INTO t VALUES (2, 3.0)");
+  REQUIRE_FALSE(b.Query("SELECT * FROM dbsp_track('t')")->HasError());
+  REQUIRE_FALSE(
+      b.Query("SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM "
+              "t')")
+          ->HasError());
+  REQUIRE(db.manager().provisional_tables() == 1);
+
+  db.exec("COMMIT");
+
+  // B's own EXPLICIT transaction. Its commit hook is where the sweep runs with
+  // a user transaction open — the shape that discriminates under the switch.
+  REQUIRE_FALSE(b.Query("BEGIN TRANSACTION")->HasError());
+  REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (3, 4.0)")->HasError());
+  REQUIRE_FALSE(b.Query("COMMIT")->HasError());
+
+  REQUIRE(db.manager().provisional_tables() == 0);
+
+  auto view = b.Query("SELECT * FROM dbsp_query('tv')");
+  auto sql = b.Query("SELECT SUM(v) FROM t");
+  REQUIRE_FALSE(view->HasError());
+  REQUIRE_FALSE(sql->HasError());
+  REQUIRE(view->GetValue(0, 0).GetValue<double>() ==
+          sql->GetValue(0, 0).GetValue<double>()); // 17.0, not 14.0
+
+  // And it stays exact through a later edit on each connection.
+  db.exec("INSERT INTO t VALUES (4, 5.0)");
+  REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 6.0)")->HasError());
+  REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->GetValue(0, 0)
+              .GetValue<double>() ==
+          b.Query("SELECT SUM(v) FROM t")->GetValue(0, 0).GetValue<double>());
+}
+
 TEST_CASE("cdc: an unseeded baseline is never served to another connection",
           "[trigger_source][create_view]") {
   // The deferred-seeding debt is per-CONNECTION, but the baseline it refers to
