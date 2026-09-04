@@ -440,6 +440,35 @@ inline std::string schema_fingerprint(const TableSchema &schema) {
   return fp;
 }
 
+/// A SQL string literal with quotes doubled.
+inline std::string sql_literal(const std::string &v) {
+  std::string out = "'";
+  for (char c : v) {
+    if (c == '\'') {
+      out += "''";
+    } else {
+      out += c;
+    }
+  }
+  return out + "'";
+}
+
+/// Does the sink table for this catalog/schema already exist? Asked on the
+/// internal connection so it reflects a fresh snapshot; skipping the CREATE
+/// when it does is what keeps the common sweep out of the catalog-write path
+/// altogether (see the write-write conflict note in install_pending_triggers).
+inline bool sink_exists(duckdb::Connection &con, const std::string &catalog,
+                        const std::string &schema) {
+  auto r = con.Query(
+      "SELECT count(*) FROM duckdb_tables() WHERE database_name = " +
+      sql_literal(catalog) + " AND schema_name = " + sql_literal(schema) +
+      " AND table_name = 'dbsp_trigger_sink'");
+  if (r->HasError() || r->RowCount() == 0) {
+    return false;
+  }
+  return r->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
 /// Every DBSP trigger currently in the catalog, as
 /// "catalog.schema.table" -> [trigger names].
 ///
@@ -743,6 +772,22 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
   }
 
   // ---- act --------------------------------------------------------------
+  //
+  // Everything below runs DDL on an internal connection, i.e. in a transaction
+  // of its own, concurrently with whatever the user's connection is doing. A
+  // CATALOG WRITE-WRITE CONFLICT is therefore an ordinary outcome, not a
+  // failure: DuckDB raises it when two transactions create entries in the same
+  // schema at once, and `CREATE TABLE IF NOT EXISTS` is not atomic against a
+  // concurrent creator. Measured: NumPad builds several materialized views in
+  // a row on a worker thread, and the sweep's sink CREATE lost that race and
+  // failed the USER's statement with
+  // `Catalog write-write conflict on create with "Schema main Table
+  // dbsp_trigger_sink"`.
+  //
+  // A conflict is retried, not swallowed and not thrown: `recheck` stays armed
+  // and the caller is told DEFERRED, so this transaction's commit reconciles
+  // by scan and the next statement installs. Correct answer, no user-visible
+  // failure, and still no silence. Every other DDL error still throws.
   bool changed = false;
   if (!to_install.empty() || !to_drop.empty()) {
     InternalQueryGuard guard;
@@ -776,7 +821,7 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       std::string catalog, schema_name, table;
       split_table_key(p.key, catalog, schema_name, table);
       const std::string sink = sink_name_for(catalog, schema_name);
-      if (made_sinks.insert(sink).second) {
+      if (made_sinks.insert(sink).second && !sink_exists(con, catalog, schema_name)) {
         auto r = con.Query("CREATE TABLE IF NOT EXISTS " + sink + "(v BIGINT)");
         if (r->HasError()) {
           throw duckdb::InvalidInputException(
@@ -820,9 +865,18 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
       st.sinks.insert(sink);
     };
 
-    for (const auto &p : to_install) {
-      install_one(p);
-      changed = true;
+    try {
+      for (const auto &p : to_install) {
+        install_one(p);
+        changed = true;
+      }
+    } catch (const std::exception &e) {
+      if (std::string(e.what()).find("write-write conflict") ==
+          std::string::npos) {
+        throw;
+      }
+      st.recheck.store(true, std::memory_order_relaxed);
+      return ReconcileResult::DEFERRED;
     }
     for (const auto &key : to_drop) {
       auto it = existing.find(key);
