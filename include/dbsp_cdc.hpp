@@ -3523,6 +3523,11 @@ public:
       return; // matches create_view's own persistence gate
     }
     try {
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                   "erase_persisted_view_row");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("DELETE FROM _dbsp_views WHERE name = '" + name + "'");
@@ -3546,6 +3551,11 @@ public:
   void erase_persisted_checkpoint_rows(duckdb::ClientContext &context,
                                        const std::string &name) {
     try {
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                   "erase_persisted_checkpoint_rows");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       con.Query("DELETE FROM _dbsp_ckpt WHERE name = '" + name + "'");
@@ -6257,6 +6267,11 @@ private:
       return;
     }
     try {
+      // FORBIDDEN. Reached from sync_table_internal, the SEEDING path: this
+      // watermark indexes the baseline that scan just established, so it must
+      // describe the same committed state that scan read.
+      enforce_internal_read_policy(context, InternalReadPolicy::Forbidden,
+                                   "fold_fresh_baseline watermark");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       auto wm = con.Query(
