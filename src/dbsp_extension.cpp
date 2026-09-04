@@ -1245,8 +1245,6 @@ void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
     ctx_state->engine_buffer_delta(key, std::move(delta));
     dbsp_native::trigger_install_state(context.db)
         .firings_since_drain.fetch_add(1, std::memory_order_relaxed);
-    dbsp_native::trigger_firings_total().fetch_add(1,
-                                                   std::memory_order_relaxed);
     // PROOF OF LIFE: the flag that disarms the capture stack flips only here,
     // on a DELIVERED ingest — never when the triggers are created. Triggers
     // that exist but never fire leave the capture stack armed rather than

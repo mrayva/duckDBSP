@@ -237,19 +237,22 @@ public:
     // THIS transaction. capture_.triggers_installed makes its commit
     // reconcile by scan; every transaction after it sees the triggers.
     if (trigger_source_enabled()) {
-      if (install_pending_triggers(context, manager)) {
+      // Both outcomes that are not UNCHANGED mean the same thing to this
+      // transaction: some tracked table's trigger bodies do not match its
+      // columns right now, so nothing they buffer can be trusted and the
+      // commit must reconcile by scan.
+      //
+      // CHANGED — the bodies were just regenerated on an internal connection,
+      // which commits AFTER this transaction took its catalog snapshot, so
+      // this transaction still runs against the old ones.
+      // DEFERRED — the user holds a transaction open, so the DDL could not run
+      // at all (an internal connection cannot see their uncommitted catalog
+      // changes; trying anyway made their own COMMIT fail and wedged the
+      // connection). The reconcile waits for the first statement after their
+      // transaction ends, and `recheck` stays armed until it succeeds.
+      if (install_pending_triggers(context, manager) !=
+          ReconcileResult::UNCHANGED) {
         capture_.triggers_installed = true;
-      }
-      // Arm the NEXT statement's sweep if this one is DDL. A trigger body
-      // pins its table's column list at generation time, and the tracked-table
-      // COUNT — the cheap steady-state check above — cannot see an
-      // `ALTER TABLE ... ADD COLUMN` (schema moved, count unchanged) or a
-      // `DROP TABLE` + recreate + re-track (triggers gone, count unchanged).
-      // Both were measured producing wrong view answers with no scan to catch
-      // them. Sniffing the leading keyword costs a few bytes and is
-      // deliberately over-inclusive.
-      if (looks_like_ddl(context.GetCurrentQuery())) {
-        request_trigger_recheck(context.db);
       }
     }
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
@@ -430,11 +433,20 @@ public:
       // produces no tuple undo entries, so the engine deltas alone can be
       // an incomplete picture of such a transaction.
       if (capture_.engine_fed) {
-        // triggers_installed: some table became tracked under this very
-        // transaction, so its brand-new triggers never fired for it — the
-        // buffered deltas cover the already-triggered tables only.
-        const bool unknown =
-            capture_.unknown_writes || capture_.triggers_installed;
+        // triggers_installed means the trigger bodies did not match their
+        // tables for the whole of this transaction: either a table became
+        // tracked under it, or a schema moved and regeneration was deferred.
+        // Whatever they buffered was produced by a body of the wrong shape, so
+        // it is DISCARDED rather than applied and then repaired — a
+        // wrong-width row applied to a baseline is a mess a later scan has to
+        // undo.
+        if (capture_.triggers_installed) {
+          capture_ = {};
+          clear_tee();
+          manager.sync_all(context, &transaction);
+          return;
+        }
+        const bool unknown = capture_.unknown_writes;
         auto deltas = std::move(capture_.engine_deltas);
         capture_ = {};
         clear_tee();

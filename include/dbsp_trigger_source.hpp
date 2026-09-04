@@ -36,6 +36,10 @@
 #include "dbsp_cdc.hpp"
 #include "dbsp_qualified_name.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
+
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -47,6 +51,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -114,9 +119,28 @@ inline TriggerSourceStats &trigger_source_stats() {
 }
 
 // Cheap process-wide gate for the sink drain, so the common commit path never
-// touches the per-database map (see maybe_drain_trigger_sinks).
-inline std::atomic<uint64_t> &trigger_firings_total() {
+// touches the per-database map (see maybe_drain_trigger_sinks). Counts
+// COMMITS, not trigger firings: a database created in trigger mode keeps its
+// trigger bodies when reopened in any other mode, and those bodies keep
+// writing one sink row per statement even though the ingest scalar now
+// refuses to deliver. Gating the drain on the MODE left that growth unbounded.
+inline std::atomic<uint64_t> &trigger_commits_total() {
   static std::atomic<uint64_t> n{0};
+  return n;
+}
+
+// How many commits between sink drains. Overridable so the bound is testable
+// without running fifty thousand statements.
+inline uint64_t trigger_sink_drain_interval() {
+  static const uint64_t n = [] {
+    if (const char *v = std::getenv("DBSP_TRIGGER_SINK_DRAIN")) {
+      const long long parsed = atoll(v);
+      if (parsed > 0) {
+        return static_cast<uint64_t>(parsed);
+      }
+    }
+    return static_cast<uint64_t>(50000);
+  }();
   return n;
 }
 
@@ -224,12 +248,24 @@ struct TriggerInstallState {
   // measured as a view reading 5.0 where SQL read 12.0. The fingerprint is
   // what makes that visible.
   std::unordered_map<std::string, std::string> installed;
+  // Tracked tables that are NOT in the catalog right now: a table dropped
+  // while still tracked, or one created inside a transaction that rolled
+  // back. Counted alongside `installed` so their absence is a steady state
+  // rather than a mismatch that re-fires the reconcile on every statement.
+  std::unordered_set<std::string> missing;
   std::unordered_set<std::string> sinks; // quoted sink table names
+  // Per catalog holding tracked tables, the catalog version last reconciled
+  // against. Catalog::GetCatalogVersion is the same signal prepared
+  // statements use to invalidate themselves: it moves on any committed
+  // catalog change, and jumps above TRANSACTION_START while a transaction has
+  // uncommitted catalog changes of its own. That second property is what
+  // makes an in-flight `ALTER TABLE ... ADD COLUMN` visible.
+  std::unordered_map<std::string, idx_t> catalog_versions;
   std::atomic<uint64_t> firings_since_drain{0};
-  // Force the next sweep to do the full catalog reconcile rather than trust
-  // the tracked-table count. Armed after any DDL statement, because DDL is
-  // exactly what a count cannot see: ADD COLUMN changes a schema, DROP TABLE
-  // takes the triggers with it, and neither moves the count by one.
+  // Force the next sweep to do the full reconcile. CLEARED ONLY ON SUCCESS —
+  // an earlier version cleared it up front, so any throw (or a deferral)
+  // disarmed the one thing that would have retried, and stale bodies stood
+  // forever.
   std::atomic<bool> recheck{true};
 };
 
@@ -443,20 +479,63 @@ inline void request_trigger_recheck(
   trigger_install_state(db).recheck.store(true, std::memory_order_relaxed);
 }
 
-/// Cheap first-keyword test: is this statement DDL, i.e. could it have moved
-/// a tracked table's schema or taken its triggers away? Deliberately
-/// over-inclusive — a false positive costs one catalog reconcile, a false
-/// negative costs silent wrong answers.
-inline bool looks_like_ddl(const std::string &sql) {
-  size_t i = 0;
-  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) {
-    i++;
+/// True while the USER holds an explicit transaction open. Autocommit
+/// statements also have an active transaction by the time QueryBegin runs
+/// (BeginQueryInternal starts it first), so the auto-commit flag is the half
+/// that actually distinguishes them.
+///
+/// It matters because the reconcile's DDL runs on a separate internal
+/// connection, which by construction CANNOT see the user's uncommitted
+/// catalog changes. Running it anyway is what produced
+/// `Binder Error: Referenced column "note" not found` out of the user's own
+/// COMMIT, and `Catalog Error: Table with name u does not exist!` out of every
+/// statement — including ROLLBACK — after a CREATE + track in one transaction.
+inline bool user_transaction_open(duckdb::ClientContext &context) {
+  return context.transaction.HasActiveTransaction() &&
+         !context.transaction.IsAutoCommit();
+}
+
+/// The catalog's current version, or "unknown" when the catalog does not
+/// support versioning (a non-DuckDB attached catalog). Unknown is treated as
+/// "may have moved", which is the conservative direction.
+inline bool catalog_version_of(duckdb::ClientContext &context,
+                               const std::string &catalog_name, idx_t &out) {
+  try {
+    auto &catalog = duckdb::Catalog::GetCatalog(
+        context, duckdb::Identifier(catalog_name));
+    auto version = catalog.GetCatalogVersion(context);
+    if (!version.IsValid()) {
+      return false;
+    }
+    out = version.GetIndex();
+    return true;
+  } catch (...) {
+    return false;
   }
-  const char *kw[] = {"alter", "drop", "create", "attach", "detach"};
-  for (const char *k : kw) {
-    const size_t n = std::strlen(k);
-    if (sql.size() - i >= n &&
-        duckdb::StringUtil::CIEquals(sql.substr(i, n), k)) {
+}
+
+/// Has any catalog holding tracked tables changed since the last reconcile?
+/// This replaces an earlier leading-keyword sniff of the statement text, which
+/// could not see DDL that did not arrive as text and could not see a
+/// transaction's own uncommitted changes at all.
+inline bool catalogs_moved(duckdb::ClientContext &context,
+                           TriggerInstallState &st) {
+  std::vector<std::string> names;
+  {
+    std::lock_guard<std::mutex> g(st.mutex);
+    names.reserve(st.catalog_versions.size());
+    for (const auto &entry : st.catalog_versions) {
+      names.push_back(entry.first);
+    }
+  }
+  for (const auto &name : names) {
+    idx_t version = 0;
+    if (!catalog_version_of(context, name, version)) {
+      return true; // unversioned catalog: never assume it stood still
+    }
+    std::lock_guard<std::mutex> g(st.mutex);
+    auto it = st.catalog_versions.find(name);
+    if (it == st.catalog_versions.end() || it->second != version) {
       return true;
     }
   }
@@ -477,31 +556,101 @@ inline bool looks_like_ddl(const std::string &sql) {
 // Returns true when it created or dropped anything. Throws on failure — a
 // tracked table with no trigger is silent staleness, and silence is the one
 // outcome this source must never have.
-inline bool install_pending_triggers(duckdb::ClientContext &context,
-                                     CDCManager &manager) {
+/// Outcome of one sweep. DEFERRED is the important one: work IS needed but
+/// the user holds a transaction open, so the transaction's commit must
+/// reconcile by scan and the DDL waits until the transaction ends.
+enum class ReconcileResult { UNCHANGED, CHANGED, DEFERRED };
+
+inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
+                                                CDCManager &manager) {
   if (!trigger_source_enabled()) {
-    return false;
+    return ReconcileResult::UNCHANGED;
   }
   auto &st = trigger_install_state(context.db);
-  const bool forced = st.recheck.exchange(false, std::memory_order_relaxed);
+
+  // ---- gate -------------------------------------------------------------
+  // Three cheap signals, none of which runs SQL: an armed recheck, a moved
+  // tracked-table count, or a moved catalog version. The count alone was not
+  // enough — an ALTER never changes it — and the catalog version is what
+  // closes that hole, including for a transaction's own uncommitted DDL.
+  const bool armed = st.recheck.load(std::memory_order_relaxed);
+  bool count_moved;
   {
     std::lock_guard<std::mutex> g(st.mutex);
-    if (!forced && manager.tracked_table_total() == st.installed.size()) {
-      return false; // steady state: no DDL since the last pass, nothing new
-    }
+    count_moved =
+        manager.tracked_table_total() != st.installed.size() + st.missing.size();
   }
+  if (!armed && !count_moved && !catalogs_moved(context, st)) {
+    return ReconcileResult::UNCHANGED;
+  }
+
+  // ---- what needs doing, computed WITHOUT SQL ---------------------------
+  // resolve_table_entry is a plain catalog lookup on the CALLER's context, so
+  // it sees exactly what the caller sees — including their own uncommitted
+  // ALTER. No internal connection is opened unless something has to change.
   const std::vector<std::string> keys = manager.list_tracked_tables();
   const std::unordered_set<std::string> tracked(keys.begin(), keys.end());
 
-  InternalQueryGuard guard;
-  duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+  struct Pending {
+    std::string key;
+    TableSchema live;
+    std::string fingerprint;
+  };
+  std::vector<Pending> to_install;
+  std::vector<std::string> now_missing;
+  std::vector<std::string> back_from_missing;
+  std::set<std::string> catalogs;
 
-  // What the catalog ACTUALLY holds. Counting tracked tables cannot see a
-  // DROP TABLE (which takes the triggers with it) followed by a recreate and
-  // a re-track: the count comes back to where it was and the table is left
-  // permanently triggerless. One query answers it for every table at once.
-  std::unordered_set<std::string> live_triggers; // "catalog.schema.name"
+  for (const auto &key : keys) {
+    std::string catalog, schema_name, table;
+    if (!split_table_key(key, catalog, schema_name, table)) {
+      throw duckdb::InvalidInputException(
+          "DBSP trigger source: table key '%s' is not catalog.schema.table",
+          key);
+    }
+    catalogs.insert(catalog);
+    TableSchema live;
+    if (!live_table_columns(context, key, live)) {
+      // Tracked but not in the catalog from here: dropped, or created inside a
+      // transaction that rolled back. Recorded rather than retried forever —
+      // and never a throw, because a throw here reached the user on every
+      // statement including their ROLLBACK.
+      now_missing.push_back(key);
+      continue;
+    }
+    const std::string fp = schema_fingerprint(live);
+    bool need;
+    {
+      std::lock_guard<std::mutex> g(st.mutex);
+      auto it = st.installed.find(key);
+      need = (it == st.installed.end()) || (it->second != fp);
+      if (st.missing.count(key)) {
+        back_from_missing.push_back(key);
+      }
+    }
+    if (need) {
+      to_install.push_back({key, std::move(live), fp});
+    }
+  }
+
+  std::vector<std::string> to_drop;
   {
+    std::lock_guard<std::mutex> g(st.mutex);
+    for (const auto &entry : st.installed) {
+      if (!tracked.count(entry.first)) {
+        to_drop.push_back(entry.first);
+      }
+    }
+  }
+
+  // A table whose fingerprint still matches can still have lost its triggers
+  // (DROP TABLE takes them along). That check needs the catalog, so it is only
+  // paid once something else already told us to look.
+  std::vector<Pending> lost;
+  bool have_trigger_catalog = false;
+  std::unordered_set<std::string> live_triggers;
+
+  auto load_trigger_catalog = [&](duckdb::Connection &con) {
     auto r = con.Query("SELECT database_name, schema_name, trigger_name "
                        "FROM duckdb_triggers()");
     if (r->HasError()) {
@@ -514,129 +663,170 @@ inline bool install_pending_triggers(duckdb::ClientContext &context,
                            r->GetValue(1, i).ToString() + "." +
                            r->GetValue(2, i).ToString());
     }
+    have_trigger_catalog = true;
+  };
+
+  // ---- defer while the user's transaction is open -----------------------
+  // Nothing above opened a connection or ran DDL, which is the point: the
+  // internal connection cannot see uncommitted catalog changes, so touching it
+  // here is what made a user's COMMIT fail and wedged a connection that had
+  // created and tracked a table in one transaction. The caller poisons this
+  // transaction instead, so its commit reconciles by scan, and `recheck` stays
+  // armed for the first statement after the transaction ends.
+  const bool work_pending =
+      !to_install.empty() || !to_drop.empty() || !now_missing.empty();
+  if (user_transaction_open(context)) {
+    if (work_pending || armed) {
+      st.recheck.store(true, std::memory_order_relaxed);
+      return ReconcileResult::DEFERRED;
+    }
+    return ReconcileResult::UNCHANGED;
   }
 
+  // ---- act --------------------------------------------------------------
   bool changed = false;
-  std::unordered_set<std::string> made_sinks;
-  for (const auto &key : keys) {
-    std::string catalog, schema_name, table;
-    if (!split_table_key(key, catalog, schema_name, table)) {
-      throw duckdb::InvalidInputException(
-          "DBSP trigger source: table key '%s' is not catalog.schema.table",
-          key);
-    }
-    // The LIVE columns, not the manager's cached ones: the cache is what the
-    // installed bodies were generated from, so comparing it with itself could
-    // never detect an ALTER.
-    TableSchema live;
-    if (!live_table_columns(context, key, live)) {
-      // Tracked but not in the catalog right now (dropped, or its catalog
-      // detached). Forget it rather than fail: if it comes back, the next
-      // reconcile installs fresh triggers on it.
-      std::lock_guard<std::mutex> g(st.mutex);
-      if (st.installed.erase(key)) {
-        changed = true;
-      }
-      continue;
-    }
-    const std::string fp = schema_fingerprint(live);
+  {
+    InternalQueryGuard guard;
+    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
 
-    bool need = false;
-    {
-      std::lock_guard<std::mutex> g(st.mutex);
-      auto it = st.installed.find(key);
-      need = (it == st.installed.end()) || (it->second != fp);
-    }
-    if (!need) {
-      for (const char *op : {"ins", "del", "upd"}) {
-        if (!live_triggers.count(catalog + "." + schema_name + "." +
-                                 trigger_name_for(table, op))) {
-          need = true; // the catalog lost them (DROP TABLE, manual DROP)
-          break;
+    if (!to_install.empty() || !to_drop.empty() || armed || count_moved) {
+      load_trigger_catalog(con);
+      for (const auto &key : keys) {
+        std::string catalog, schema_name, table;
+        if (!split_table_key(key, catalog, schema_name, table)) {
+          continue;
+        }
+        bool already = false;
+        for (const auto &p : to_install) {
+          if (p.key == key) {
+            already = true;
+            break;
+          }
+        }
+        if (already) {
+          continue;
+        }
+        bool gone = false;
+        for (const char *op : {"ins", "del", "upd"}) {
+          if (!live_triggers.count(catalog + "." + schema_name + "." +
+                                   trigger_name_for(table, op))) {
+            gone = true;
+            break;
+          }
+        }
+        if (!gone) {
+          continue;
+        }
+        TableSchema live;
+        if (live_table_columns(context, key, live)) {
+          lost.push_back({key, live, schema_fingerprint(live)});
         }
       }
     }
-    if (!need) {
-      continue;
-    }
 
-    const std::string sink = sink_name_for(catalog, schema_name);
-    if (made_sinks.insert(sink).second) {
-      auto r = con.Query("CREATE TABLE IF NOT EXISTS " + sink + "(v BIGINT)");
-      if (r->HasError()) {
-        throw duckdb::InvalidInputException(
-            "DBSP trigger source: could not create sink %s: %s", sink,
-            r->GetError());
+    std::unordered_set<std::string> made_sinks;
+    auto install_one = [&](const Pending &p) {
+      std::string catalog, schema_name, table;
+      split_table_key(p.key, catalog, schema_name, table);
+      const std::string sink = sink_name_for(catalog, schema_name);
+      if (made_sinks.insert(sink).second) {
+        auto r = con.Query("CREATE TABLE IF NOT EXISTS " + sink + "(v BIGINT)");
+        if (r->HasError()) {
+          throw duckdb::InvalidInputException(
+              "DBSP trigger source: could not create sink %s: %s", sink,
+              r->GetError());
+        }
       }
-    }
-    // CREATE OR REPLACE rewrites a stale body in place, so no drop is needed
-    // for the ALTER case; the drop only matters if a name ever changes.
-    for (const auto &sql : trigger_ddl_for(key, live)) {
-      auto r = con.Query(sql);
-      if (r->HasError()) {
-        throw duckdb::InvalidInputException("DBSP trigger source: %s [%s]",
-                                            r->GetError(), sql);
+      for (const auto &sql : trigger_ddl_for(p.key, p.live)) {
+        auto r = con.Query(sql);
+        if (r->HasError()) {
+          throw duckdb::InvalidInputException("DBSP trigger source: %s [%s]",
+                                              r->GetError(), sql);
+        }
       }
-    }
-    {
       std::lock_guard<std::mutex> g(st.mutex);
-      st.installed[key] = fp;
+      st.installed[p.key] = p.fingerprint;
+      st.missing.erase(p.key);
       st.sinks.insert(sink);
+    };
+
+    for (const auto &p : to_install) {
+      install_one(p);
+      changed = true;
     }
-    changed = true;
+    for (const auto &p : lost) {
+      install_one(p);
+      changed = true;
+    }
+    for (const auto &key : to_drop) {
+      for (const auto &sql : trigger_drop_ddl_for(key)) {
+        con.Query(sql); // best effort: the table itself may already be gone
+      }
+      std::lock_guard<std::mutex> g(st.mutex);
+      st.installed.erase(key);
+      st.missing.erase(key);
+      changed = true;
+    }
   }
 
-  std::vector<std::string> to_drop;
   {
     std::lock_guard<std::mutex> g(st.mutex);
-    for (const auto &entry : st.installed) {
-      if (!tracked.count(entry.first)) {
-        to_drop.push_back(entry.first);
+    for (const auto &key : now_missing) {
+      if (st.installed.erase(key)) {
+        changed = true;
+      }
+      st.missing.insert(key);
+    }
+    for (const auto &key : back_from_missing) {
+      st.missing.erase(key);
+    }
+    // Only the catalogs we just reconciled against are recorded, and only now:
+    // recording them earlier would have let a failed pass look complete.
+    st.catalog_versions.clear();
+    for (const auto &name : catalogs) {
+      idx_t version = 0;
+      if (catalog_version_of(context, name, version)) {
+        st.catalog_versions[name] = version;
       }
     }
   }
-  for (const auto &key : to_drop) {
-    for (const auto &sql : trigger_drop_ddl_for(key)) {
-      con.Query(sql); // best effort: the table itself may already be gone
-    }
-    std::lock_guard<std::mutex> g(st.mutex);
-    st.installed.erase(key);
-    changed = true;
-  }
-  return changed;
+  // SUCCESS is the only path that disarms. A throw above leaves it armed, so
+  // the next statement retries instead of standing on stale bodies.
+  st.recheck.store(false, std::memory_order_relaxed);
+  return changed ? ReconcileResult::CHANGED : ReconcileResult::UNCHANGED;
 }
 
-// One sink row accumulates per statement firing. Drain them periodically so a
-// long-lived process cannot grow the sink without bound; the rows are write-
-// only bookkeeping, nothing ever reads them.
+// One sink row accumulates per statement firing. Nothing ever reads them, so
+// they are drained periodically to keep a long-lived process from growing the
+// sink without bound.
+//
+// Deliberately NOT gated on the mode. Triggers are catalog objects: a database
+// tracked once in trigger mode carries its bodies forever, and those bodies go
+// on writing a sink row per statement in every later mode even though the
+// ingest scalar refuses to deliver from them. Gating on the mode meant that
+// growth was never reclaimed on a non-trigger build.
 inline void maybe_drain_trigger_sinks(duckdb::ClientContext &context) {
-  static constexpr uint64_t kDrainEvery = 50000;
-  if (!trigger_source_enabled()) {
-    return;
+  const uint64_t every = trigger_sink_drain_interval();
+  if (trigger_commits_total().fetch_add(1, std::memory_order_relaxed) + 1 <
+      every) {
+    return; // one relaxed atomic on the common commit path, nothing else
   }
-  // The counter is consulted through a process-wide atomic BEFORE the
-  // per-database map is touched. Going to trigger_install_state() first would
-  // take a global mutex and do a map insert on EVERY commit, and would
-  // resurrect an entry for a database that dbsp_forget_triggers() had just
-  // pruned at close.
-  if (trigger_firings_total().load(std::memory_order_relaxed) < kDrainEvery) {
-    return;
-  }
-  auto &st = trigger_install_state(context.db);
-  if (st.firings_since_drain.load(std::memory_order_relaxed) < kDrainEvery) {
-    return;
-  }
-  trigger_firings_total().store(0, std::memory_order_relaxed);
-  st.firings_since_drain.store(0, std::memory_order_relaxed);
-  std::vector<std::string> sinks;
-  {
-    std::lock_guard<std::mutex> g(st.mutex);
-    sinks.assign(st.sinks.begin(), st.sinks.end());
-  }
+  trigger_commits_total().store(0, std::memory_order_relaxed);
   try {
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
-    for (const auto &sink : sinks) {
+    // Ask the catalog which sinks exist rather than trusting an install
+    // record: in a non-trigger mode this process never installed anything and
+    // has no record, yet the sinks are there and filling.
+    auto r = con.Query("SELECT DISTINCT database_name, schema_name "
+                       "FROM duckdb_triggers() "
+                       "WHERE trigger_name LIKE 'dbsp\\_trg\\_%' ESCAPE '\\'");
+    if (r->HasError()) {
+      return;
+    }
+    for (duckdb::idx_t i = 0; i < r->RowCount(); i++) {
+      const std::string sink = sink_name_for(r->GetValue(0, i).ToString(),
+                                             r->GetValue(1, i).ToString());
       con.Query("DELETE FROM " + sink);
     }
   } catch (...) {

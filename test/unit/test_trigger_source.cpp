@@ -535,3 +535,116 @@ TEST_CASE("trigger source: a user's own trigger coexists", "[trigger_source]") {
   REQUIRE(sql_count(db, "SELECT COUNT(*) FROM audit") == 2);
   REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 4);
 }
+
+// ---------------------------------------------------------------------------
+// Fix round 2: DDL inside an explicit transaction. The round-1 sweep read the
+// caller's catalog but ran its DDL on an internal connection, which cannot see
+// uncommitted catalog changes — so it threw out of the user's own COMMIT, and
+// a CREATE + track in one transaction wedged the connection permanently.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("trigger source: ADD COLUMN inside an explicit transaction",
+          "[trigger_source]") {
+  DuckDBTestHarness db;
+  db.createTable("t", "id INTEGER, v DOUBLE", {});
+  db.exec("SELECT * FROM dbsp_track('t')");
+  db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
+  db.exec("INSERT INTO t VALUES (1, 5.0)");
+
+  SECTION("ALTER alone in the transaction") {
+    // Measured before this round: the COMMIT itself raised
+    // "DBSP trigger source: Binder Error: Referenced column \"note\" not found"
+    // and left the transaction open.
+    db.exec("BEGIN TRANSACTION");
+    db.exec("ALTER TABLE t ADD COLUMN note VARCHAR");
+    db.exec("COMMIT"); // must not throw
+
+    db.exec("SELECT * FROM dbsp_create_view('byw', "
+            "'SELECT note, COUNT(*) AS c FROM t GROUP BY note')");
+    db.exec("INSERT INTO t VALUES (2, 7.0, 'world')");
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(sql_count(db, "SELECT COUNT(*) FROM t WHERE note = 'world'") == 1);
+    int64_t named = 0;
+    for (auto &r : db.getViewRows("byw")) {
+      if (!r[0].IsNull() && r[0].ToString() == "world") {
+        named = r[1].GetValue<int64_t>();
+      }
+    }
+    REQUIRE(named == 1);
+  }
+
+  SECTION("ALTER and a write in the SAME transaction") {
+    // The write runs under bodies that no longer match the table, so its
+    // commit must reconcile by scan — and the NEXT commit, after the bodies
+    // are regenerated, must be exact again.
+    db.exec("BEGIN TRANSACTION");
+    db.exec("ALTER TABLE t ADD COLUMN note VARCHAR");
+    db.exec("INSERT INTO t VALUES (2, 7.0, 'a')");
+    db.exec("COMMIT");
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+
+    const auto trg0 = dbsp_native::trigger_source_stats().trigger_syncs.load();
+    const auto scan0 = db.manager().scan_syncs();
+    db.exec("INSERT INTO t VALUES (3, 2.0, 'b')");
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(dbsp_native::trigger_source_stats().trigger_syncs.load() > trg0);
+    REQUIRE(db.manager().scan_syncs() == scan0); // exact again, no scan
+  }
+
+  SECTION("ALTER rolled back leaves the bodies alone") {
+    db.exec("BEGIN TRANSACTION");
+    db.exec("ALTER TABLE t ADD COLUMN note VARCHAR");
+    db.exec("ROLLBACK");
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+
+    const auto trg0 = dbsp_native::trigger_source_stats().trigger_syncs.load();
+    const auto scan0 = db.manager().scan_syncs();
+    db.exec("INSERT INTO t VALUES (2, 7.0)"); // still two columns
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(dbsp_native::trigger_source_stats().trigger_syncs.load() > trg0);
+    REQUIRE(db.manager().scan_syncs() == scan0);
+  }
+}
+
+TEST_CASE("trigger source: CREATE and track inside one transaction",
+          "[trigger_source]") {
+  // Measured before this round: every statement after the track — the INSERT,
+  // the COMMIT, the ROLLBACK, and a bare SELECT 1 — threw
+  // "DBSP trigger source: Catalog Error: Table with name u does not exist!",
+  // and only closing the connection escaped it.
+  SECTION("committed") {
+    DuckDBTestHarness db;
+    db.exec("BEGIN TRANSACTION");
+    db.exec("CREATE TABLE u (id INTEGER, v DOUBLE)");
+    db.exec("SELECT * FROM dbsp_track('u')");
+    db.exec("INSERT INTO u VALUES (1, 5.0)");
+    db.exec("COMMIT");
+
+    db.exec("SELECT * FROM dbsp_create_view('tu', 'SELECT SUM(v) AS s FROM u')");
+    db.exec("INSERT INTO u VALUES (2, 3.0)");
+    REQUIRE(view_sum(db, "tu") == sql_sum(db, "SELECT SUM(v) FROM u"));
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 3);
+  }
+
+  SECTION("rolled back") {
+    DuckDBTestHarness db;
+    db.exec("BEGIN TRANSACTION");
+    db.exec("CREATE TABLE u (id INTEGER, v DOUBLE)");
+    db.exec("SELECT * FROM dbsp_track('u')");
+    db.exec("INSERT INTO u VALUES (1, 5.0)");
+    db.exec("ROLLBACK");
+
+    // The table never existed; nothing may throw on the way out, and no
+    // triggers may be left behind for it.
+    db.exec("SELECT 1");
+    REQUIRE(sql_count(db, "SELECT count(*) FROM duckdb_triggers()") == 0);
+    db.exec("SELECT 42");
+
+    // and the connection is still usable for real work
+    db.createTable("w", "id INTEGER, v DOUBLE", {});
+    db.exec("SELECT * FROM dbsp_track('w')");
+    db.exec("SELECT * FROM dbsp_create_view('tw', 'SELECT SUM(v) AS s FROM w')");
+    db.exec("INSERT INTO w VALUES (1, 4.0)");
+    REQUIRE(view_sum(db, "tw") == 4.0);
+  }
+}

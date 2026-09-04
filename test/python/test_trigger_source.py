@@ -94,6 +94,24 @@ if IS_CHILD:
             f"(trigger_syncs=0) and the view is correct: {got}",
             flush=True,
         )
+
+        # The bodies keep writing one sink row per statement even though the
+        # scalar refuses to deliver from them, so the drain must NOT be gated
+        # on the mode. DBSP_TRIGGER_SINK_DRAIN (set by the parent) makes the
+        # bound observable without running fifty thousand statements.
+        for i in range(100):
+            conn.execute(f"INSERT INTO t VALUES ({100 + i}, 1.0)")
+        rows = conn.execute("SELECT count(*) FROM dbsp_trigger_sink").fetchone()[0]
+        interval = int(os.environ.get("DBSP_TRIGGER_SINK_DRAIN", "50000"))
+        assert rows <= 2 * interval, (
+            f"sink grew unbounded in mode {s2['delta_source_mode']}: "
+            f"{rows} rows after 100 statements (drain every {interval})"
+        )
+        got = conn.execute("SELECT * FROM dbsp_query('tot')").fetchall()[0][0]
+        want = conn.execute("SELECT SUM(v) FROM t").fetchone()[0]
+        assert got == want, f"default-mode view {got} != SQL {want}"
+        print(f"ok: sink bounded at {rows} rows after 100 statements "
+              f"(drain every {interval}), view still correct", flush=True)
     finally:
         conn.close()
     print("CHILD PASS", flush=True)
@@ -206,6 +224,7 @@ with tempfile.TemporaryDirectory() as tmp:
     # Same database, a child interpreter, no DBSP_DELTA_SOURCE at all.
     child_env = {k: v for k, v in os.environ.items()
                  if k != "DBSP_DELTA_SOURCE"}
+    child_env["DBSP_TRIGGER_SINK_DRAIN"] = "10"
     proc = subprocess.run(
         [sys.executable, os.path.abspath(__file__), CHILD_FLAG, EXT, db_path],
         env=child_env, capture_output=True, text=True, timeout=TIMEOUT_S,
