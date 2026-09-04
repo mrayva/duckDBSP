@@ -2446,7 +2446,9 @@ public:
               // its triggers and its commit reconcile.
               InternalReadPolicy::AllowedInTxn, "rebuild_all_views");
           table.install_rebuild();
-          fold_fresh_baseline(context, name, table);
+          fold_fresh_baseline(context, name, table,
+                              InternalReadPolicy::AllowedInTxn,
+                              "rebuild_all_views (baseline fold)");
           if (was_deferred) {
             deferred_tables_--;
           }
@@ -4600,6 +4602,12 @@ public:
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+    // WHITELISTED for the __dbsp_mv_meta read and the __mv_* writes below.
+    // Both are DBSP's OWN mirror bookkeeping, never the user's tables: the
+    // backfill copies a VIEW RESULT out of the circuit, so it reads no user
+    // table at all and needs no view of their uncommitted rows.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "set_mv_tables (mirror backfill)");
     InternalQueryGuard guard;
     try {
       duckdb::Connection con(*mv_db_);
@@ -5482,6 +5490,11 @@ public:
     try {
       // Create _dbsp_views table if it doesn't exist. Fresh connection:
       // `context` may be mid-query (recovery runs inside table functions).
+      // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the user's,
+      // so it never needs to see their uncommitted catalog — the hazard the
+      // sweep's DDL hit.
+      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                   "initialize_persistence_table");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       auto result = con.Query(
@@ -6261,17 +6274,25 @@ private:
   // mid-statement materialize path, whose SQL watermark could observe
   // in-flight writes. No-op unless spilled, durable, and not already
   // flat-mapped. Caller holds the table lock.
+  //
+  // TWO callers, and they do not share a policy — sync_table_internal (the
+  // SEEDING path, Forbidden) and rebuild_all_views (a refresh from QueryBegin,
+  // AllowedInTxn) — so this carries the CALLER's, exactly as live_watermark
+  // does. Hard-coding Forbidden here was wrong twice over: it misdescribed the
+  // rebuild caller, and the throw landed INSIDE the best-effort catch below,
+  // where it was swallowed. Under the strict switch a spilled table rebuilt
+  // inside a user transaction would have silently skipped its fold.
   void fold_fresh_baseline(duckdb::ClientContext &context,
-                           const std::string &table_name, TrackedTable &tt) {
+                           const std::string &table_name, TrackedTable &tt,
+                           InternalReadPolicy policy, const char *site) {
     if (!tt.spilled() || tt.baseline_flat_mapped()) {
       return;
     }
+    // OUTSIDE the try: the catch below is a best-effort net for a failed fold,
+    // and a swallowed law violation is not a failed fold — it is the diagnostic
+    // the strict switch exists to produce.
+    enforce_internal_read_policy(context, policy, site);
     try {
-      // FORBIDDEN. Reached from sync_table_internal, the SEEDING path: this
-      // watermark indexes the baseline that scan just established, so it must
-      // describe the same committed state that scan read.
-      enforce_internal_read_policy(context, InternalReadPolicy::Forbidden,
-                                   "fold_fresh_baseline watermark");
       InternalQueryGuard guard;
       duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
       auto wm = con.Query(
@@ -6301,6 +6322,13 @@ private:
       if (!tt.spilled()) {
         const size_t th = TrackedTable::auto_spill_threshold();
         if (th != 0) {
+          // FORBIDDEN. A COUNT(*) over the USER's table, on the SEEDING path:
+          // the same shape and the same path as the seeding scan below, and it
+          // decides whether that scan spills. A count taken without the
+          // caller's uncommitted rows is the wrong count for them.
+          enforce_internal_read_policy(
+              context, InternalReadPolicy::Forbidden,
+              "sync_table_internal (auto-spill probe)");
           InternalQueryGuard guard;
           duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
           auto cnt = con.Query("SELECT COUNT(*) FROM " +
@@ -6334,7 +6362,9 @@ private:
             InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
       tt.install_rebuild();
-      fold_fresh_baseline(context, table_name, tt);
+      fold_fresh_baseline(context, table_name, tt,
+                          InternalReadPolicy::Forbidden,
+                          "sync_table_internal (baseline fold)");
       return true;
     } catch (const std::exception &e) {
       (void)e;

@@ -959,6 +959,14 @@ inline void maybe_drain_trigger_sinks(duckdb::ClientContext &context) {
   }
   trigger_commits_total().store(0, std::memory_order_relaxed);
   try {
+    // WHITELISTED. duckdb_triggers() and a DELETE over DBSP's OWN sink tables,
+    // never the user's data — and it runs from the COMMIT hook, where the
+    // engine has already cleared the transaction context (auto-commit is true
+    // there by construction), so the strict switch could not fire here anyway.
+    // Declared so the question is asked in code rather than left to whoever
+    // reads this next.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "maybe_drain_trigger_sinks");
     InternalQueryGuard guard;
     duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
     // Ask the catalog which sinks exist rather than trusting an install

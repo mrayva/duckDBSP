@@ -2382,7 +2382,17 @@ void RefreshMaterializedViewExecute(ClientContext &context,
     return;
   }
 
-  // REFRESH is a no-op since views are automatically incremental
+  // REFRESH is a no-op only for a view that EXISTS. Without this check any
+  // name at all reported "is always up-to-date" — `REFRESH MATERIALIZED VIEW
+  // s2.qv` on a nonexistent qualified name succeeded silently, which is the
+  // worst possible answer to "is my view current?".
+  EnsureContextState(context);
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  if (!manager.view_exists(state.view_name)) {
+    throw InvalidInputException("Materialized view does not exist: " +
+                                state.view_name);
+  }
   output.SetChildCardinality(1);
   output.SetValue(
       0, 0,
