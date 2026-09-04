@@ -77,11 +77,13 @@ self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source       # 33 cases, 915 assertions
+./test_trigger_source       # 33 cases, 959 assertions
 ```
 
 Beyond the oracle it pins the paths specific to this source: the C++
-`Appender`, `COPY FROM`, `INSERT ... SELECT`, `TRUNCATE`, multi-chunk DML under
+`Appender`, `COPY FROM`, `INSERT ... SELECT` (self-referential, twice over, plus one matching no
+rows) and `TRUNCATE` — both asserted against PLAIN SQL rather than literals,
+so a view and a table that drifted together cannot pass — multi-chunk DML under
 `threads=8`, a user's own trigger coexisting on a tracked table, a double-count
 guard that asserts a **sum** rather than a row count, `ALTER TABLE ... ADD
 COLUMN` regenerating the bodies, `DROP TABLE` + recreate reinstalling them, DDL
@@ -176,6 +178,17 @@ with A ending in COMMIT and in ROLLBACK), that `provisional_tables` goes 1 then
 back to 0, and — the half that keeps the fix from being a tax — that a seeding
 with no other transaction open is never provisional and that six later edits
 then cost **0** scans and **6** exact deltas.
+
+The two-connection case `cdc: an unseeded baseline is never served to another
+connection` is order-INDEPENDENT: it arms the process-global trigger flag
+(`arm_trigger_source`) before its first section. That flag gates the commit
+path's cheap "no statements seen, so nothing was written" early return, and
+until it flips every unaccountable commit takes the pessimistic `sync_all` —
+which seeds a baseline by accident. Whichever section ran first in a process was
+therefore vacuous and passed with the apply-path gate deleted. Verified by
+deleting that gate and running each section alone under `-c`: four of the five
+now fail (the fifth's subject is the ROLLBACK rebuild, not the gate, and says
+so in place).
 
 `test_unseeded_read.py` pins the read surfaces against a baseline nothing has
 scanned. It needs two connections against one database, which is why it lives

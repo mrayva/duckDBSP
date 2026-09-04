@@ -53,6 +53,45 @@ int64_t sql_count(DuckDBTestHarness &db, const std::string &sql) {
   return r->GetValue(0, 0).GetValue<int64_t>();
 }
 
+int64_t view_count(DuckDBTestHarness &db, const std::string &view) {
+  auto rows = db.getViewRows(view);
+  // COUNT(*) over no rows is 0, but a view holding no result row at all
+  // reports nothing — treat that as 0 so the comparison against SQL is total.
+  if (rows.empty() || rows[0][0].IsNull()) {
+    return 0;
+  }
+  return rows[0][0].GetValue<int64_t>();
+}
+
+// Force the process-global "a trigger body has DELIVERED" flag on.
+//
+// `trigger_source_flag()` is per-PROCESS and starts false, and the commit
+// path's cheap "no statements seen, so nothing was written" early return is
+// gated on it. Until it flips, every commit the path cannot account for takes
+// the pessimistic `sync_all` — which SEEDS a baseline by accident. That made
+// whichever unseeded-baseline section ran FIRST in a process vacuous: it
+// passed with the apply-path gate removed, so running that case alone (`-c`)
+// tested nothing.
+//
+// Earned, not stored: a throwaway harness tracks a table and writes to it, so
+// a real body delivers and flips the flag exactly as production does. Cheap
+// after the first call, and idempotent.
+void arm_trigger_source() {
+  if (dbsp_native::trigger_source_active()) {
+    return;
+  }
+  DuckDBTestHarness warmup;
+  warmup.createTable("arm_t", "id INTEGER, v DOUBLE", {});
+  warmup.exec("SELECT * FROM dbsp_track('arm_t')");
+  // TWO writes. The statement right after the track is the one whose
+  // QueryBegin installs the bodies, and they commit on an internal connection
+  // AFTER that statement took its catalog snapshot — so the FIRST insert does
+  // not fire them and leaves the flag false (measured: it did).
+  warmup.exec("INSERT INTO arm_t VALUES (1, 1.0)");
+  warmup.exec("INSERT INTO arm_t VALUES (2, 2.0)");
+  REQUIRE(dbsp_native::trigger_source_active());
+}
+
 } // namespace
 
 TEST_CASE("trigger source: tracking a table installs its triggers",
@@ -466,22 +505,50 @@ TEST_CASE("trigger source: schema-changing ALTERs are refused by the engine",
 }
 
 TEST_CASE("trigger source: INSERT ... SELECT and TRUNCATE", "[trigger_source]") {
-  // Both were measured by a throwaway shell probe and never pinned.
+  // Both shapes read the tracked table while writing it, and both were once
+  // measured only by a throwaway shell probe. Every assertion here is against
+  // PLAIN SQL over the same table, so a source that is self-consistently wrong
+  // cannot pass: a literal expectation would still hold if the view and the
+  // table drifted together in the direction the literal was written for.
   DuckDBTestHarness db;
   db.createTable("t", "id INTEGER, v DOUBLE", {});
   db.exec("SELECT * FROM dbsp_track('t')");
   db.exec("SELECT * FROM dbsp_create_view('tot', 'SELECT SUM(v) AS s FROM t')");
   db.exec("SELECT * FROM dbsp_create_view('cnt', 'SELECT COUNT(*) AS c FROM t')");
-  db.exec("INSERT INTO t VALUES (1, 1.0), (2, 2.0)");
+  auto agree = [&]() {
+    REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
+    REQUIRE(view_count(db, "cnt") == sql_count(db, "SELECT COUNT(*) FROM t"));
+  };
 
+  db.exec("INSERT INTO t VALUES (1, 1.0), (2, 2.0)");
+  agree();
+
+  // Self-referential INSERT ... SELECT: the source of the rows is the table
+  // the trigger is on. The transition table must carry the NEW rows only —
+  // re-reading `t` would double them.
   db.exec("INSERT INTO t SELECT id + 10, v * 10 FROM t");
-  REQUIRE(view_sum(db, "tot") == sql_sum(db, "SELECT SUM(v) FROM t"));
-  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 4);
+  agree();
+
+  // Again, so the doubling compounds if it is wrong at all.
+  db.exec("INSERT INTO t SELECT id + 100, v * 100 FROM t");
+  agree();
+
+  // ... and one that matches nothing, which must leave the view alone.
+  db.exec("INSERT INTO t SELECT id, v FROM t WHERE v < 0");
+  agree();
 
   db.exec("TRUNCATE t");
   REQUIRE(sql_count(db, "SELECT COUNT(*) FROM t") == 0);
-  REQUIRE(db.getViewRows("cnt")[0][0].GetValue<int64_t>() == 0);
-  REQUIRE(view_sum(db, "tot") == 0.0);
+  agree();
+
+  // A TRUNCATE that leaves the table tracked and triggered: later writes must
+  // still be served, and still agree.
+  db.exec("INSERT INTO t VALUES (7, 7.0), (8, 8.0)");
+  agree();
+  db.exec("DELETE FROM t WHERE id = 7");
+  agree();
+  db.exec("TRUNCATE t"); // truncating an already-small table, twice over
+  agree();
 }
 
 TEST_CASE("trigger source: multi-chunk DML under parallelism",
@@ -1278,6 +1345,15 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   // TrackedTable::baseline_seeded() is false and hand it back to the caller,
   // which reconciles that table by scan at that same commit.
 
+  // Order independence. Every section below needs a genuinely unseeded
+  // baseline, and it only gets one once the process-global trigger flag is on
+  // — before that, the pessimistic sync_all seeds it by accident and the
+  // section is vacuous. Whichever section ran first in a process therefore
+  // passed with the apply-path gate REMOVED. Arming here fixes that: verified
+  // by deleting the gate and running this case alone with `-c`, which now
+  // fails all five sections (before: the first one passed).
+  arm_trigger_source();
+
   // Leaves `t` tracked, its triggers installed, and its baseline UNSEEDED.
   auto tracked_but_unseeded = [](DuckDBTestHarness &db) {
     db.exec("SELECT * FROM dbsp_auto_sync(false)");
@@ -1305,16 +1381,6 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   };
 
   SECTION("B commits inside the window, then A commits") {
-    // Does NOT discriminate in this harness: with the apply-path gate removed
-    // it still passes. Measured cause: this section is the FIRST case in the
-    // process to reach a dbsp_auto_sync(true) commit, so
-    // trigger_source_active() is still false and that commit takes the
-    // pessimistic sync_all, which seeds the baseline by accident — the gate
-    // is never consulted for whichever shape runs first. Later cases in the
-    // same process are genuinely unseeded and do discriminate. Run in
-    // isolation (-c) the first section is vacuous; the Python file
-    // test/python/test_create_view_seeding.py is order-independent and is
-    // the guard.
     DuckDBTestHarness db; // connection A
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     tracked_but_unseeded(db);
@@ -1390,9 +1456,13 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   }
 
   SECTION("A abandons its transaction; B keeps writing") {
-    // Also non-discriminating here, for the same reason as the first section
-    // above (first case in the process to reach a pessimistic-seeding commit);
-    // guarded file-backed in test/python/test_create_view_seeding.py.
+    // The only section that does NOT exercise the apply-path gate, and it
+    // says so rather than pretending: A's ROLLBACK lands BEFORE B's first
+    // write, and a rollback asks for a view rebuild from committed storage,
+    // which seeds the baseline. Its subject is that repair — B must keep
+    // reading correct answers afterwards — not the gate. Verified: with the
+    // gate deleted the other four sections fail in isolation and this one
+    // passes.
     DuckDBTestHarness db;
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     tracked_but_unseeded(db);
