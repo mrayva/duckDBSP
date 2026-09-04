@@ -2209,6 +2209,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
 struct DropMaterializedViewData : public TableFunctionData {
   string view_name;
   bool cascade = false;
+  bool if_exists = false;
   bool done = false;
 };
 
@@ -2219,6 +2220,10 @@ DropMaterializedViewBind(ClientContext &context, TableFunctionBindInput &input,
   auto data = make_uniq<DropMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->cascade = input.inputs[1].GetValue<bool>();
+  // Third argument = IF EXISTS. Absent on the two-parameter plan-function
+  // route, where the flag was parsed and then thrown away.
+  data->if_exists =
+      input.inputs.size() > 2 ? input.inputs[2].GetValue<bool>() : false;
   return_types.push_back(LogicalType::VARCHAR);
   names.push_back("result");
   return std::move(data);
@@ -2235,9 +2240,15 @@ void DropMaterializedViewExecute(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
 
-  // Check if view exists
   if (!manager.view_exists(state.view_name)) {
-    // IF EXISTS was handled by parser, so this is an error
+    if (state.if_exists) {
+      output.SetValue(0, 0,
+                      Value("Materialized view does not exist: " +
+                            state.view_name + " (IF EXISTS)"));
+      output.SetChildCardinality(1);
+      state.done = true;
+      return;
+    }
     throw InvalidInputException("Materialized view does not exist: " +
                                 state.view_name);
   }
@@ -2264,18 +2275,22 @@ void DropMaterializedViewExecute(ClientContext &context,
         " CASCADE to drop with dependents");
   }
 
-  // Drop the view (and dependents if cascade)
+  // Drop the view (and dependents first, if cascade).
+  //
+  // get_drop_order returns the DEPENDENTS only, never the named view — so the
+  // cascade branch used to drop every dependent and leave the view itself
+  // behind. Measured the first time this path became reachable at all:
+  // `DROP MATERIALIZED VIEW a1 CASCADE` reported "a1 (and 1 dependent views)"
+  // and dbsp_views() still listed a1. It was unreachable before the
+  // parser_override reclaimed DROP MATERIALIZED VIEW, which is why it stood.
   size_t dropped_count = 1;
   if (state.cascade && !dependents.empty()) {
-    // Drop dependents first (in reverse topological order)
-    auto drop_order = manager.get_drop_order(state.view_name);
-    for (const auto &view : drop_order) {
+    for (const auto &view : manager.get_drop_order(state.view_name)) {
       manager.drop_view(view);
       dropped_count++;
     }
-  } else {
-    manager.drop_view(state.view_name);
   }
+  manager.drop_view(state.view_name);
 
   // Return success message
   output.SetChildCardinality(1);
@@ -2590,11 +2605,35 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Or just rely on the table function
 
   // Register Create Materialized View Table Function (internal)
+  // The functions MaterializedViewOverride rewrites its DDL into. They are
+  // registered rather than synthesized because the override has to hand the
+  // core parser real SQL: it returns SQLStatements, not a plan. Two arities:
+  // the two-parameter form predates the override, and the three-parameter one
+  // carries OR REPLACE.
   TableFunction create_mv_func("dbsp_create_materialized_view",
                                {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                CreateMaterializedViewExecute,
                                CreateMaterializedViewBind);
-  loader.RegisterFunction(create_mv_func);
+  TableFunctionSet create_mv_set("dbsp_create_materialized_view");
+  create_mv_set.AddFunction(create_mv_func);
+  create_mv_set.AddFunction(TableFunction(
+      "dbsp_create_materialized_view",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN},
+      CreateMaterializedViewExecute, CreateMaterializedViewBind));
+  CreateTableFunctionInfo create_mv_set_info(create_mv_set);
+  loader.RegisterFunction(create_mv_set_info);
+
+  TableFunction drop_mv_func(
+      "dbsp_drop_materialized_view",
+      {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+      DropMaterializedViewExecute, DropMaterializedViewBind);
+  loader.RegisterFunction(drop_mv_func);
+
+  TableFunction refresh_mv_func("dbsp_refresh_materialized_view",
+                                {LogicalType::VARCHAR},
+                                RefreshMaterializedViewExecute,
+                                RefreshMaterializedViewBind);
+  loader.RegisterFunction(refresh_mv_func);
 
   TableFunction insert_func("dbsp_notify_insert", {LogicalType::VARCHAR},
                             NotifyInsertFunc, NotifyBind);
@@ -2740,6 +2779,31 @@ static void LoadInternal(ExtensionLoader &loader) {
   // We need to register the parser extension
   ParserExtension::Register(
       config, dbsp_native::CreateMaterializedViewParserExtension());
+
+  // parser_override callbacks are SKIPPED unless allow_parser_override_extension
+  // is FALLBACK or STRICT, and DuckDB's default is DEFAULT (skip). Raising it to
+  // FALLBACK is what makes `CREATE MATERIALIZED VIEW` keep the user's exact SQL
+  // and `DROP MATERIALIZED VIEW` reachable at all — the 2.0 PEG grammar claims
+  // DROP and its transformer throws `Cannot drop MATERIALIZED VIEW yet`, so a
+  // hook that only sees PEG FAILURES can never have it.
+  //
+  // FALLBACK, never STRICT: a query no override claims must still reach the core
+  // parser. And this raises the setting for EVERY parser-override extension in
+  // the database, not just this one — stated here because it is a real side
+  // effect of loading dbsp. Setting it back to DEFAULT does not break the DDL:
+  // the parse_function path still parses the same statements, it only
+  // normalises the stored SQL text and cannot reach DROP.
+  try {
+    config.SetOptionByName("allow_parser_override_extension",
+                           Value("FALLBACK"));
+  } catch (const std::exception &e) {
+    // A build or embedding without that setting keeps the token path, which is
+    // functional. Say so rather than failing the LOAD.
+    std::cerr << "DBSP: could not enable parser overrides ("
+              << e.what()
+              << "); CREATE MATERIALIZED VIEW will keep its token-reconstructed "
+                 "SQL text and DROP MATERIALIZED VIEW stays unavailable\n";
+  }
 }
 
 #ifndef EXT_VERSION_DBSP

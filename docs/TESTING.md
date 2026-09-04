@@ -204,8 +204,10 @@ not fail until it was corrected. Fetch, and assert on what the call was supposed
 to change.
 
 They exercise what only the loadable extension on a real Python client can
-reach: the SQL DDL front door (`test_ddl_syntax.py`), `dbsp_mv_tables`
-semantics, window frames, self-joins. Close the connection in any script you
+reach: the SQL DDL front door (`test_ddl_syntax.py` — byte-exact stored SQL,
+`DROP MATERIALIZED VIEW` with `IF EXISTS` and `CASCADE`, and the same DDL again
+with `allow_parser_override_extension='DEFAULT'` so the older token path stays
+covered), `dbsp_mv_tables` semantics, window frames, self-joins. Close the connection in any script you
 add — an open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha
 (CHANGELOG, "DuckDB 2.0 alpha issues").
 

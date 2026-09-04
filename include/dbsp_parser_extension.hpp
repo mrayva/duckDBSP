@@ -289,6 +289,342 @@ inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *inf
 }
 
 //===--------------------------------------------------------------------===//
+// parser_override: the RAW-TEXT route
+//===--------------------------------------------------------------------===//
+//
+// DuckDB 2.0 gained `ParserExtension::parser_override`, which receives the
+// query TEXT and runs BEFORE the core PEG grammar (duckdb/src/parser/parser.cpp
+// ParseQuery). That buys two things the token-reconstruction path above cannot:
+//
+//  1. **Byte-exact SQL.** The token path rebuilds the statement by joining
+//     token slices with single spaces, so `dbsp_views()` reports a normalised
+//     string and every comment inside the SELECT is gone. Here the SELECT body
+//     is a substring of what the user typed.
+//  2. **`DROP MATERIALIZED VIEW` is reachable again.** The 2.0 PEG grammar
+//     CLAIMS that statement (`drop.gram`) and its transformer then throws
+//     `NotImplementedException: Cannot drop MATERIALIZED VIEW yet`, so the
+//     parse_function hook — which only ever sees statements the PEG parser
+//     FAILED on — never saw it. Running before the grammar takes it back.
+//
+// It is not unconditional. `parser_override` callbacks are skipped unless
+// `allow_parser_override_extension` is FALLBACK or STRICT, and DuckDB's default
+// is DEFAULT (skip). The extension raises it to FALLBACK at load; a user who
+// sets it back gets the token path above, which parses the same DDL and builds
+// the same view — only the stored text is normalised. That is why BOTH paths
+// exist and neither is deleted.
+
+// True when `kw` appears at `pos` case-insensitively AND is followed by a
+// non-identifier character (so "CREATED" does not match "CREATE").
+inline bool dbsp_keyword_at(const string &q, size_t pos, const char *kw) {
+    const size_t n = strlen(kw);
+    if (pos + n > q.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (StringUtil::CharacterToUpper(q[pos + i]) != kw[i]) {
+            return false;
+        }
+    }
+    if (pos + n == q.size()) {
+        return true;
+    }
+    const char next = q[pos + n];
+    return !(std::isalnum(static_cast<unsigned char>(next)) || next == '_');
+}
+
+// Advance past whitespace, `-- line` comments and `/* block */` comments.
+inline size_t dbsp_skip_ws_comments(const string &q, size_t pos) {
+    while (pos < q.size()) {
+        if (std::isspace(static_cast<unsigned char>(q[pos]))) {
+            pos++;
+        } else if (q.compare(pos, 2, "--") == 0) {
+            const size_t nl = q.find('\n', pos);
+            pos = (nl == string::npos) ? q.size() : nl + 1;
+        } else if (q.compare(pos, 2, "/*") == 0) {
+            const size_t end = q.find("*/", pos + 2);
+            pos = (end == string::npos) ? q.size() : end + 2;
+        } else {
+            break;
+        }
+    }
+    return pos;
+}
+
+// Advance past one possibly-qualified, possibly-quoted identifier. Returns
+// `pos` unchanged when there is no identifier there.
+inline size_t dbsp_skip_identifier(const string &q, size_t pos) {
+    const size_t start = pos;
+    while (true) {
+        if (pos < q.size() && q[pos] == '"') {
+            pos++;
+            while (pos < q.size()) {
+                if (q[pos] == '"') {
+                    if (pos + 1 < q.size() && q[pos + 1] == '"') {
+                        pos += 2; // "" is an escaped quote inside the identifier
+                        continue;
+                    }
+                    pos++;
+                    break;
+                }
+                pos++;
+            }
+        } else {
+            const size_t part = pos;
+            while (pos < q.size() &&
+                   (std::isalnum(static_cast<unsigned char>(q[pos])) ||
+                    q[pos] == '_' || q[pos] == '$')) {
+                pos++;
+            }
+            if (pos == part) {
+                return start; // nothing consumed: not an identifier
+            }
+        }
+        if (pos < q.size() && q[pos] == '.') {
+            pos++;
+            continue; // qualified name: keep going
+        }
+        return pos;
+    }
+}
+
+// Index of the first statement-terminating `;` at or after `pos`, skipping
+// string literals, quoted identifiers and comments; q.size() when there is
+// none. Needed because "the rest of the text is the SELECT" is only true up to
+// a terminator a user wrote.
+inline size_t dbsp_find_statement_end(const string &q, size_t pos) {
+    while (pos < q.size()) {
+        const char c = q[pos];
+        if (c == ';') {
+            return pos;
+        }
+        if (c == '\'' || c == '"') {
+            const char quote = c;
+            pos++;
+            while (pos < q.size()) {
+                if (q[pos] == quote) {
+                    if (pos + 1 < q.size() && q[pos + 1] == quote) {
+                        pos += 2;
+                        continue;
+                    }
+                    pos++;
+                    break;
+                }
+                pos++;
+            }
+            continue;
+        }
+        if (q.compare(pos, 2, "--") == 0) {
+            const size_t nl = q.find('\n', pos);
+            pos = (nl == string::npos) ? q.size() : nl + 1;
+            continue;
+        }
+        if (q.compare(pos, 2, "/*") == 0) {
+            const size_t end = q.find("*/", pos + 2);
+            pos = (end == string::npos) ? q.size() : end + 2;
+            continue;
+        }
+        pos++;
+    }
+    return q.size();
+}
+
+// Single-quoted SQL literal for `s`.
+inline string dbsp_sql_literal(const string &s) {
+    string out = "'";
+    for (char c : s) {
+        out += c;
+        if (c == '\'') {
+            out += c; // doubled, not prefixed: '' is the escape
+        }
+    }
+    out += "'";
+    return out;
+}
+
+inline string dbsp_trimmed(const string &s) {
+    string out = s;
+    StringUtil::Trim(out);
+    return out;
+}
+
+// Rewrite one MATERIALIZED VIEW DDL statement into the equivalent call on the
+// extension's own functions. Returns false when `query` is not one of ours (or
+// is one of ours followed by another statement — see below), which makes the
+// override decline and hands the query to the core parser.
+inline bool dbsp_rewrite_mv_ddl(const string &query, string &out) {
+    size_t pos = dbsp_skip_ws_comments(query, 0);
+
+    // Everything below is a single statement. A trailing statement is DECLINED
+    // rather than rewritten: the input then takes the ordinary route and fails
+    // there, loudly, exactly as it did before this override existed. Silently
+    // folding it into the SELECT body, or silently dropping it, are the two
+    // outcomes that must never happen.
+    auto single_statement = [&](size_t body_start, string &body) -> bool {
+        const size_t end = dbsp_find_statement_end(query, body_start);
+        if (end < query.size() &&
+            dbsp_skip_ws_comments(query, end + 1) < query.size()) {
+            return false; // more statements follow
+        }
+        body = dbsp_trimmed(query.substr(body_start, end - body_start));
+        return !body.empty();
+    };
+
+    if (dbsp_keyword_at(query, pos, "CREATE")) {
+        pos = dbsp_skip_ws_comments(query, pos + 6);
+        bool or_replace = false;
+        if (dbsp_keyword_at(query, pos, "OR")) {
+            const size_t after_or = dbsp_skip_ws_comments(query, pos + 2);
+            if (!dbsp_keyword_at(query, after_or, "REPLACE")) {
+                return false;
+            }
+            or_replace = true;
+            pos = dbsp_skip_ws_comments(query, after_or + 7);
+        }
+        if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 12);
+        if (!dbsp_keyword_at(query, pos, "VIEW")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 4);
+        if (dbsp_keyword_at(query, pos, "IF")) {
+            // IF NOT EXISTS is accepted and ignored, as it always has been on
+            // this path: create_view already treats a repeat create as a
+            // redefinition rather than an error.
+            size_t p = dbsp_skip_ws_comments(query, pos + 2);
+            if (!dbsp_keyword_at(query, p, "NOT")) {
+                return false;
+            }
+            p = dbsp_skip_ws_comments(query, p + 3);
+            if (!dbsp_keyword_at(query, p, "EXISTS")) {
+                return false;
+            }
+            pos = dbsp_skip_ws_comments(query, p + 6);
+        }
+        const size_t name_start = pos;
+        const size_t name_end = dbsp_skip_identifier(query, pos);
+        if (name_end == name_start) {
+            return false;
+        }
+        const string name = query.substr(name_start, name_end - name_start);
+        pos = dbsp_skip_ws_comments(query, name_end);
+        if (!dbsp_keyword_at(query, pos, "AS")) {
+            return false;
+        }
+        string body;
+        if (!single_statement(pos + 2, body)) {
+            return false;
+        }
+        out = "SELECT * FROM dbsp_create_materialized_view(" +
+              dbsp_sql_literal(name) + ", " + dbsp_sql_literal(body) + ", " +
+              (or_replace ? "true" : "false") + ")";
+        return true;
+    }
+
+    if (dbsp_keyword_at(query, pos, "DROP")) {
+        pos = dbsp_skip_ws_comments(query, pos + 4);
+        if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 12);
+        if (!dbsp_keyword_at(query, pos, "VIEW")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 4);
+        bool if_exists = false;
+        if (dbsp_keyword_at(query, pos, "IF")) {
+            const size_t p = dbsp_skip_ws_comments(query, pos + 2);
+            if (!dbsp_keyword_at(query, p, "EXISTS")) {
+                return false;
+            }
+            if_exists = true;
+            pos = dbsp_skip_ws_comments(query, p + 6);
+        }
+        const size_t name_start = pos;
+        const size_t name_end = dbsp_skip_identifier(query, pos);
+        if (name_end == name_start) {
+            return false;
+        }
+        const string name = query.substr(name_start, name_end - name_start);
+        pos = dbsp_skip_ws_comments(query, name_end);
+        bool cascade = false;
+        if (dbsp_keyword_at(query, pos, "CASCADE")) {
+            cascade = true;
+            pos = dbsp_skip_ws_comments(query, pos + 7);
+        } else if (dbsp_keyword_at(query, pos, "RESTRICT")) {
+            pos = dbsp_skip_ws_comments(query, pos + 8);
+        }
+        if (pos < query.size() && query[pos] == ';') {
+            pos = dbsp_skip_ws_comments(query, pos + 1);
+        }
+        if (pos < query.size()) {
+            return false; // trailing junk or another statement
+        }
+        out = "SELECT * FROM dbsp_drop_materialized_view(" +
+              dbsp_sql_literal(name) + ", " + (cascade ? "true" : "false") +
+              ", " + (if_exists ? "true" : "false") + ")";
+        return true;
+    }
+
+    if (dbsp_keyword_at(query, pos, "REFRESH")) {
+        pos = dbsp_skip_ws_comments(query, pos + 7);
+        if (!dbsp_keyword_at(query, pos, "MATERIALIZED")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 12);
+        if (!dbsp_keyword_at(query, pos, "VIEW")) {
+            return false;
+        }
+        pos = dbsp_skip_ws_comments(query, pos + 4);
+        const size_t name_start = pos;
+        const size_t name_end = dbsp_skip_identifier(query, pos);
+        if (name_end == name_start) {
+            return false;
+        }
+        const string name = query.substr(name_start, name_end - name_start);
+        pos = dbsp_skip_ws_comments(query, name_end);
+        if (pos < query.size() && query[pos] == ';') {
+            pos = dbsp_skip_ws_comments(query, pos + 1);
+        }
+        if (pos < query.size()) {
+            return false;
+        }
+        out = "SELECT * FROM dbsp_refresh_materialized_view(" +
+              dbsp_sql_literal(name) + ")";
+        return true;
+    }
+
+    return false;
+}
+
+inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
+                                                     const string &query,
+                                                     ParserOptions &options) {
+    // Cheap gate: every statement this override claims contains the word
+    // MATERIALIZED, and this callback runs on EVERY query in the database.
+    if (StringUtil::Upper(query).find("MATERIALIZED") == string::npos) {
+        return ParserOverrideResult();
+    }
+    string rewritten;
+    if (!dbsp_rewrite_mv_ddl(query, rewritten)) {
+        return ParserOverrideResult();
+    }
+    try {
+        // Parse the rewritten call with overrides and extensions OFF: this
+        // callback would otherwise re-enter itself on its own output.
+        ParserOptions inner = options;
+        inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
+        inner.extensions = nullptr;
+        Parser parser(inner);
+        parser.ParseQuery(rewritten);
+        return ParserOverrideResult(std::move(parser.statements));
+    } catch (std::exception &e) {
+        return ParserOverrideResult(e);
+    }
+}
+
+//===--------------------------------------------------------------------===//
 // Plan Function (Implementation in dbsp_extension.cpp)
 //===--------------------------------------------------------------------===//
 
@@ -305,6 +641,10 @@ inline ParserExtension CreateMaterializedViewParserExtension() {
     ParserExtension extension;
     extension.parse_function = MaterializedViewParse;
     extension.plan_function = MaterializedViewPlan;
+    // Runs BEFORE the core PEG grammar when allow_parser_override_extension is
+    // FALLBACK or STRICT — see the block above. parse_function stays as the
+    // fallback for a database where that setting is DEFAULT.
+    extension.parser_override = MaterializedViewOverride;
     extension.parser_info = nullptr; // No additional info needed
     return extension;
 }

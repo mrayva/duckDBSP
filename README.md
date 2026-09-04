@@ -130,6 +130,22 @@ triggers, which are ordinary SQL objects a stock DuckDB already supports. The
 extension therefore loads into the public PyPI wheel of the same engine commit,
 and CI can build against one.
 
+### SQL DDL
+
+`CREATE [OR REPLACE] MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW [IF EXISTS]
+name [CASCADE]` and `REFRESH MATERIALIZED VIEW` are recognised by
+`ParserExtension::parser_override`, which sees the RAW query text before
+DuckDB's PEG grammar. The SQL a view stores is therefore byte-exact with what
+was typed (comments included), and `DROP MATERIALIZED VIEW` works — the 2.0
+grammar claims that statement and throws `Cannot drop MATERIALIZED VIEW yet`,
+so a hook running only on parse failures could never reach it.
+
+**Loading the extension raises `allow_parser_override_extension` to
+`FALLBACK`** (DuckDB's default, `DEFAULT`, skips every override callback). The
+setting is global, so other parser-override extensions in that database become
+active too. Setting it back keeps the DDL working through the older
+token-reconstruction hook — same view, normalised stored SQL, no DROP.
+
 ### The delta source
 
 The extension learns what a committing transaction wrote from statement-level

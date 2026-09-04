@@ -2,27 +2,39 @@
 
 This is the extension's SQL-DDL front door, and NumPad's only route into it
 (calcengine/engine/mvcompile rewrites CREATE VIEW -> CREATE MATERIALIZED VIEW).
-DuckDB 2.0 replaced the PostgreSQL-derived parser with a PEG parser and changed
-the parser-extension contract with it: the hook no longer receives the raw
-statement text, it receives the tokenized tail from the PEG failure point, and
-include/dbsp_parser_extension.hpp RECONSTRUCTS the statement by joining token
-slices with single spaces. Everything below exists to pin that reconstruction,
-because a lossy rebuild would silently change what the view computes.
+
+The statement is recognised by `ParserExtension::parser_override`, which gets
+the RAW query text and runs BEFORE the core PEG grammar. So the SELECT body a
+view stores is a substring of what the user typed -- comments, spacing and all
+-- and `DROP MATERIALIZED VIEW` is reachable, which it was not while the only
+hook ran on PEG FAILURES (the 2.0 grammar claims DROP and its transformer
+throws `Cannot drop MATERIALIZED VIEW yet`).
+
+The older token-reconstruction path is still there and still parses the same
+statements: `parser_override` callbacks are skipped unless
+`allow_parser_override_extension` is FALLBACK or STRICT, and the extension
+raises it to FALLBACK at load. A database where that setting is put back to
+DEFAULT keeps working, with normalised stored SQL and no DROP DDL. Both are
+exercised below.
 
 Covered:
-  - a quoted, mixed-case identifier survives (quotes are part of the slice)
+  - a quoted, mixed-case identifier survives
   - a string literal with an escaped quote and runs of two spaces survives
-    verbatim -- the single-space join must not touch the inside of a token
-  - qualified `t.col` references still resolve when rebuilt as `t . col`
-  - negative literals survive the `-` / `1` and `-` / `10` token splits
-  - `--` line comments and block comments inside the SELECT are dropped
+    verbatim
+  - qualified `t.col` references resolve
+  - negative literals survive
+  - `--` line comments and block comments inside the SELECT are KEPT
   - `||` concatenation is not split
   - the resulting dbsp_query('v') matches the same SQL run natively
+  - the SQL `dbsp_views()` reports is BYTE-EXACT with what was typed
   - REFRESH MATERIALIZED VIEW reports the view is incrementally maintained
-  - DROP MATERIALIZED VIEW: never reaches the extension (also true on
-    1.5.4); pinned so the day it changes, this test says so
+  - DROP MATERIALIZED VIEW, with IF EXISTS, with CASCADE, and the refusal
+    when a dependent exists
+  - dbsp_drop_view still works (NumPad calls it)
   - a multi-statement input errors LOUDLY and does not silently execute or
     silently drop the trailing statement
+  - the same DDL under allow_parser_override_extension=DEFAULT still builds a
+    correct view through the token path
 
 Run: python test_ddl_syntax.py <path-to-dbsp.duckdb_extension>
 """
@@ -84,6 +96,21 @@ try:
     ], f"unexpected rows (literal spacing or negative literal mangled?): {got}"
     print("ok: dbsp_query matches native SQL, literal and comments intact", flush=True)
 
+    # BYTE-EXACT: parser_override keeps the raw text, so what dbsp_views()
+    # reports is the substring the user typed after AS, trimmed. The token
+    # path could not do this -- it returned `t . "MixedCol" AS m , ...` with
+    # every comment gone.
+    stored = conn.execute(
+        "SELECT sql FROM dbsp_views() WHERE view_name = 'v'"
+    ).fetchone()[0]
+    assert stored == SELECT_BODY.strip(), (
+        "stored SQL is not byte-exact:\n"
+        f"  got  {stored!r}\n  want {SELECT_BODY.strip()!r}"
+    )
+    assert "-- quoted mixed-case identifier" in stored, "line comment lost"
+    assert "/* a block comment, mid-statement */" in stored, "block comment lost"
+    print("ok: stored SQL is byte-exact, comments preserved", flush=True)
+
     # The view is a real materialized view, not a snapshot: it must track writes.
     conn.execute("INSERT INTO t VALUES (11, 'c')")
     got = conn.execute("SELECT * FROM dbsp_query('v') ORDER BY m").fetchall()
@@ -96,44 +123,66 @@ try:
     assert len(msg) == 1 and "up-to-date" in msg[0][0], f"unexpected REFRESH result: {msg}"
     print("ok: REFRESH MATERIALIZED VIEW reports incremental maintenance", flush=True)
 
-    # --- PINNED: DROP MATERIALIZED VIEW never reaches the extension -------------
-    # NOT a 2.0 regression -- MEASURED on the 1.5.4 stack (build_v1.5.4 extension
-    # under duckdb==1.5.4): `DROP MATERIALIZED VIEW v` and the IF EXISTS form both
-    # raise `NotImplementedException: Not implemented Error: Cannot drop this type
-    # yet`, and `SELECT dbsp_drop_view('v')` returns 'Dropped'. So DuckDB has owned
-    # this statement since at least 1.5.4 and the extension's
-    # ParseDropMaterializedView has never been reachable through it; docs/API.md
-    # has said so since 2026-07-05.
-    # What 2.0 changed is only the message and the mechanism: 2.0 added
-    # `MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'` to its OWN drop grammar
-    # (duckdb/src/parser/peg/grammar/statements/drop.gram:32), so the PEG parse
-    # SUCCEEDS and the core transformer throws:
-    #   duckdb/src/parser/peg/transformer/transform_drop.cpp:34
-    #     throw NotImplementedException("Cannot drop MATERIALIZED VIEW yet");
-    # This assertion pins that state on purpose: when upstream implements DROP
-    # MATERIALIZED VIEW (or the fork reclaims the statement via
-    # ParserExtension::parser_override), this test fails and whoever is here can
-    # re-point callers. NumPad used to issue `DROP MATERIALIZED VIEW IF EXISTS`
-    # from calcengine/session/mv_reattach.py and now calls dbsp_drop_view.
-    for stmt in ("DROP MATERIALIZED VIEW v", "DROP MATERIALIZED VIEW IF EXISTS v"):
-        try:
-            conn.execute(stmt)
-            raise AssertionError(
-                f"{stmt} unexpectedly SUCCEEDED -- the 2.0 grammar regression is "
-                "fixed; re-route the fork's DROP path and update this test"
-            )
-        except duckdb.NotImplementedException as e:
-            assert "Cannot drop MATERIALIZED VIEW" in str(e), f"{stmt}: unexpected error {e}"
-    print(
-        "ok: DROP MATERIALIZED VIEW blocked by the core parser, as on 1.5.4 "
-        "(pinned; use dbsp_drop_view)",
-        flush=True,
-    )
+    # --- DROP MATERIALIZED VIEW is ours again ----------------------------------
+    # It was NOT reachable while the only hook ran on PEG failures: DuckDB 2.0
+    # added `MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'` to its own drop
+    # grammar (duckdb/src/parser/peg/grammar/statements/drop.gram:32), so the
+    # parse SUCCEEDED and the core transformer threw
+    # `NotImplementedException: Cannot drop MATERIALIZED VIEW yet`
+    # (duckdb/src/parser/peg/transformer/transform_drop.cpp:34). parser_override
+    # runs BEFORE that grammar, so the statement never reaches it.
+    conn.execute("CREATE MATERIALIZED VIEW dropme AS SELECT count(*) AS n FROM t")
+    assert conn.execute(
+        "SELECT count(*) FROM dbsp_views() WHERE view_name = 'dropme'"
+    ).fetchone()[0] == 1
+    conn.execute("DROP MATERIALIZED VIEW dropme")
+    assert conn.execute(
+        "SELECT count(*) FROM dbsp_views() WHERE view_name = 'dropme'"
+    ).fetchone()[0] == 0, "DROP MATERIALIZED VIEW did not drop the view"
+    print("ok: DROP MATERIALIZED VIEW drops the view", flush=True)
 
-    # The view must survive a failed DROP rather than being half-torn-down.
+    # Without IF EXISTS a missing view is an error; with it, a message.
+    try:
+        conn.execute("DROP MATERIALIZED VIEW nosuchview")
+        raise AssertionError("DROP of a missing view should have raised")
+    except duckdb.InvalidInputException as e:
+        assert "does not exist" in str(e), f"unexpected error: {e}"
+    msg = conn.execute("DROP MATERIALIZED VIEW IF EXISTS nosuchview").fetchall()
+    assert len(msg) == 1 and "IF EXISTS" in msg[0][0], f"unexpected result: {msg}"
+    print("ok: DROP MATERIALIZED VIEW honours IF EXISTS", flush=True)
+
+    # A view with a dependent is refused, and CASCADE takes both -- INCLUDING
+    # the named view itself. get_drop_order returns the dependents only, so
+    # the cascade branch used to leave the named view behind; the first run of
+    # this path reported "a1 (and 1 dependent views)" with a1 still listed.
+    conn.execute(
+        "CREATE MATERIALIZED VIEW casc1 AS SELECT tag, count(*) AS n FROM t GROUP BY tag")
+    conn.execute("CREATE MATERIALIZED VIEW casc2 AS SELECT tag FROM casc1")
+    try:
+        conn.execute("DROP MATERIALIZED VIEW casc1")
+        raise AssertionError("DROP of a view with a dependent should have raised")
+    except duckdb.InvalidInputException as e:
+        assert "casc2" in str(e), f"error should name the dependent: {e}"
+    conn.execute("DROP MATERIALIZED VIEW casc1 CASCADE")
+    left = [r[0] for r in conn.execute(
+        "SELECT view_name FROM dbsp_views() WHERE view_name IN ('casc1','casc2')"
+    ).fetchall()]
+    assert left == [], f"CASCADE left views behind: {left}"
+    print("ok: DROP MATERIALIZED VIEW CASCADE takes the view and its dependents",
+          flush=True)
+
+    # dbsp_drop_view still works: NumPad calls it (calcengine/session/mv_reattach.py).
+    conn.execute("CREATE MATERIALIZED VIEW fn_drop AS SELECT count(*) AS n FROM t")
+    assert conn.execute("SELECT dbsp_drop_view('fn_drop')").fetchone()[0] == "Dropped"
+    assert conn.execute(
+        "SELECT count(*) FROM dbsp_views() WHERE view_name = 'fn_drop'"
+    ).fetchone()[0] == 0
+    print("ok: dbsp_drop_view still works", flush=True)
+
+    # The view under test must be untouched by all of the above.
     got = conn.execute("SELECT * FROM dbsp_query('v') ORDER BY m").fetchall()
-    assert got == want, f"view damaged by the failed DROP: {got}"
-    print("ok: view intact after the failed DROP", flush=True)
+    assert got == want, f"view damaged by the DROP work: {got}"
+    print("ok: view intact after the DROP cases", flush=True)
 
     # --- multi-statement input must not be silently truncated ------------------
     # The hook claims the whole token tail, terminator included, so a trailing
@@ -158,6 +207,33 @@ try:
     ).fetchone()[0]
     assert mv2 == 0, "mv2 was created despite the error"
     print("ok: multi-statement input errors loudly, nothing half-applied", flush=True)
+
+    # --- the token path is still a working fallback ----------------------------
+    # parser_override callbacks are skipped when allow_parser_override_extension
+    # is DEFAULT, which is DuckDB's own default -- the extension raises it to
+    # FALLBACK at load. Put it back and the DDL still builds a correct view
+    # through the token reconstruction; only the stored text is normalised, and
+    # DROP MATERIALIZED VIEW goes back to the core parser's refusal.
+    assert conn.execute(
+        "SELECT current_setting('allow_parser_override_extension')"
+    ).fetchone()[0] == "FALLBACK", "the extension did not raise the setting at load"
+    conn.execute("SET allow_parser_override_extension='DEFAULT'")
+    conn.execute("CREATE MATERIALIZED VIEW tokpath AS SELECT tag, count(*) AS n "
+                 "FROM t GROUP BY tag")
+    got = sorted(conn.execute("SELECT * FROM dbsp_query('tokpath')").fetchall())
+    want_tok = sorted(conn.execute(
+        "SELECT tag, count(*) AS n FROM t GROUP BY tag").fetchall())
+    assert got == want_tok, f"token path built a wrong view: {got} vs {want_tok}"
+    try:
+        conn.execute("DROP MATERIALIZED VIEW tokpath")
+        raise AssertionError(
+            "DROP MATERIALIZED VIEW worked with overrides off -- the core parser "
+            "must own it there")
+    except duckdb.NotImplementedException as e:
+        assert "Cannot drop MATERIALIZED VIEW" in str(e), f"unexpected error: {e}"
+    conn.execute("SET allow_parser_override_extension='FALLBACK'")
+    print("ok: token path still builds a correct view with overrides off",
+          flush=True)
 finally:
     conn.close()
 

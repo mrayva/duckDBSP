@@ -1,5 +1,60 @@
 # Changelog
 
+## The DDL is parsed from RAW TEXT, and DROP works again — 2026-09-04
+
+`CREATE` / `DROP` / `REFRESH MATERIALIZED VIEW` are now recognised in
+`ParserExtension::parser_override`, which receives the query TEXT and runs
+BEFORE the core PEG grammar. **The token-reconstruction path is no longer how
+these statements are normally parsed** — it survives only as the fallback for a
+database where parser overrides are switched off (see below).
+
+Two things follow:
+
+- **The stored SQL is byte-exact.** `dbsp_views()` returns the substring the
+  user typed after `AS`. Before, the hook received the tokenized tail from the
+  PEG failure point and rebuilt the statement by joining token slices with
+  single spaces: `SELECT t . "MixedCol" AS m , t . tag || '-' || ... FROM t`,
+  with every `--` and `/* */` comment gone. Now
+  `stored == SELECT_BODY.strip()` and both comments survive.
+- **`DROP MATERIALIZED VIEW [IF EXISTS] name [CASCADE]` is reachable again.**
+  DuckDB 2.0's grammar CLAIMS that statement
+  (`peg/grammar/statements/drop.gram:32`) and its transformer throws
+  `NotImplementedException: Cannot drop MATERIALIZED VIEW yet`
+  (`transform_drop.cpp:34`), so a hook that only sees PEG FAILURES never had
+  it. Running before the grammar takes it back. `dbsp_drop_view()` and
+  `dbsp_drop()` are unchanged and still work.
+
+**Loading the extension now raises `allow_parser_override_extension` to
+`FALLBACK`.** DuckDB's default is `DEFAULT`, which skips every
+`parser_override` callback, so without this the DDL above would never reach the
+extension. Stated plainly because it is a real side effect: the setting is
+global, so any OTHER parser-override extension in that database becomes active
+too. `FALLBACK` and never `STRICT`, so a query no override claims still reaches
+the core parser. A user who sets it back to `DEFAULT` keeps working DDL through
+the token path — same view, normalised stored text, no DROP.
+
+Two bugs surfaced by making the path reachable:
+
+- `dbsp_sql_literal` escaped `'` by appending `''` and then the character
+  again, producing `'''`. The malformed rewrite failed to parse, the override
+  declined, and the statement quietly fell back to the token path — the stored
+  SQL was still normalised and nothing said why.
+- `DROP ... CASCADE` dropped every dependent and left the named view behind:
+  `get_drop_order` returns the DEPENDENTS only, and the cascade branch had no
+  `drop_view` for the view itself. Measured on the first run of a path that had
+  never been reachable: `DROP MATERIALIZED VIEW a1 CASCADE` reported
+  "a1 (and 1 dependent views)" and `dbsp_views()` still listed a1.
+
+`DROP MATERIALIZED VIEW` also honours `IF EXISTS` now, which the old parse data
+carried and the plan function threw away.
+
+`test/python/test_ddl_syntax.py` covers all of it: byte-exact stored SQL with
+both comment styles, DROP with and without IF EXISTS, the refusal when a
+dependent exists, CASCADE taking both views, `dbsp_drop_view` still working,
+the multi-statement input still erroring loudly with nothing half-applied, and
+the token path still building a correct view with
+`allow_parser_override_extension='DEFAULT'`.
+
 ## `dbsp_mv_tables(false)` actually stops mirroring — 2026-09-04
 
 `test/python/test_mv_tables.py` had a standing red on `disable must stop

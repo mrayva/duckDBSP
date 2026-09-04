@@ -51,12 +51,48 @@ Accepted for compatibility — a no-op, since views refresh automatically.
 
 ### DROP MATERIALIZED VIEW
 
-DuckDB parses `DROP MATERIALIZED VIEW` natively, which bypasses the
-extension's parser hook — use the function form instead:
+```sql
+DROP MATERIALIZED VIEW [IF EXISTS] name [CASCADE | RESTRICT];
+```
+
+Drops the view. `IF EXISTS` turns a missing view from an error into a message;
+`CASCADE` drops the view together with every view that depends on it (without
+it, a view with dependents is refused and the error names them).
+
+This works because the extension recognises the statement in
+`ParserExtension::parser_override`, which runs BEFORE the core PEG grammar. The
+grammar CLAIMS `DROP MATERIALIZED VIEW` and its transformer then throws
+`NotImplementedException: Cannot drop MATERIALIZED VIEW yet`, so a hook that
+only sees statements the grammar failed on could never have it. See "How the
+DDL is parsed" below.
+
+The function forms still work and are unchanged:
 
 ```sql
+SELECT dbsp_drop_view('name');      -- or dbsp_drop_view_cascade('name')
 SELECT dbsp_drop('name');           -- or dbsp_drop_cascade('name')
 ```
+
+### How the DDL is parsed
+
+`CREATE`/`DROP`/`REFRESH MATERIALIZED VIEW` are recognised by
+`ParserExtension::parser_override` (`include/dbsp_parser_extension.hpp`), which
+receives the RAW query text before the PEG grammar sees it and rewrites the
+statement into a call on the extension's own functions. Two consequences:
+
+- **The stored SQL is byte-exact.** `dbsp_views()` returns the substring you
+  typed after `AS`, comments and spacing included.
+- **`DROP MATERIALIZED VIEW` is reachable**, as above.
+
+`parser_override` callbacks are SKIPPED unless
+`allow_parser_override_extension` is `FALLBACK` or `STRICT`, and DuckDB's
+default is `DEFAULT`. **Loading the extension raises that setting to
+`FALLBACK`** — for the whole database, so any other parser-override extension
+becomes active too. Setting it back does not break the DDL: the older
+token-reconstruction hook (which runs on PEG failures) still parses
+`CREATE`/`REFRESH`, and builds the same view. What is lost there is the exact
+text — `dbsp_views()` reports a normalised `t . "col" AS m , ...` with comments
+stripped — and `DROP MATERIALIZED VIEW` goes back to the core parser's refusal.
 
 ---
 
