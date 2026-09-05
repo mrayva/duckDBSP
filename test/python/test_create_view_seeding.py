@@ -267,21 +267,11 @@ def third_party_scan_case(label, path):
     untracked when the statement folded). Measured before the fix:
     view [(10.0,)] against SQL [(13.0,)], permanently.
 
-    OPEN DEFECT — this reproduction FAILS. It is not in the default run
-    because it does not yet describe the shipped behaviour; run it with
-    DBSP_KNOWN_DEFECTS=1.
-
-    The fix that closes it is known and was measured to work: make
-    `retire_scanned_baseline` ask the readiness watermark for DEFERRED as it
-    already does for PROVISIONAL, and DEMOTE to Provisional when it has not
-    cleared. It is not landed because the read gate refuses a PROVISIONAL
-    source on every connection, so the demotion turns four sections of
-    `cdc: an unseeded baseline is never served to another connection` from
-    SERVED-with-the-right-answer into refusals. That case pins availability
-    during the deferral window, this one pins correctness after it, and the two
-    cannot both hold until the read gate can tell an ordinary autocommit reader
-    from one inside the deferring transaction. See the read-gate OPEN item in
-    docs/DESIGN_TRIGGER_SOURCE.md.
+    A wrote the table BEFORE tracking it, so the deferral is TAINTED
+    (`TrackedTable::pre_trigger_rows`) and only a scan taken once A is gone may
+    establish the baseline. `untainted_third_party_scan` below is the same
+    shape with the write AFTER the track, where any scan may establish — that
+    pair is the whole of the rule.
     """
     a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
     b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
@@ -313,6 +303,99 @@ def third_party_scan_case(label, path):
         assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
         print(f"ok: {label} — a third party cannot establish it ({v})",
               flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
+def untainted_third_party_scan_case(label, path):
+    """The other half of the taint rule: a third party's scan is WELCOME here.
+
+    A tracks the table BEFORE writing to it, so every write A makes is
+    accounted for — `capture_.touched` names the table at A's own commit (and
+    once the triggers exist they feed it directly). A scan at committed state
+    plus those deltas is exactly right, so B's `dbsp_sync()` may establish the
+    baseline, B is SERVED during the window instead of refused, and A's commit
+    lands the rest.
+
+    This is the case that must not regress when `third_party_scan` is fixed:
+    refusing here would trade a rare wrong answer for a common outage.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute(
+            "SELECT * FROM dbsp_create_view('mv','SELECT sum(v) AS s FROM t')"
+        ).fetchall()                                  # tracked first: untainted
+        a.execute("INSERT INTO t VALUES (2, 3.0)")    # accounted for by touched
+
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()
+
+        # SERVED, and correct for B's own snapshot: A's row is uncommitted, so
+        # plain SQL on B does not see it either.
+        v = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = b.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label}/B in window: view {v} != SQL {sq}"
+
+        a.execute("COMMIT")
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after COMMIT: view {v} != SQL {sq}"
+        a.execute("INSERT INTO t VALUES (3, 4.0)")
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — untainted, so a third party may establish it "
+              f"({v})", flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
+def tainted_rollback_case(label, path):
+    """A TAINTED deferral that ends in ROLLBACK still heals.
+
+    The rows that could not be reported are rolled back with the transaction,
+    so once it is gone the watermark clears and the next scan — here the one
+    the READ path runs before refusing — establishes the baseline at committed
+    state, which is now the whole truth.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute("INSERT INTO t VALUES (2, 3.0)")    # pre-track: taints it
+        a.execute(
+            "SELECT * FROM dbsp_create_view('mv','SELECT sum(v) AS s FROM t')"
+        ).fetchall()
+
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()   # must not establish
+        try:
+            rows = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            raise AssertionError(
+                f"{label}: B was served {rows} from a tainted deferral")
+        except duckdb.InvalidInputException as e:
+            assert "baseline" in str(e), f"{label}: unexpected error {e}"
+
+        a.execute("ROLLBACK")
+        for who, con in (("A", a), ("B", b)):
+            v = con.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            sq = con.execute("SELECT sum(v) FROM t").fetchall()
+            assert v == sq, f"{label}/{who} after ROLLBACK: view {v} != SQL {sq}"
+        b.execute("INSERT INTO t VALUES (4, 5.0)")
+        v = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = b.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — a rolled-back taint heals ({v})", flush=True)
     finally:
         b.close()
         a.close()
@@ -394,12 +477,12 @@ with tempfile.TemporaryDirectory() as tmp:
                         os.path.join(tmp, "in_window.duckdb"))
     watermark_never_lowers_case("watermark_never_lowers",
                                 os.path.join(tmp, "wm_lower.duckdb"))
-    if os.environ.get("DBSP_KNOWN_DEFECTS"):
-        third_party_scan_case("third_party_scan",
-                              os.path.join(tmp, "third_party.duckdb"))
-    else:
-        print("skip: third_party_scan — OPEN DEFECT, see its docstring "
-              "(DBSP_KNOWN_DEFECTS=1 to run it)", flush=True)
+    third_party_scan_case("third_party_scan",
+                          os.path.join(tmp, "third_party.duckdb"))
+    untainted_third_party_scan_case("untainted_third_party_scan",
+                                    os.path.join(tmp, "untainted.duckdb"))
+    tainted_rollback_case("tainted_rollback",
+                          os.path.join(tmp, "tainted_rollback.duckdb"))
 
 
 # ---------------------------------------------------------------------------

@@ -743,7 +743,15 @@ public:
   // timestamp the deferring transaction's end passes (its own start + 1), so
   // ready_watermark_cleared() is the question "has that transaction ended?" —
   // the same comparison PROVISIONAL uses, against the same counter.
-  void mark_seed_deferred(uint64_t watermark) {
+  // `pre_trigger_rows`: the deferring transaction was ALREADY holding
+  // uncommitted rows for this table when it was tracked — see
+  // pre_trigger_rows() for what that costs. Sticky across repeated deferrals:
+  // one tainted deferral taints the debt, and only establishing it clears the
+  // bit.
+  void mark_seed_deferred(uint64_t watermark, bool pre_trigger_rows) {
+    if (pre_trigger_rows) {
+      pre_trigger_rows_ = true;
+    }
     auto s = baseline_.load();
     while (s == Baseline::Unseeded || s == Baseline::Deferred) {
       if (baseline_.compare_exchange_weak(s, Baseline::Deferred)) {
@@ -781,10 +789,35 @@ public:
     while (s == Baseline::Unseeded || s == Baseline::Deferred) {
       if (baseline_.compare_exchange_weak(s, Baseline::Seeded)) {
         ready_watermark_ = 0;
+        pre_trigger_rows_ = false;
         return;
       }
     }
   }
+
+  // Does this DEFERRED debt hold rows NOBODY can report?
+  //
+  // The rows a deferred baseline is missing belong to the transaction that
+  // deferred it, and they reach a view one of two ways: the triggers report
+  // them at that transaction's commit, or `capture_.touched` names the table
+  // and the commit scans it. BOTH need the table to have been tracked BEFORE
+  // the write — the triggers do not exist until the transaction ends, and a
+  // statement that writes an UNTRACKED table folds without naming it. Note it
+  // is TRACKED that matters, not TRIGGERED: a write to a tracked table whose
+  // triggers are not installed yet is still named by `touched`.
+  //
+  // So a transaction that already held uncommitted rows for this table when it
+  // tracked it holds rows no one will ever report. Nothing but that
+  // transaction's OWN commit sweep can establish the baseline, and a scan by
+  // anyone else — a third connection's `dbsp_sync()`, another connection's
+  // commit reconcile — would mark it trusted while it is short. Measured:
+  // `view 10.0` against SQL `13.0`, permanently.
+  //
+  // False is the common case and costs nothing: the table was tracked first,
+  // so every later write of that transaction is accounted for and any scan may
+  // establish the baseline — which is what keeps a second connection reading
+  // correct answers during the window instead of being refused.
+  bool pre_trigger_rows() const { return pre_trigger_rows_; }
 
   // Watermark BEFORE state; mark_seed_deferred writes state before watermark.
   // Neither order is safe on its own against a concurrent reader, and neither
@@ -1017,6 +1050,8 @@ private:
   std::atomic<Baseline> baseline_{Baseline::Unseeded};
   // The transaction-manager timestamp this state waits on; 0 = nothing.
   std::atomic<uint64_t> ready_watermark_{0};
+  // See pre_trigger_rows(). Meaningful only while baseline_ is DEFERRED.
+  std::atomic<bool> pre_trigger_rows_{false};
   int64_t restore_weight_ = 0; // restore-time COUNT(*)
   std::string restore_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };

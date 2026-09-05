@@ -83,16 +83,18 @@ every transaction that begins afterwards is served by triggers. Cost: one
 scan-and-diff, once, per newly tracked table.
 
 **Read that flag narrowly.** It is consulted only on the TRIGGER-FED commit
-branch. A transaction that writes a table and then TRACKS it — the write is
-pre-trigger, so nothing is fed, and the table was untracked when the statement
-folded, so `capture_.touched` never names it — reaches the fallback branch and
-takes its "read-only commit" early return. What covers that transaction is not
-this flag but the baseline state: such a table is DEFERRED, it can never become
-SEEDED before that transaction ends (`retire_scanned_baseline` demotes to
-PROVISIONAL instead), and the commit hook's sweep therefore always finds it by
-name. Honouring `triggers_installed` on both branches would close it at the
-source as well; it has not been done, because it would move `scan_syncs`
-counters `test_auto_cdc` asserts exactly.
+branch, so it is not what covers a transaction that writes a table and then
+TRACKS it: that write is pre-trigger, and the table was untracked when the
+statement folded, so `capture_.touched` never names it either and the commit
+reaches the fallback branch's "read-only commit" early return.
+
+What covers it is the baseline state and the SHAPE OF THE HOOK. Such a table is
+DEFERRED and TAINTED, so no other connection's scan can establish it (see
+*Whose rows are missing* below); and the reconcile sweep runs from a
+DESTRUCTOR, so it fires on every path out of `TransactionCommit` including that
+early return. At the deferring transaction's own commit the watermark has
+cleared, the sweep names the table, and the scan runs. Pinned end to end by
+`third_party_scan` and `tainted_rollback`.
 
 `CREATE OR REPLACE` makes re-tracking free of "trigger already exists"
 failures. The install record is per database and holds a **weak reference** to
@@ -513,11 +515,37 @@ and the strict switch's structural blindness to commit hooks.
   healed, because the write predated the triggers and so fed nothing. Pinned by
   `watermark_never_lowers`.
 
-  **OPEN DEFECT — a THIRD connection's scan can establish a DEFERRED baseline
-  it could not see the whole of.** `retire_scanned_baseline` asks the readiness
-  watermark for PROVISIONAL and not for DEFERRED, and the caller test it asks
-  instead is about the CALLER's transaction — but the rows a deferred baseline
-  is missing belong to whichever connection deferred it. Measured:
+  **Whose rows are missing decides who may establish a DEFERRED baseline.**
+  The rows a deferred baseline lacks belong to the transaction that deferred
+  it, and they reach a view one of exactly two ways: its triggers report them
+  at its commit, or `capture_.touched` names the table and its commit scans it.
+  Both need the table to have been TRACKED before the write — a statement that
+  writes an untracked table folds without naming it, and the triggers do not
+  exist until the transaction ends. (Tracked, not triggered: a write to a
+  tracked table whose triggers are not installed yet is still named by
+  `touched`.)
+
+  So the deferral carries one bit, `TrackedTable::pre_trigger_rows`, taken at
+  the moment the table JOINS the tracked set by asking the engine whether the
+  caller's transaction is already holding uncommitted rows for it
+  (`LocalStorage::Find`, which reads the caller's own transaction state — not
+  committed storage, so the internal-connection law does not apply). Anything
+  the probe cannot answer reads as tainted; the bit only costs availability for
+  the length of one transaction, and a wrong answer is worse than a refusal.
+
+  | | who may establish the baseline | reads during the window |
+  |---|---|---|
+  | UNTAINTED — tracked before it was written | ANY scan: committed state plus the deltas that transaction's own commit contributes is exactly right | served |
+  | TAINTED — written before it was tracked | only a scan taken once that transaction is GONE (`ready_watermark_cleared`) | refused |
+
+  The untainted row is the common case and is what keeps a second connection
+  reading correct answers during a deferral window rather than being refused —
+  `cdc: an unseeded baseline is never served to another connection` pins 110.0,
+  not an error, and `untainted_third_party_scan` pins the same shape through a
+  third connection's `dbsp_sync()`.
+
+  The tainted row is the rare write-then-track-in-one-transaction shape, and
+  before the bit existed it was a permanent wrong answer with no error:
 
   ```
   A: BEGIN; INSERT INTO t VALUES (2, 3.0);          -- t untracked, no triggers
@@ -527,42 +555,13 @@ and the strict switch's structural blindness to commit hooks.
      dbsp_query('mv') -> 10.0     SELECT sum(v) FROM t -> 13.0    permanently
   ```
 
-  B's scan reads committed state, passes the caller test, and marks the
-  baseline SEEDED. A's own commit then finds nothing owed: A's write was
-  pre-trigger, and its table was untracked when the statement folded, so
-  `capture_.touched` never named it. Reproduced by `third_party_scan` in
-  `test/python/test_create_view_seeding.py`, which is kept OUT of the default
-  run (`DBSP_KNOWN_DEFECTS=1` runs it) precisely because it fails.
-
-  **The fix is known and blocked on a ruling.** Asking the readiness watermark
-  for DEFERRED too, and DEMOTING to PROVISIONAL when it has not cleared, closes
-  it — measured green on this tree, and it needs no new machinery, because
-  PROVISIONAL already means "a baseline exists, correct for committed storage,
-  possibly short by an open transaction, re-scanned when the watermark clears".
-  What blocks it is the read gate, two items below: it refuses a PROVISIONAL
-  source on EVERY connection, so the demotion turns four sections of `cdc: an
-  unseeded baseline is never served to another connection` from
-  SERVED-with-the-right-answer (110.0) into refusals — measured, 8 assertions
-  across 4 sections, plus the Python `cross/*` cases.
-
-  The two expectations cannot both hold as the gate stands:
-
-  * that case pins AVAILABILITY during the window — a second connection that
-    writes gets the right answer rather than an error, and the doc's own
-    reasoning agrees it is entitled to one ("that reader's snapshot cannot see
-    the deferring writes either, so the committed-state answer the baseline
-    already holds is exactly right for it");
-  * `third_party_scan` pins CORRECTNESS after the window — a baseline no scan
-    could vouch for must not be marked trusted, because being SEEDED is exactly
-    what lets the deferring transaction's own commit skip it.
-
-  Both are satisfiable together only by the read gate's own candidate
-  refinement (serve an ordinary autocommit reader, refuse the one inside the
-  deferring transaction), which that item says is not costed and needs the
-  reasoning got right first — and which needs more than the stored watermark,
-  since it must distinguish a snapshot taken BEFORE the deferring commit from
-  one taken after. Owner ruling needed; nothing here changes a pinned
-  expectation on its own.
+  B's scan reads committed state, holds no transaction of its own, and used to
+  mark the baseline SEEDED — after which A's own commit found nothing owed.
+  Now it installs the CONTENT and leaves the state DEFERRED, so A's commit
+  sweep finds the table by name and scans it to 13.0. Pinned by
+  `third_party_scan`; `tainted_rollback` pins the other exit, where the
+  unreportable rows are rolled back and the first read afterwards establishes
+  the baseline at committed state.
 
   **The seeding concurrency check is NOT asked on a reconcile, and cannot be.**
   `mark_provisional_if_concurrent` has exactly ONE call site, `seed_baseline`.

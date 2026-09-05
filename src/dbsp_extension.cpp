@@ -585,11 +585,13 @@ static void EnsureViewReadable(ClientContext &context,
         fn + "('" + view_name + "'): source table '" + block.table +
         "' has an UNSEEDED baseline — its seeding scan was DEFERRED because a "
         "transaction was open when the view was created, and no scan since has "
-        "been able to establish it. Reading now would return the unseeded "
-        "(empty) answer, not the table's content. dbsp_sync() cannot repair it "
-        "from inside that transaction either — a scan run there cannot see the "
-        "transaction's own rows, and says so. End the transaction (COMMIT or "
-        "ROLLBACK) and read again.");
+        "been able to establish it. That transaction may be on ANOTHER "
+        "connection, and it was already holding uncommitted rows for the table "
+        "when it was tracked: nothing else can report those rows, so no scan "
+        "taken while it is open — dbsp_sync() included — can establish the "
+        "baseline. Reading now would return the unseeded (empty) answer, not "
+        "the table's content. End that transaction (COMMIT or ROLLBACK) and "
+        "read again.");
   }
   if (block.state == Baseline::Unseeded) {
     throw InvalidInputException(

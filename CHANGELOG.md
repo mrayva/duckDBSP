@@ -1,5 +1,59 @@
 # Changelog
 
+## Quality round, fix 3 — whose rows are missing decides who may establish a baseline — 2026-09-04
+
+**The wrong answer from fix 2 is closed, and the availability pin stays green.**
+Owner ruling, implemented: a DEFERRED baseline is only dangerous when the
+deferring transaction was ALREADY holding uncommitted rows for the table at the
+moment it was tracked. Those rows reach a view no other way — the triggers do
+not exist yet, and `capture_.touched` cannot name a table that was untracked
+when the statement folded — so nothing but that transaction's own commit can
+establish the baseline. Rows written to an ALREADY-TRACKED table are accounted
+for either way, so any scan may establish it, and a second connection keeps
+reading correct answers during the window.
+
+`TrackedTable::pre_trigger_rows` is that bit, taken once, at the moment the
+table joins the tracked set, by asking the engine directly:
+`DuckTransaction::GetLocalStorage().Find(DataTable&)` — the caller's own
+transaction state, not committed storage, so the internal-connection law does
+not apply to it. Anything the probe cannot answer reads as TAINTED.
+
+`retire_scanned_baseline` then splits DEFERRED in two: untainted retires to
+SEEDED on any scan, exactly as before; tainted retires only on a scan taken
+once the deferring transaction is gone (`ready_watermark_cleared`), and until
+then the scan installs CONTENT and leaves the state DEFERRED. Reads are refused
+for that window, which is the accepted price for the rare
+write-then-track-in-one-transaction shape.
+
+The discriminator is "was the table TRACKED when the rows were written", not
+"were the triggers installed". A write to a tracked table whose triggers are not
+in yet is still named by `touched`. Measured while getting this wrong: probing
+local storage on every deferral (rather than only on the one that adds the
+table) taints `cross/a_writes_too`, whose write IS trigger-fed, and refuses a
+read the design pins as served.
+
+**The `triggers_installed` residual is closed, and it needed no new mechanism.**
+It is consulted only on the trigger-fed commit branch, so a write-then-track
+transaction reaches the fallback branch's read-only early return — but the
+reconcile sweep runs from a DESTRUCTOR and fires on every path out of the hook,
+including that one. With the taint keeping such a table out of SEEDED until its
+transaction ends, the sweep always finds it by name at that transaction's own
+commit. `test_auto_cdc`'s exact `scan_syncs` counters did not move, so no test
+expectation changed; the design doc describes the mechanism where it used to
+record a gap.
+
+**Three new pins**, all in `test/python/test_create_view_seeding.py`:
+`third_party_scan` (tainted: a third connection's `dbsp_sync()` must not
+establish; RED before this round at `view [(10.0,)]` against SQL `[(13.0,)]`),
+`untainted_third_party_scan` (untainted: it MUST establish, and B is served
+during the window), and `tainted_rollback` (the deferring transaction rolls
+back, the unreportable rows go with it, and the first read afterwards
+establishes at committed state). `docs/TESTING.md`'s known-red line is back to
+"none" — the quarantine fix 2 added is gone.
+
+The read gate's DEFERRED message now says the transaction may be on ANOTHER
+connection and why `dbsp_sync()` cannot help there.
+
 ## Quality round, fix 2 — a third connection's scan could establish a baseline it could not see — 2026-09-04
 
 **Wrong answer, permanent, no error.** The in-window rule asked whether the

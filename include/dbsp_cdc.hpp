@@ -26,6 +26,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -2875,7 +2876,7 @@ public:
           // discard the pending changes, because the replay below IS the
           // initialization and the delta must not be applied twice.
           if (!tracked_tables_.at(source)->established() &&
-              !seed_baseline(context, source)) {
+              !seed_baseline(context, source, /*new_tracking=*/false)) {
             // A seeding scan that FAILED must not fall through to the replay:
             // that would build the view over the empty baseline, which is the
             // exact defect this branch exists to prevent.
@@ -6041,8 +6042,16 @@ private:
     }
   }
 
+  // `new_tracking`: this call is the one that ADDS the table to the tracked
+  // set (track_table_internal), rather than a later retry over a table that
+  // was already tracked (create_view). It is what decides whether uncommitted
+  // rows in the caller's transaction are a problem — see
+  // TrackedTable::pre_trigger_rows(). Rows written to an ALREADY-TRACKED table
+  // are accounted for whether or not its triggers exist yet: the triggers feed
+  // them, or `capture_.touched` names the table at that transaction's commit,
+  // because the statement that wrote it folded with the table tracked.
   bool seed_baseline(duckdb::ClientContext &context,
-                     const std::string &table_name) {
+                     const std::string &table_name, bool new_tracking) {
     if (std::getenv("DBSP_DEBUG_SEED")) {
       std::cerr << "[dbsp] seed_baseline " << table_name
                 << " user_txn_open=" << user_transaction_open(context) << "\n";
@@ -6057,7 +6066,9 @@ private:
       auto it = tracked_tables_.find(table_name);
       if (it != tracked_tables_.end()) {
         it->second->mark_seed_deferred(
-            deferring_watermark(context, table_name));
+            deferring_watermark(context, table_name),
+            new_tracking &&
+                transaction_holds_local_rows(context, table_name));
       }
       return true;
     }
@@ -6073,6 +6084,40 @@ private:
       mark_provisional_if_concurrent(context, table_name, *it->second);
     }
     return true;
+  }
+
+  // Is the CALLER's transaction holding uncommitted rows for this table RIGHT
+  // NOW? Asked once, at the moment the table JOINS the tracked set, because
+  // that is when "were there rows here before anything could account for them?"
+  // has an answer.
+  //
+  // `LocalStorage::Find` is the engine's own question — a transaction's
+  // uncommitted appends, updates and deletes for a table live in a
+  // LocalTableStorage, and Find reports whether one exists. It reads the
+  // caller's OWN transaction state, not committed storage, so it is not an
+  // internal-connection read and the law does not apply to it.
+  //
+  // TRUE on anything it cannot answer (a table it cannot resolve, a catalog
+  // with no DuckDB transaction manager, any throw): the bit only ever costs
+  // availability for the length of one transaction, and a wrong answer is
+  // worse than a refusal.
+  bool transaction_holds_local_rows(duckdb::ClientContext &context,
+                                    const std::string &table_name) {
+    try {
+      auto entry = resolve_table_entry(context, table_name);
+      if (!entry) {
+        return true;
+      }
+      auto &attached = entry->ParentCatalog().GetAttached();
+      auto &tm = duckdb::TransactionManager::Get(attached);
+      if (!tm.IsDuckTransactionManager()) {
+        return true;
+      }
+      auto &txn = duckdb::DuckTransaction::Get(context, attached);
+      return txn.GetLocalStorage().Find(entry->GetStorage());
+    } catch (...) {
+      return true;
+    }
   }
 
   // A timestamp the deferring transaction's END passes: its own start + 1, so
@@ -6196,29 +6241,30 @@ private:
   //
   // A NO to (2) leaves the state exactly where it was.
   //
-  // A NO to (3) is an OPEN DEFECT, and this is where it lives. Question (3) is
-  // asked for PROVISIONAL and NOT for DEFERRED, which means a scan taken by a
-  // connection holding no transaction of its own establishes a DEFERRED
-  // baseline it could not see the whole of. Measured: connection A opens a
-  // transaction, writes an UNTRACKED table and creates a view over it
-  // (DEFERRED); connection B, holding no transaction, runs `dbsp_sync()`; B's
-  // scan cannot see A's rows either, but the caller test passes for B, so the
-  // baseline is marked SEEDED at 10.0. A's own commit then finds nothing owed —
-  // A's write was pre-trigger, and its table was untracked when the statement
-  // folded, so `capture_.touched` never named it — and the view reads `10.0`
-  // against SQL `13.0`, permanently. Reproduced by `third_party_scan` in
-  // test/python/test_create_view_seeding.py (run with DBSP_KNOWN_DEFECTS=1).
+  // A NO to (3) depends on WHOSE rows are missing, and that is the whole of
+  // the rule for DEFERRED:
   //
-  // Asking (3) for DEFERRED as well DOES close it, and was measured to work —
-  // the scan then installs content and demotes the baseline to PROVISIONAL,
-  // which is exactly what that state means. It is not landed because the read
-  // gate refuses a PROVISIONAL source on EVERY connection (see the read-gate
-  // OPEN item in docs/DESIGN_TRIGGER_SOURCE.md, "the gate does not distinguish
-  // the two, so it refuses both"), so the demotion turns four sections of
-  // `cdc: an unseeded baseline is never served to another connection` from
-  // SERVED-with-the-right-answer into refusals. That case pins availability
-  // during the window; this comment pins the conflict. Owner ruling needed —
-  // see docs/DESIGN_TRIGGER_SOURCE.md.
+  //   * UNTAINTED (TrackedTable::pre_trigger_rows() false) — the deferring
+  //     transaction tracked the table BEFORE it wrote to it, so every write it
+  //     makes is accounted for: by its triggers, or by `capture_.touched`
+  //     naming the table at its own commit. A scan at committed state plus
+  //     those deltas is exactly right, so ANY scan may establish the baseline.
+  //     That is what keeps a second connection reading correct answers during
+  //     the window — `cdc: an unseeded baseline is never served to another
+  //     connection` pins 110.0, not an error.
+  //   * TAINTED — the deferring transaction was already holding uncommitted
+  //     rows when the table was tracked. Nothing will ever report those rows,
+  //     so only a scan taken once that transaction is GONE can establish the
+  //     baseline. Measured without this distinction: A opens a transaction,
+  //     writes an UNTRACKED table, creates a view over it; B, holding no
+  //     transaction, runs `dbsp_sync()`; B's scan marks the baseline SEEDED at
+  //     10.0; A's commit then finds nothing owed and the view reads `10.0`
+  //     against SQL `13.0`, permanently. Pinned by `third_party_scan`.
+  //
+  // A tainted table therefore stays DEFERRED — reads refused, which is the
+  // acceptable price for the rare write-then-track-in-one-transaction shape —
+  // until the deferring transaction ends and the watermark clears. Its own
+  // commit sweep is normally the scan that does it.
   //
   // The seeding-path concurrency check (mark_provisional_if_concurrent) is NOT
   // asked here, and cannot be: it needs a reference start timestamp, and a
@@ -6245,7 +6291,10 @@ private:
       }
       return;
     }
-    // The open defect above: no question (3) for DEFERRED.
+    if (table.pre_trigger_rows() &&
+        !ready_watermark_cleared(context, table_name, table)) {
+      return; // rows nobody will report, and their transaction is still alive
+    }
     table.mark_seeded();
   }
 
@@ -6337,7 +6386,7 @@ private:
       }
     }
 
-    if (!seed_baseline(context, table_name)) {
+    if (!seed_baseline(context, table_name, /*new_tracking=*/true)) {
       last_error_ = "Failed to seed the baseline of '" + table_name + "'";
       tracked_tables_.erase(table_name);
       table_schemas_.erase(table_name);
