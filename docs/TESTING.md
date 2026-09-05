@@ -295,6 +295,15 @@ by the deferred rows cannot hide as a constant offset.
 scripts exit 0. (`test_mv_tables.py` was the standing red until
 `dbsp_mv_tables(false)` was made sticky — see the CHANGELOG.)
 
+One case is deliberately held OUT of a default run because it FAILS:
+`third_party_scan` in `test_create_view_seeding.py`, the reproduction for the
+open defect where a third connection's scan establishes a DEFERRED baseline it
+could not see the whole of. Run it with `DBSP_KNOWN_DEFECTS=1`; the fix, and why
+it is blocked on a ruling about the read gate, are in that case's docstring and
+in `docs/DESIGN_TRIGGER_SOURCE.md`. A reproduction that ships and is named beats
+one that lives in a report nobody reads, and a suite that is green by default
+stays a usable signal.
+
 The exit-139 scripts were never an engine problem to live with: they left a
 DBSP connection open at interpreter exit, or exited while a detached teardown
 thread was still running. `close()` fixed two outright; two more needed

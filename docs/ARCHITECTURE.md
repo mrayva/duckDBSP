@@ -620,7 +620,7 @@ State after:
   (`NativeMaterializedView::is_pending_restore()`). `dbsp_load()` returns
   without paying any per-view decode cost; each view's
   `realize_pending_view`/`realize_pending_view_locked` decodes on first
-  need — mirrors D3c's `TrackedTable::is_deferred()` +
+  need — mirrors D3c's `TrackedTable::restore_pending()` +
   `materialize_deferred_locked` shape (and its locking discipline:
   `pending_restore_` is guarded by the same `view_mutex_` tier that
   already owns view content, no new lock level). Realization is wired

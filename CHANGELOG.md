@@ -1,5 +1,73 @@
 # Changelog
 
+## Quality round, fix 2 — a third connection's scan could establish a baseline it could not see — 2026-09-04
+
+**Wrong answer, permanent, no error.** The in-window rule asked whether the
+CALLER holds a transaction open — but the rows a DEFERRED baseline is missing
+belong to whichever connection deferred it, not to the caller. So:
+
+```
+A: BEGIN; INSERT INTO t VALUES (2, 3.0);      -- t untracked, no triggers yet
+A: dbsp_create_view('mv', 'SELECT sum(v) FROM t')   -- t tracked, DEFERRED
+B: SELECT * FROM dbsp_sync()                  -- B holds no transaction
+A: COMMIT
+   dbsp_query('mv') -> 10.0      SELECT sum(v) FROM t -> 13.0     forever
+```
+
+B's scan reads committed state (10.0), passes the caller test, and marked the
+baseline SEEDED. A's own commit then found nothing owed: A's write was
+pre-trigger, and its table was untracked when the statement folded, so
+`capture_.touched` never named it. Measured RED before the fix, pinned as
+`third_party_scan` in `test/python/test_create_view_seeding.py`.
+
+**NOT FIXED — the fix is blocked on a ruling, and the defect is now written
+down.** Asking the readiness watermark for DEFERRED as well, and DEMOTING to
+PROVISIONAL when it has not cleared, closes it: measured green on this tree, and
+it needs no new machinery, because PROVISIONAL already means "a baseline exists,
+correct for committed storage, possibly short by an open transaction, re-scanned
+when the watermark clears". It is not landed because the read gate refuses a
+PROVISIONAL source on EVERY connection — `docs/DESIGN_TRIGGER_SOURCE.md` says so
+in as many words ("the gate does not distinguish the two, so it refuses both") —
+so the demotion turns four sections of `cdc: an unseeded baseline is never
+served to another connection` from SERVED-with-the-right-answer (110.0) into
+refusals, 8 assertions, plus the Python `cross/*` cases. That case pins
+availability during the window; `third_party_scan` pins correctness after it;
+the two cannot both hold until the gate can tell an ordinary autocommit reader
+from one inside the deferring transaction. No pinned expectation was changed.
+The reproduction ships, out of the default run (`DBSP_KNOWN_DEFECTS=1`), and the
+defect is recorded at `retire_scanned_baseline` and in the design doc.
+
+The previous round's `triggers_installed` residual is the SAME hole seen from
+the other side: what would make that flag's narrowness harmless is the
+invariant "a table written-and-then-tracked in one transaction is never SEEDED
+before that transaction ends", and that invariant is exactly what the demotion
+would establish. Written down in the design doc rather than left in a gitignored
+report.
+
+**Ordering, declared.** PROVISIONAL retirement moved from `sync_tables` (after
+`propagate_changes_multi`) into the scan, with the per-table lock released
+before propagation — so a reader can observe SEEDED slightly before the repair
+delta reaches the views. Same window DEFERRED already had.
+
+**Corrections to the fix-1 entry.** It described
+`mark_provisional_if_concurrent` being called from `retire_scanned_baseline`
+with an on-the-spot reference. That implementation was measured, rejected and
+never shipped: the probe counts the caller's OWN statement transaction as an
+older concurrent one (`lowest_active_start=36 mine=53`), which marked every
+reconciled table PROVISIONAL and refused reads of the view it had just repaired.
+The call has one site, `seed_baseline`. `CHANGELOG.md` and
+`docs/DESIGN_TRIGGER_SOURCE.md` now say what the code does. The commit hook's
+`sync_all` count was also still wrong in one comment
+(`dbsp_context_state.hpp`): there are three sites in the hook, plus the
+user-invoked one behind `dbsp_sync()`.
+
+**Minors.** `dbsp_sync()`'s owed-note no longer blames an open transaction
+unconditionally — a scan that did not RUN leaves the same debt, and the note
+names both causes and points at `reconcile_failures`. `mark_seeded`'s comment no
+longer names a parameter `finish_rebuild` does not have. Two
+residency-`deferred` leftovers renamed (`dbsp_cdc.hpp`'s `PendingViewCkpt`
+comment, `docs/ARCHITECTURE.md`).
+
 ## Quality round, fix 1 — an in-window dbsp_sync() cannot pay the debt, and now says so — 2026-09-04
 
 **Third defect of the seeding family closed, and declared this time.** Old
@@ -42,12 +110,16 @@ and the Provisional-side one (a loop in `sync_tables`). It runs after every
 successful scan, through the single funnel `sync_table_scan_and_consume`, and
 asks three questions in order: is anything owed; could THIS scan see everything
 (no user transaction open); has the transaction the state waits on ended. A NO
-to any leaves the state exactly where it was, so a failed or ineligible scan
-cannot drop a debt without paying it. When it establishes, it then runs
-`mark_provisional_if_concurrent` — the same concurrency question `seed_baseline`
-asks — with the reference timestamp taken on the spot, because a commit hook has
-no caller transaction to be relative to. No reproduction was constructed for
-that last gap; it is a symmetry the code now has rather than a measured defect.
+to any of the first two leaves the state exactly where it was, so a failed or
+ineligible scan cannot drop a debt without paying it; a NO to the third makes
+the baseline PROVISIONAL rather than SEEDED — see the fix-2 entry above, which
+is where that landed and why. `mark_provisional_if_concurrent` is NOT called
+from here and has one site, `seed_baseline`: it needs a reference start
+timestamp and a reconcile has no caller transaction to use, so a probed one
+counts the caller's own statement transaction — measured,
+`lowest_active_start=36 mine=53(probe)` on a bare `dbsp_sync()`, which marked
+the table PROVISIONAL and refused every read of the view it had just
+repaired.
 
 **`establishes` is mandatory.** `install_rebuild(bool)` no longer defaults to
 the unsafe value, and every call site states its reason: `true` only at the
