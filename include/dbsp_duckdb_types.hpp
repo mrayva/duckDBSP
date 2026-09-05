@@ -743,9 +743,9 @@ public:
   // timestamp the deferring transaction's end passes (its own start + 1), so
   // ready_watermark_cleared() is the question "has that transaction ended?" —
   // the same comparison PROVISIONAL uses, against the same counter.
-  // `pre_trigger_rows`: the deferring transaction was ALREADY holding
-  // uncommitted rows for this table when it was tracked — see
-  // pre_trigger_rows() for what that costs. Sticky across repeated deferrals:
+  // `pre_trigger_rows`: the deferring transaction ALREADY held uncommitted
+  // changes when it tracked this table — see pre_trigger_rows() for what that
+  // costs. Sticky across repeated deferrals:
   // one tainted deferral taints the debt, and only establishing it clears the
   // bit.
   void mark_seed_deferred(uint64_t watermark, bool pre_trigger_rows) {
@@ -806,12 +806,20 @@ public:
   // is TRACKED that matters, not TRIGGERED: a write to a tracked table whose
   // triggers are not installed yet is still named by `touched`.
   //
-  // So a transaction that already held uncommitted rows for this table when it
-  // tracked it holds rows no one will ever report. Nothing but that
-  // transaction's OWN commit sweep can establish the baseline, and a scan by
-  // anyone else — a third connection's `dbsp_sync()`, another connection's
-  // commit reconcile — would mark it trusted while it is short. Measured:
-  // `view 10.0` against SQL `13.0`, permanently.
+  // So a transaction that had already changed this table when it tracked it —
+  // appended, deleted or updated rows — holds changes no one will ever report.
+  // Nothing but that transaction's OWN commit sweep can establish the
+  // baseline, and a scan by anyone else — a third connection's `dbsp_sync()`,
+  // another connection's commit reconcile — would mark it trusted while it is
+  // wrong. Measured: `view 10.0` against SQL `13.0` for an INSERT, `13.0`
+  // against `10.0` for a DELETE and for an UPDATE, permanently.
+  //
+  // The bit is `DuckTransaction::ChangesMade()` at tracking time, which is
+  // transaction-WIDE: the engine offers no public per-table answer
+  // (CDCManager::probe_deferring_transaction says what it does offer and why
+  // that is not enough), so a transaction that changed ANYTHING before tracking
+  // reads as tainted. The name is historical — the first probe saw only
+  // appended rows, which is the wrong answer this replaces.
   //
   // False is the common case and costs nothing: the table was tracked first,
   // so every later write of that transaction is accounted for and any scan may

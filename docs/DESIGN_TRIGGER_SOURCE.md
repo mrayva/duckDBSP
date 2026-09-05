@@ -410,12 +410,14 @@ commit-guard counter case (the guard is gone), and the forced-scan differential
 ## Concurrency notes, and what is still open
 
 Most of what follows is CLOSED — a design note kept because the reasoning is
-load-bearing, with the commit that closed it. **Five** items are genuinely
+load-bearing, with the commit that closed it. **Six** items are genuinely
 open and say so: *an open transaction that loses its triggers* (a residual that
 has not been reproduced); *`dbsp_untrack` does not exist* (an unexercised
 branch); the two `QueryBegin` internal scans, whose `AllowedInTxn` whitelist is
 a judgement rather than a proof; the provisional read gate's availability cost;
-and the strict switch's structural blindness to commit hooks.
+the strict switch's structural blindness to commit hooks; and *a concurrent
+writer that never deferred anything* (a wrong answer, measured, whose fix is an
+owner decision).
 
 - **An open transaction that loses its triggers.** `DROP t; CREATE t (same
   columns)` inside a transaction takes the bodies with the old table and leaves
@@ -527,16 +529,50 @@ and the strict switch's structural blindness to commit hooks.
 
   So the deferral carries one bit, `TrackedTable::pre_trigger_rows`, taken at
   the moment the table JOINS the tracked set by asking the engine whether the
-  caller's transaction is already holding uncommitted rows for it
-  (`LocalStorage::Find`, which reads the caller's own transaction state — not
-  committed storage, so the internal-connection law does not apply). Anything
-  the probe cannot answer reads as tainted; the bit only costs availability for
-  the length of one transaction, and a wrong answer is worse than a refusal.
+  caller's transaction already holds ANY uncommitted change:
+  `DuckTransaction::ChangesMade()` — `undo_buffer.ChangesMade() ||
+  storage->ChangesMade()`, i.e. deletes and updates of committed rows, catalog
+  changes and sequence use (the undo buffer) or appends (local storage). It
+  reads the caller's own transaction state, not committed storage, so the
+  internal-connection law does not apply. The probe and the readiness
+  watermark come from ONE lookup of the same `DuckTransaction`
+  (`CDCManager::probe_deferring_transaction`), so they cannot describe
+  different transactions; if that lookup cannot be made at all (the table's
+  catalog is gone, or has no DuckDB transaction manager) the deferral is
+  REFUSED with an error rather than recorded — there is no watermark to retire
+  it by, and a debt that can never be retired would hold the table DEFERRED
+  for the life of the process.
+
+  **The rule is transaction-wide, not per-table, and that is deliberate.** The
+  engine records which table each uncommitted change belongs to
+  (`DeleteInfo`/`UpdateInfo`/`AppendInfo` carry a `DuckTableEntry*`) but only
+  inside the undo buffer, whose iteration and storage are private
+  (`UndoBuffer::IterateEntries`, `DuckTransaction::undo_buffer`); the per-table
+  locks a write takes (`DuckTransaction::active_locks`) have no accessor. The
+  first version used the one per-table signal that IS public,
+  `LocalStorage::Find(table)`, and it was wrong: `Find` reports a
+  transaction-local APPEND buffer and nothing else, so a DELETE or UPDATE of
+  committed rows — which goes to the undo buffer and creates no local storage —
+  read UNTAINTED, a third connection's `dbsp_sync()` established the baseline
+  at the pre-change value, and the deferring commit found nothing owed:
+  `view 13.0` against SQL `10.0`, permanently, for both shapes. Pinned by
+  `tainted_delete_third_party_scan` and `tainted_update_third_party_scan`.
+  What the coarser rule costs: a transaction that has written ANYTHING — another
+  table, a `CREATE TABLE`, a sequence — and then tracks a table is tainted, so
+  reads of views over that table are refused until it ends. That is
+  availability for one transaction's length on a rare shape; a wrong answer is
+  worse than a refusal, and the rule is never approximated from statement
+  text.
 
   | | who may establish the baseline | reads during the window |
   |---|---|---|
-  | UNTAINTED — tracked before it was written | ANY scan: committed state plus the deltas that transaction's own commit contributes is exactly right | served |
-  | TAINTED — written before it was tracked | only a scan taken once that transaction is GONE (`ready_watermark_cleared`) | refused |
+  | UNTAINTED — the transaction had changed nothing when it tracked the table | ANY scan: committed state plus the deltas that transaction's own commit contributes is exactly right | served |
+  | TAINTED — the transaction already held uncommitted changes when it tracked the table | only a scan taken once that transaction is GONE (`ready_watermark_cleared`) | refused |
+
+  A tainted window has a second cost besides the refused reads: every writing
+  commit on every connection finds the table not SEEDED, has its exact delta
+  refused on the apply path, and pays a scan-and-diff of the table instead —
+  once per such commit, until the deferring transaction ends.
 
   The untainted row is the common case and is what keeps a second connection
   reading correct answers during a deferral window rather than being refused —
@@ -571,9 +607,11 @@ and the strict switch's structural blindness to commit hooks.
   statement transaction as an older concurrent one — measured,
   `lowest_active_start=36 mine=53(probe)` for a bare `dbsp_sync()`, which then
   marked the table PROVISIONAL and refused every read of the view it had just
-  repaired. The stored readiness watermark answers the same question without
-  needing a reference of its own, which is why the demotion above is the whole
-  of the reconcile's concurrency story.
+  repaired. The stored readiness watermark needs no reference of its own, and
+  it plus the taint bit is the whole of the reconcile's concurrency story for
+  the transactions that DEFERRED a seed on the table. It answers only for
+  those — *a concurrent writer that never deferred anything*, below, is the
+  shape it cannot see.
 
   **Ordering note.** PROVISIONAL retirement used to run in `sync_tables`,
   after `propagate_changes_multi`; it now runs inside the scan, with the
@@ -646,6 +684,60 @@ and the strict switch's structural blindness to commit hooks.
   manager exposes — `DuckTransaction::start_time` on the reader versus the
   table's watermark — but the reasoning has to be got right before the gate is
   loosened, and a wrong answer is worse than an error.
+
+- **OPEN — a concurrent writer that never deferred anything.** The readiness
+  watermark a DEFERRED table carries is the deferring transaction's own start
+  + 1, and it is consulted only when the deferral is tainted. It therefore
+  covers exactly one transaction — the one that deferred a seed on that table
+  (for PROVISIONAL, every transaction alive at ITS seed time). A transaction on
+  another connection that wrote the table while it was untracked, and deferred
+  nothing, is invisible to it. Two shapes, both measured on the round-4 tree,
+  both permanent wrong answers with no error:
+
+  ```
+  -- tainted deferral, younger writer
+  A: BEGIN; INSERT INTO t VALUES (2, 3.0);           -- t untracked
+  D: BEGIN; INSERT INTO t VALUES (3, 4.0);           -- D begins AFTER A; t still untracked
+  A: dbsp_create_view('mv', 'SELECT sum(v) FROM t')  -- t tracked, DEFERRED, tainted, watermark = A.start + 1
+  A: COMMIT                                          -- LowestActiveStart() = D.start > watermark: "cleared";
+                                                     -- A's own sweep scans committed state: 13.0, without D
+  D: COMMIT                                          -- no trigger fired for D's INSERT (none existed when it ran);
+                                                     -- `touched` never named t (untracked when the statement folded)
+     dbsp_query('mv') -> 13.0    SELECT sum(v) FROM t -> 17.0    then 14.0 / 18.0 after the next edit
+
+  -- untainted deferral, any concurrent writer
+  A: BEGIN; SELECT count(*) FROM t;                  -- A has written nothing
+  D: BEGIN; INSERT INTO t VALUES (3, 4.0);           -- t untracked
+  A: dbsp_create_view('mv', 'SELECT sum(v) FROM t')  -- t tracked, DEFERRED, UNTAINTED
+  B: SELECT * FROM dbsp_sync()                       -- untainted: any scan may establish -> SEEDED at 10.0
+  A: COMMIT; D: COMMIT                               -- D's row is reported by nothing
+     dbsp_query('mv') -> 10.0    SELECT sum(v) FROM t -> 14.0    then 11.0 / 15.0
+  ```
+
+  Why the watermark cannot see it: in the first shape D's start is above A's
+  watermark, so D's openness never holds the scan back; in the second the
+  watermark is not consulted at all, because the untainted rule lets any scan
+  establish. What this path lacks is the seeding path's concurrency check: a
+  NON-deferred seed runs `mark_provisional_if_concurrent` and waits on every
+  older open transaction, while a deferred seed's establishing scan runs later,
+  from a hook with no caller transaction to be relative to, and asks nothing
+  about other writers. Pre-existing — every scan that has ever retired
+  DEFERRED had this blind spot; the taint rule (fix 3) closed the
+  third-party-scan wrong answer, not this one. Measured 2026-09-04; not pinned.
+
+  Fix direction, and its cost: take the DEFERRED watermark at tracking time as
+  a start timestamp newer than every transaction alive at that moment
+  (`probe_new_start_timestamp`, exactly as PROVISIONAL does) instead of the
+  deferring transaction's own start, and consult it for untainted deferrals
+  too. That holds the establishing scan until every transaction that could
+  have written the table untracked is gone, which closes both shapes. It also
+  refuses the untainted third-party establish for as long as ANY transaction
+  that was open at tracking time is still open — the deferring transaction
+  included, so the shape `cdc: an unseeded baseline is never served to another
+  connection` pins at 110.0 becomes a refusal for the length of A's
+  transaction, and so does `untainted_third_party_scan`. That is the trade this
+  design has refused so far (a rare wrong answer against a common outage); it
+  is an owner decision, not a fix-round edit.
 
 - **The strict switch cannot see a commit hook.** `DBSP_STRICT_INTERNAL_QUERY=1`
   fires on `user_transaction_open(context)`, and DuckDB clears the transaction

@@ -1,5 +1,64 @@
 # Changelog
 
+## Quality round, fix 4 — the taint sees every uncommitted change, not only appends — 2026-09-04
+
+**Fix 3's taint probe was wrong for DELETE and UPDATE.** It asked
+`LocalStorage::Find(table)`, which reports whether the transaction holds a
+transaction-local APPEND buffer for the table, and nothing else. A DELETE or an
+UPDATE of committed rows goes to the transaction's undo buffer and creates no
+local storage, so a transaction that deleted or updated rows of an untracked
+table and then tracked it read UNTAINTED — the case fix 3 was built to refuse
+fell open instead of into the fail-safe. Measured: A `BEGIN; DELETE FROM t WHERE
+id = 2` (or `UPDATE t SET v = 0.0 WHERE id = 2`), `dbsp_create_view` over `t`;
+B `dbsp_sync()`; A `COMMIT` → `dbsp_query` `13.0` against SQL `10.0`,
+permanently, both shapes.
+
+**The probe is now `DuckTransaction::ChangesMade()`** — any uncommitted change
+the transaction holds: appends, deletes, updates, catalog changes and sequence
+use alike. It is transaction-WIDE, and that is the conservative rule chosen on
+purpose. The engine keeps per-table records of uncommitted changes
+(`DeleteInfo`/`UpdateInfo`/`AppendInfo` carry the table) only inside the undo
+buffer, whose iteration and storage are private, and the per-table locks a
+write takes have no accessor, so nothing public answers "did THIS transaction
+change THIS table". The cost is availability only for the "write anything,
+then track a table, in one transaction" shape; a wrong answer is worse than a
+refusal. Never approximated from statement text.
+
+**One probe, not two.** The taint and the readiness watermark are now taken by
+one function from one `DuckTransaction` (`probe_deferring_transaction`), so
+they cannot disagree about which transaction they describe. Fix 3's two helpers
+did disagree in their fail-safes: the taint read TAINTED where the watermark
+read 0 = "cleared", so the taint was retired by the first scan and protected
+nothing. When the lookup cannot be made at all (the table's catalog is gone, or
+it has no DuckDB transaction manager — `require_trigger_capable_catalog` does
+not exclude the latter) the deferral is REFUSED with an error naming the
+remedy, rather than recorded with no watermark to ever retire it by;
+`track_table_internal` drops the half-tracked table and rethrows.
+
+**Two new pins** in `test/python/test_create_view_seeding.py`:
+`tainted_delete_third_party_scan` and `tainted_update_third_party_scan`, RED at
+the previous HEAD at `view [(13.0,)]` against SQL `[(10.0,)]` (B was served
+`13.0` in the window). `third_party_scan`, `untainted_third_party_scan`,
+`tainted_rollback` and the 110.0 availability pin are unchanged and green.
+
+**The read gate's DEFERRED message** branches on the taint: an untainted
+deferral says another connection's scan, or the deferring transaction's own
+COMMIT/ROLLBACK, can establish it; a tainted one keeps the "nothing else can
+report those changes" text. `ViewReadBlock` carries the blocking table's taint.
+
+**Documented, not fixed — a concurrent writer that never deferred anything.**
+The DEFERRED watermark covers only the transaction that deferred the seed, so a
+transaction on another connection that wrote the table while it was untracked
+is not waited for; the untainted rule consults no watermark at all. Both shapes
+measured (`13.0`/`17.0` and `10.0`/`14.0`, permanent) and written into
+`docs/DESIGN_TRIGGER_SOURCE.md` as OPEN, with the fix direction and its
+availability cost (an owner decision). The comment at `retire_scanned_baseline`
+that said the stored watermark "answers the same question" is corrected.
+
+Housekeeping: the stale "demotion above" sentence in the design doc, the fix-1
+entry's never-shipped "PROVISIONAL rather than SEEDED" line, and the
+`local_storage.hpp` include (out of order, and no longer needed — removed).
+
 ## Quality round, fix 3 — whose rows are missing decides who may establish a baseline — 2026-09-04
 
 **The wrong answer from fix 2 is closed, and the availability pin stays green.**
@@ -16,7 +75,9 @@ reading correct answers during the window.
 table joins the tracked set, by asking the engine directly:
 `DuckTransaction::GetLocalStorage().Find(DataTable&)` — the caller's own
 transaction state, not committed storage, so the internal-connection law does
-not apply to it. Anything the probe cannot answer reads as TAINTED.
+not apply to it. Anything the probe cannot answer reads as TAINTED. *(Superseded
+by fix 4: `Find` reports appends only, so a pre-tracking DELETE or UPDATE read
+untainted; the probe is now `DuckTransaction::ChangesMade()`.)*
 
 `retire_scanned_baseline` then splits DEFERRED in two: untainted retires to
 SEEDED on any scan, exactly as before; tainted retires only on a scan taken
@@ -165,9 +226,11 @@ successful scan, through the single funnel `sync_table_scan_and_consume`, and
 asks three questions in order: is anything owed; could THIS scan see everything
 (no user transaction open); has the transaction the state waits on ended. A NO
 to any of the first two leaves the state exactly where it was, so a failed or
-ineligible scan cannot drop a debt without paying it; a NO to the third makes
-the baseline PROVISIONAL rather than SEEDED — see the fix-2 entry above, which
-is where that landed and why. `mark_provisional_if_concurrent` is NOT called
+ineligible scan cannot drop a debt without paying it; a NO to the third leaves
+the state where it was (for DEFERRED the third question is asked only when the
+deferral is tainted — fix 3). An earlier version of this entry said a NO here
+demoted the baseline to PROVISIONAL: that was measured, rejected and never
+shipped — the fix-2 entry says why. `mark_provisional_if_concurrent` is NOT called
 from here and has one site, `seed_baseline`: it needs a reference start
 timestamp and a reconcile has no caller transaction to use, so a probed one
 counts the caller's own statement transaction — measured,

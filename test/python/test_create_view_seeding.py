@@ -401,6 +401,61 @@ def tainted_rollback_case(label, path):
         a.close()
 
 
+def tainted_change_third_party_scan_case(label, path, change_sql):
+    """`third_party_scan` with a DELETE or an UPDATE where it had an INSERT.
+
+    The taint has to be true for ANY uncommitted change the deferring
+    transaction holds on the table when it is tracked — not only appends. The
+    first probe asked `LocalStorage::Find`, which reports a transaction-local
+    APPEND buffer and nothing else: a DELETE or UPDATE of committed rows goes
+    to the transaction's undo buffer and creates no local storage, so the
+    deferral read UNTAINTED, B's `dbsp_sync()` established the baseline at the
+    pre-change value, and A's commit found nothing owed. Measured before the
+    fix (both shapes): view [(13.0,)] against SQL [(10.0,)], permanently.
+
+    The probe is now `DuckTransaction::ChangesMade()` — every uncommitted
+    write of the transaction, appends, deletes and updates alike.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0), (2, 3.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute(change_sql)                        # untracked, pre-trigger
+        a.execute(
+            "SELECT * FROM dbsp_create_view('mv','SELECT sum(v) AS s FROM t')"
+        ).fetchall()
+
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()   # must not establish
+        try:
+            rows = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            raise AssertionError(
+                f"{label}: B was served {rows} from a tainted deferral")
+        except duckdb.InvalidInputException as e:
+            assert "baseline" in str(e), f"{label}: unexpected error {e}"
+
+        a.execute("COMMIT")
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, (
+            f"{label}: view {v} != SQL {sq} — a third connection's scan "
+            f"established a baseline short by an uncommitted "
+            f"{change_sql.split()[0]}"
+        )
+        a.execute("INSERT INTO t VALUES (3, 4.0)")   # and no constant offset
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — a pre-tracking {change_sql.split()[0]} taints "
+              f"the deferral too ({v})", flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
 def in_window_sync_case(label, path):
     """`dbsp_sync()` INSIDE the deferring transaction cannot pay the debt.
 
@@ -483,6 +538,14 @@ with tempfile.TemporaryDirectory() as tmp:
                                     os.path.join(tmp, "untainted.duckdb"))
     tainted_rollback_case("tainted_rollback",
                           os.path.join(tmp, "tainted_rollback.duckdb"))
+    tainted_change_third_party_scan_case(
+        "tainted_delete_third_party_scan",
+        os.path.join(tmp, "tainted_delete.duckdb"),
+        "DELETE FROM t WHERE id = 2")
+    tainted_change_third_party_scan_case(
+        "tainted_update_third_party_scan",
+        os.path.join(tmp, "tainted_update.duckdb"),
+        "UPDATE t SET v = 0.0 WHERE id = 2")
 
 
 # ---------------------------------------------------------------------------

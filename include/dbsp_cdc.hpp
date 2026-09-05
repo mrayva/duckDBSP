@@ -26,7 +26,6 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
-#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -4443,6 +4442,9 @@ public:
   struct ViewReadBlock {
     TrackedTable::Baseline state = TrackedTable::Baseline::Seeded;
     std::string table;
+    // Meaningful for DEFERRED only: TrackedTable::pre_trigger_rows() of the
+    // blocking table, so the read gate can say WHO can lift the block.
+    bool pre_trigger_rows = false;
   };
 
   ViewReadBlock view_read_block(const std::string &view_name) {
@@ -6026,7 +6028,7 @@ private:
     if (tbl != tracked_tables_.end()) {
       const auto state = tbl->second->baseline();
       if (state < out.state) {
-        out = {state, name};
+        out = {state, name, tbl->second->pre_trigger_rows()};
       }
       return;
     }
@@ -6065,10 +6067,23 @@ private:
       // only a full sync_all on that one connection could pay it.
       auto it = tracked_tables_.find(table_name);
       if (it != tracked_tables_.end()) {
-        it->second->mark_seed_deferred(
-            deferring_watermark(context, table_name),
-            new_tracking &&
-                transaction_holds_local_rows(context, table_name));
+        const auto probe = probe_deferring_transaction(context, table_name);
+        if (!probe.answered) {
+          // No watermark means no way to know when this transaction ends, and
+          // so no way to ever retire the debt. Refuse to take it on; the
+          // caller drops the half-tracked table (track_table_internal) or
+          // fails the create (create_view).
+          throw duckdb::InvalidInputException(
+              "DBSP cannot track '%s' inside an open transaction: it could "
+              "not read that transaction's state (the table's catalog was not "
+              "found, or it has no DuckDB transaction manager), so it can tell "
+              "neither whether the transaction has already changed the table "
+              "nor when it ends. COMMIT or ROLLBACK first, then track the "
+              "table.",
+              table_name);
+        }
+        it->second->mark_seed_deferred(probe.watermark,
+                                       new_tracking && probe.tainted);
       }
       return true;
     }
@@ -6086,66 +6101,83 @@ private:
     return true;
   }
 
-  // Is the CALLER's transaction holding uncommitted rows for this table RIGHT
-  // NOW? Asked once, at the moment the table JOINS the tracked set, because
-  // that is when "were there rows here before anything could account for them?"
-  // has an answer.
+  // What a deferral must know about the CALLER's transaction, asked ONCE, at
+  // the moment the table JOINS the tracked set, from one lookup of the table's
+  // catalog and one DuckTransaction. Both answers describe the same
+  // transaction, so they cannot disagree about which one the debt waits on.
   //
-  // `LocalStorage::Find` is the engine's own question — a transaction's
-  // uncommitted appends, updates and deletes for a table live in a
-  // LocalTableStorage, and Find reports whether one exists. It reads the
-  // caller's OWN transaction state, not committed storage, so it is not an
-  // internal-connection read and the law does not apply to it.
+  //   tainted   — does this transaction hold ANY uncommitted change right now?
+  //               `DuckTransaction::ChangesMade()` is the engine's own
+  //               question — `undo_buffer.ChangesMade() ||
+  //               storage->ChangesMade()` (duckdb/src/transaction/
+  //               duck_transaction.cpp) — i.e. any delete or update of
+  //               committed rows, any catalog change or sequence use (the undo
+  //               buffer), or any append (local storage). It reads the
+  //               caller's OWN transaction state, not committed storage, so
+  //               the internal-connection law does not apply to it.
+  //   watermark — this transaction's start + 1, so `lowest_active_start >=
+  //               watermark` is exactly "that transaction is no longer
+  //               active". DuckDB removes a transaction from the active set
+  //               inside Commit(), BEFORE the TransactionCommit callbacks
+  //               (duckdb/src/transaction/transaction_context.cpp), so the
+  //               deferring connection's own commit hook sees it cleared and
+  //               pays the debt there.
   //
-  // TRUE on anything it cannot answer (a table it cannot resolve, a catalog
-  // with no DuckDB transaction manager, any throw): the bit only ever costs
-  // availability for the length of one transaction, and a wrong answer is
-  // worse than a refusal.
-  bool transaction_holds_local_rows(duckdb::ClientContext &context,
-                                    const std::string &table_name) {
-    try {
-      auto entry = resolve_table_entry(context, table_name);
-      if (!entry) {
-        return true;
-      }
-      auto &attached = entry->ParentCatalog().GetAttached();
-      auto &tm = duckdb::TransactionManager::Get(attached);
-      if (!tm.IsDuckTransactionManager()) {
-        return true;
-      }
-      auto &txn = duckdb::DuckTransaction::Get(context, attached);
-      return txn.GetLocalStorage().Find(entry->GetStorage());
-    } catch (...) {
-      return true;
-    }
-  }
-
-  // A timestamp the deferring transaction's END passes: its own start + 1, so
-  // `lowest_active_start >= watermark` is exactly "that transaction is no
-  // longer active". Zero (no DuckDB transaction manager, or the lookup threw)
-  // reads as "nothing to wait on", which is the behaviour of every catalog
-  // that cannot answer the question.
+  // CONSERVATIVE, deliberately. The engine does record WHICH table each
+  // uncommitted change belongs to — DeleteInfo, UpdateInfo and AppendInfo all
+  // carry a DuckTableEntry* — but only inside the undo buffer, whose
+  // iteration is private (UndoBuffer::IterateEntries), as is the buffer
+  // itself (DuckTransaction::undo_buffer); the per-table checkpoint locks a
+  // write takes (DuckTransaction::active_locks) have no accessor either.
+  // Nothing public answers "did THIS transaction change THIS table", so the
+  // rule is "did this transaction change ANYTHING". The first version asked
+  // `LocalStorage::Find(table)`, which IS per-table but reports only a
+  // transaction-local APPEND buffer: a DELETE or UPDATE of committed rows goes
+  // to the undo buffer and creates no local storage, so the deferral read
+  // untainted and a third connection's scan established a baseline that was
+  // short — measured `view 13.0` against SQL `10.0`, permanently, for both
+  // shapes (`tainted_delete_third_party_scan`,
+  // `tainted_update_third_party_scan`). What the coarser rule costs: a
+  // transaction that writes ANYTHING (another table, a CREATE TABLE, a
+  // sequence) and then tracks a table is tainted, so reads of views over that
+  // table are refused until it ends — availability, for one transaction's
+  // length, on a rare shape. A wrong answer is worse than a refusal. Never
+  // approximated from statement text.
   //
-  // DuckDB removes a transaction from the active set inside Commit(), which
-  // runs BEFORE the TransactionCommit callbacks
-  // (duckdb/src/transaction/transaction_context.cpp), so the deferring
-  // connection's own commit hook already sees the watermark cleared and pays
-  // the debt there — which is where it was paid before this became per-table.
-  uint64_t deferring_watermark(duckdb::ClientContext &context,
-                               const std::string &table_name) {
+  // `answered` false means neither field means anything: the table's catalog
+  // was not found, or it has no DuckDB transaction manager, or the lookup
+  // threw. `require_trigger_capable_catalog` does not exclude that
+  // (catalog_supports_triggers is permissive on a throw), so the branch is not
+  // provably unreachable — and seed_baseline REFUSES the deferral there rather
+  // than record a debt it has no watermark to retire. There is no fail-safe
+  // value to store: "tainted, and never cleared until the deferring
+  // transaction ends" needs a watermark to know when that is, and without one
+  // the table would sit DEFERRED for the life of the process. Refusing the
+  // track, and saying why, is the honest answer.
+  struct DeferralProbe {
+    bool answered = false;
+    bool tainted = true;
+    uint64_t watermark = 0;
+  };
+  DeferralProbe probe_deferring_transaction(duckdb::ClientContext &context,
+                                            const std::string &table_name) {
+    DeferralProbe probe;
     try {
       auto attached = attached_of_table_key(context, table_name);
       if (!attached) {
-        return 0;
+        return probe;
       }
-      if (lowest_active_start(*attached) == 0) {
-        return 0; // catalog has no DuckDB transaction manager
+      auto &tm = duckdb::TransactionManager::Get(*attached);
+      if (!tm.IsDuckTransactionManager()) {
+        return probe;
       }
-      return static_cast<uint64_t>(
-                 duckdb::DuckTransaction::Get(context, *attached).start_time) +
-             1;
+      auto &txn = duckdb::DuckTransaction::Get(context, *attached);
+      probe.tainted = txn.ChangesMade();
+      probe.watermark = static_cast<uint64_t>(txn.start_time) + 1;
+      probe.answered = true;
+      return probe;
     } catch (...) {
-      return 0;
+      return DeferralProbe{};
     }
   }
 
@@ -6252,9 +6284,11 @@ private:
   //     That is what keeps a second connection reading correct answers during
   //     the window — `cdc: an unseeded baseline is never served to another
   //     connection` pins 110.0, not an error.
-  //   * TAINTED — the deferring transaction was already holding uncommitted
-  //     rows when the table was tracked. Nothing will ever report those rows,
-  //     so only a scan taken once that transaction is GONE can establish the
+  //   * TAINTED — the deferring transaction already held uncommitted changes
+  //     when the table was tracked (any at all — appends, deletes, updates:
+  //     `DuckTransaction::ChangesMade()`, see probe_deferring_transaction for
+  //     why it is not per-table). Nothing will ever report those changes, so
+  //     only a scan taken once that transaction is GONE can establish the
   //     baseline. Measured without this distinction: A opens a transaction,
   //     writes an UNTRACKED table, creates a view over it; B, holding no
   //     transaction, runs `dbsp_sync()`; B's scan marks the baseline SEEDED at
@@ -6272,8 +6306,13 @@ private:
   // counts the caller's OWN statement transaction as an older concurrent one —
   // measured, `lowest_active_start=36 mine=53(probe)` on a bare `dbsp_sync()`,
   // which then marked the table PROVISIONAL and refused every read of the view
-  // it had just repaired. The stored watermark answers the same question
-  // without a reference of its own.
+  // it had just repaired. The stored watermark needs no reference of its own,
+  // but it answers a NARROWER question: has the transaction that deferred a
+  // seed on THIS table (or, for PROVISIONAL, every transaction alive at ITS
+  // seed time) ended. It knows nothing of a transaction that wrote the table
+  // while it was untracked and never deferred anything on it — that shape is
+  // OPEN, see *Concurrent non-deferring writer* in
+  // docs/DESIGN_TRIGGER_SOURCE.md.
   void retire_scanned_baseline(duckdb::ClientContext &context,
                                const std::string &table_name,
                                TrackedTable &table) {
@@ -6300,8 +6339,11 @@ private:
 
   // Has the transaction this table's state is waiting on ended? PROVISIONAL
   // waits on every transaction that was active when it was seeded; DEFERRED
-  // waits on the one whose openness deferred the seed. Zero watermark (nothing
-  // to wait on, or no DuckDB transaction manager) reads as cleared.
+  // waits on the one whose openness deferred the seed. Neither state is ever
+  // entered with a zero watermark any more — a deferral whose watermark cannot
+  // be taken is REFUSED (probe_deferring_transaction), and a provisional mark
+  // without one is never taken — so the zero branch below is the field's
+  // resting value on a SEEDED table, where nothing consults it.
   bool ready_watermark_cleared(duckdb::ClientContext &context,
                                const std::string &table_name,
                                const TrackedTable &table) {
@@ -6386,11 +6428,24 @@ private:
       }
     }
 
-    if (!seed_baseline(context, table_name, /*new_tracking=*/true)) {
-      last_error_ = "Failed to seed the baseline of '" + table_name + "'";
+    const auto untrack = [&] {
       tracked_tables_.erase(table_name);
       table_schemas_.erase(table_name);
       table_locks_.erase(table_name);
+    };
+    bool seeded = false;
+    try {
+      seeded = seed_baseline(context, table_name, /*new_tracking=*/true);
+    } catch (...) {
+      // seed_baseline refused to defer (probe_deferring_transaction could not
+      // answer): the table must not stay tracked with a debt nothing can
+      // retire. Drop it and let the refusal reach the statement that asked.
+      untrack();
+      throw;
+    }
+    if (!seeded) {
+      last_error_ = "Failed to seed the baseline of '" + table_name + "'";
+      untrack();
       return false;
     }
     return true;
