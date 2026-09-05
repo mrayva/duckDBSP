@@ -106,7 +106,7 @@ inline std::atomic<size_t> g_arr_backfills{0};
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
 // (source sync / arrangement backfill / blob decode) and commit propagation
-// path (apply_captured_delta / arrangements / view_step). Off by default.
+// path (apply_captured_deltas / arrangements / view_step). Off by default.
 inline bool dbsp_timing_enabled() {
   static const bool on = std::getenv("DBSP_TIMING") != nullptr;
   return on;
@@ -3806,10 +3806,11 @@ public:
   // fail (sync_table_scan_and_consume returns nullopt: the table vanished, a
   // deferred materialization threw, any exception mid-scan) and a name can be
   // skipped for want of a table lock; both leave that table's baseline where
-  // it was. This used to be silent, which is fatal for a caller that treats
-  // "the commit ran a reconcile" as "the baseline is now seeded" — it left the
-  // baseline empty forever. Every failure is also reported through
-  // record_error_best_effort.
+  // it was. A caller that treats "the commit ran a reconcile" as "the baseline
+  // is now seeded" must therefore read the verdict — a silent failure leaves
+  // the baseline empty for good. Every failure is also reported through
+  // record_error_best_effort and pinned by `cdc: a failed reconcile scan keeps
+  // the debt and says so`.
   bool sync_tables(duckdb::ClientContext &context,
                    const std::vector<std::string> &table_refs,
                    bool do_parallel,
@@ -5163,74 +5164,15 @@ public:
     return it->second->state_total_weight();
   }
 
-  // Apply a delta captured from a transaction's local storage (G2 fast
-  // path): O(delta) — no table scan, no diff. The caller has already
-  // validated the delta against the committed table (count guard).
-  // `context` enables lazy-baseline materialization (D3c); without it a
-  // deferred manager rejects the fast path (caller falls back to sync).
-  // No caller in this repo (singular form) — the unseeded-baseline gate
-  // just below is therefore unexercised. The live, tested path is the
-  // plural apply_captured_deltas() below (~line 4987 for its own copy of
-  // this gate).
-  bool apply_captured_delta(const std::string &table_name,
-                            const DuckDBZSet &delta,
-                            duckdb::ClientContext *context = nullptr) {
-    if (delta.empty()) {
-      return true;
-    }
-    DbspScopeTimer t_total("apply_captured_delta",
-                           table_name + " rows=" +
-                               std::to_string(delta.size()));
-    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
-    auto it = tracked_tables_.find(table_name);
-    if (it == tracked_tables_.end()) {
-      return false;
-    }
-    // An UNSEEDED baseline is empty because nothing has scanned it yet, not
-    // because the table is empty (TrackedTable::baseline_seeded). Applying an
-    // exact delta onto it produces a view holding only the delta — measured
-    // across connections, `view 1.0 / sql 11.0`. The debt belongs to whichever
-    // connection deferred the seed, but the baseline is per-INSTANCE, so any
-    // connection's commit can walk into it. Refuse the fast path and let the
-    // caller reconcile this table by scan at this commit.
-    if (!it->second->baseline_seeded()) {
-      return false;
-    }
-    // Same refusal for a PROVISIONAL baseline: seeded, correct for committed
-    // storage, and possibly short by what a concurrently open transaction had
-    // already written before the table was tracked. Reconcile by scan until
-    // the watermark clears (TrackedTable::mark_provisional).
-    if (it->second->is_provisional()) {
-      return false;
-    }
-    auto lock_it = table_locks_.find(table_name);
-    if (lock_it == table_locks_.end()) {
-      return false;
-    }
-    if (has_deferred() &&
-        !prepare_deferred_for_delta(context, table_name, delta)) {
-      // Rebuild scheduled (or no context): the committed rows are already
-      // in storage, so the rebuild/scan fallback reconciles them.
-      return false;
-    }
-    {
-      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      it->second->apply_delta(delta);
-    }
-    propagate_changes(table_name, delta);
-    exact_delta_syncs_++;
-    return true;
-  }
-
-  // Multi-table commit: apply EVERY reported table's delta to its baseline
-  // first, then run ONE propagation pass over all of them.
-  // Calling apply_captured_delta per table stepped the circuit once per
-  // table — each pass rewrote every downstream view's single-generation
-  // delta buffer (a view reading both tables kept only the LAST table's
-  // effects) and a join both of whose sides changed in the commit missed
-  // its both-shared correction (see propagate_changes_multi). Returns the
-  // tables that could not be served (untracked, or a deferred-baseline
-  // rebuild was scheduled) — the caller reconciles those by scan.
+  // Apply ONE commit's exact per-table deltas (trigger-fed) and propagate
+  // them in a SINGLE circuit pass. Returns the tables that could not be
+  // served — the caller reconciles those by scan at the same commit.
+  //
+  // One pass over all tables, never one per table: a per-table step rewrote
+  // every downstream view's single-generation delta buffer, so a view reading
+  // both tables kept only the LAST table's effects, and a join both of whose
+  // sides changed in the commit missed its both-shared correction (see
+  // propagate_changes_multi).
   std::vector<std::string> apply_captured_deltas(
       const std::unordered_map<std::string, DuckDBZSet> &deltas,
       duckdb::ClientContext *context = nullptr) {
@@ -5272,7 +5214,7 @@ public:
         failed.push_back(table_name);
         continue;
       }
-      DbspScopeTimer t_total("apply_captured_delta",
+      DbspScopeTimer t_total("apply_captured_deltas",
                              table_name + " rows=" +
                                  std::to_string(delta.size()));
       {
@@ -5658,10 +5600,9 @@ private:
     return total;
   }
 
-  // Live COUNT(*) + bit_xor(hash) of a table, matching the watermark format
-  // written by save_checkpoint. Returns false on query failure.
-  // Committed COUNT + row-hash of a USER table, on a fresh internal
-  // connection. Same hazard shape as stream_table_rows — it reads
+  // Committed COUNT(*) + bit_xor(hash) of a USER table, on a fresh internal
+  // connection, in the watermark format save_checkpoint writes. Returns false
+  // on query failure. Same hazard shape as stream_table_rows — it reads
   // committed-only state — so it carries the caller's policy rather than
   // deciding for itself.
   static bool live_watermark(duckdb::ClientContext &context,
@@ -6278,10 +6219,9 @@ private:
   // TWO callers, and they do not share a policy — sync_table_internal (the
   // SEEDING path, Forbidden) and rebuild_all_views (a refresh from QueryBegin,
   // AllowedInTxn) — so this carries the CALLER's, exactly as live_watermark
-  // does. Hard-coding Forbidden here was wrong twice over: it misdescribed the
-  // rebuild caller, and the throw landed INSIDE the best-effort catch below,
-  // where it was swallowed. Under the strict switch a spilled table rebuilt
-  // inside a user transaction would have silently skipped its fold.
+  // does. A hard-coded policy here would misdescribe one of them, and the
+  // throw it raised would land inside the best-effort catch below and be
+  // swallowed; hence also the hoist noted at the check itself.
   void fold_fresh_baseline(duckdb::ClientContext &context,
                            const std::string &table_name, TrackedTable &tt,
                            InternalReadPolicy policy, const char *site) {
