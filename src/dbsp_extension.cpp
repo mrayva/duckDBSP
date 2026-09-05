@@ -504,21 +504,19 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
 // measured `view 10.0 / sql 13.0` on both backends, the next read returning
 // 13.0. Transient, no error, wrong.
 //
-// A PROVISIONAL block is REPAIRABLE, so this tries the repair before refusing:
-// once every transaction that was alive at seed time has ended, one scan of
-// committed storage is exactly what the baseline is missing.
-// `reconcile_ready_provisional` does that and retires the flag. It is only
-// legal when the READER holds no transaction of its own — the scan opens an
-// internal connection, and running it inside the reader's transaction is the
+// A block is REPAIRABLE once the transaction it is waiting on has ended: one
+// scan of committed storage is then exactly what the baseline is missing, and
+// `reconcile_untrusted_baselines` takes it and retires the state. The repair is
+// only legal when the READER holds no transaction of its own — the scan opens
+// an internal connection, and running it inside the reader's transaction is the
 // very read that produces a wrong baseline. In autocommit (every ordinary
 // `SELECT * FROM dbsp_query(...)`) it is legal, which is why the first read
-// now answers correctly instead of refusing.
+// after the window answers correctly instead of refusing.
 //
-// An UNSEEDED block is NOT repairable here: the rows that are missing live in
-// another connection's UNCOMMITTED transaction, so no scan can find them. It
-// refuses. So does a PROVISIONAL block the repair could not clear — the
-// watermark has not cleared yet, the reader is inside its own transaction, or
-// the scan failed.
+// A block whose readiness watermark has NOT cleared is not repairable here: the
+// rows that are missing live in another connection's UNCOMMITTED transaction,
+// so no scan can find them. It refuses, and so does any block the repair could
+// not clear — the reader is inside its own transaction, or the scan failed.
 //
 // `dbsp_view_state()` is not gated. It takes no view argument — it reports
 // row counts for every registered view — so there is no view for this gate to
@@ -527,22 +525,26 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
 static void EnsureViewReadable(ClientContext &context,
                                dbsp_native::CDCManager &manager,
                                const string &fn, const string &view_name) {
-  using Block = dbsp_native::CDCManager::ViewReadBlock;
+  using Baseline = dbsp_native::TrackedTable::Baseline;
   auto block = manager.view_read_block(view_name);
-  if (block.kind == Block::Kind::None) {
+  if (block.state == Baseline::Seeded) {
     return;
   }
-  if (block.kind == Block::Kind::Provisional &&
-      !dbsp_native::user_transaction_open(context)) {
-    manager.reconcile_ready_provisional(
+  if (!dbsp_native::user_transaction_open(context)) {
+    // The reader holds no transaction of its own, so the scan is legal here.
+    // The sweep only takes tables whose readiness watermark has CLEARED, so a
+    // baseline whose deferring or seeding transaction is still alive is left
+    // alone and this read still refuses — it cannot establish a baseline that
+    // an open transaction would have changed.
+    manager.reconcile_untrusted_baselines(
         context, dbsp_native::InternalReadPolicy::Forbidden,
-        "provisional reconcile at read");
+        "baseline reconcile at read");
     block = manager.view_read_block(view_name);
-    if (block.kind == Block::Kind::None) {
+    if (block.state == Baseline::Seeded) {
       return;
     }
   }
-  if (block.kind == Block::Kind::Unseeded) {
+  if (block.state != Baseline::Provisional) { // UNSEEDED or DEFERRED
     throw InvalidInputException(
         fn + "('" + view_name + "'): source table '" + block.table +
         "' has an UNSEEDED baseline — its seeding scan was deferred because a "
@@ -2629,17 +2631,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
-
-  // Let the CDC core reach the per-connection transaction state. It cannot
-  // include dbsp_context_state.hpp (that header includes dbsp_cdc.hpp), so the
-  // callback is installed here, where both types are visible.
-  dbsp_native::txn_bookkeeping().baseline_unseeded = [](ClientContext &ctx) {
-    auto st = ctx.registered_state->Get<dbsp_native::DBSPContextState>(
-        "dbsp_cdc_state");
-    if (st) {
-      st->note_unseeded_baseline();
-    }
-  };
 
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,

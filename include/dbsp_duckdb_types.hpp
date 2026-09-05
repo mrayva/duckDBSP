@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <iostream>
+
 #include <cmath>
 
 #include "dbsp_circuit.hpp" // dbsp::Node::StateKind, reused by circuit_state_kind()
@@ -662,56 +664,134 @@ public:
     deferred_weight_ = expected_weight;
     deferred_hash_ = std::move(row_hash);
     // A deferred baseline IS the committed table content by construction —
-    // the restore verified the save-time watermark against live storage.
-    baseline_seeded_ = true;
+    // the restore verified the save-time watermark against live storage. So
+    // deferral is a RESIDENCY state, not a trust state: the content is
+    // trusted, it is merely not materialized yet, and an exact delta is served
+    // through prepare_deferred_for_delta rather than refused. Hence SEEDED
+    // here, with `deferred_` living beside the trust enum rather than in it.
+    mark_seeded();
   }
 
   bool is_deferred() const { return deferred_; }
   int64_t deferred_weight() const { return deferred_weight_; }
   const std::string &deferred_hash() const { return deferred_hash_; }
 
-  // Has this baseline ever been established from committed storage?
+  // ---- baseline trust state ---------------------------------------------
   //
-  // FALSE means "empty because nothing has scanned it yet", which is NOT the
-  // same as "empty because the table is empty" — and the two are
-  // indistinguishable from the Z-set alone. The public dbsp_track() creates a
-  // TrackedTable with an empty baseline on purpose and leaves the seeding to a
-  // later dbsp_sync(); anything that replays a baseline as if it were table
-  // content (CDCManager::create_view) has to know the difference, or it builds
-  // a view over nothing and returns a permanently wrong answer with no error.
-  bool baseline_seeded() const { return baseline_seeded_; }
+  // How far this table's baseline can be trusted. This is the ONLY question
+  // the two consultation points ask: the delta APPLY path
+  // (CDCManager::apply_captured_deltas) and the view READ path
+  // (CDCManager::view_read_block). Anything not SEEDED is scanned by the
+  // commit hook's reconcile sweep (CDCManager::untrusted_baselines) instead of
+  // being served an exact delta.
+  //
+  // UNSEEDED — nothing has read committed storage into it yet, so it is empty
+  // BECAUSE NOTHING SCANNED IT, which is not the same as "empty because the
+  // table is empty"; the two are indistinguishable from the Z-set alone. A
+  // freshly constructed table is here until its seeding scan runs. Applying an
+  // exact delta onto it makes the view hold the delta ALONE — measured across
+  // connections, `view 1.0 / sql 11.0`.
+  //
+  // DEFERRED — unseeded, and OWED a scan: CDCManager::seed_baseline was asked
+  // for a baseline while a user transaction was open, where a scan on an
+  // internal connection cannot see that transaction's uncommitted rows. This
+  // is the state that used to be a sticky per-CONNECTION boolean naming no
+  // table, which is why the debt could only be paid by a full sync_all on that
+  // one connection. It refuses exact deltas and reads exactly as UNSEEDED
+  // does; what it adds is a NAME and a readiness watermark, so any connection's
+  // commit can pay it with one scoped scan once the deferring transaction has
+  // ended. A read is refused rather than repaired: the missing rows are
+  // uncommitted on another connection, so no scan can find them.
+  //
+  // PROVISIONAL — seeded correctly from committed storage while ANOTHER
+  // connection held a transaction open, so it may be SHORT by what that
+  // transaction had already written to the table before it was tracked: the
+  // scan could not see those rows and no trigger fired for them, because there
+  // were no triggers when the statement ran. Measured before this state:
+  // `view 10.0 / sql 13.0`, then `14.0 / 17.0`, and it never healed. The
+  // watermark is a transaction-manager start timestamp newer than every
+  // transaction alive at seed time; once `LowestActiveStart() >= watermark`
+  // every one of them has ended and one scan of committed storage pays the
+  // debt (CDCManager::sync_tables retires it there, on a scan that SUCCEEDED).
+  //
+  // SEEDED — established from committed storage with nothing outstanding. The
+  // only state that serves an exact delta.
+  //
+  // Atomic because the retirement runs under a SHARED struct lock, having
+  // already released the per-table lock the scan held.
+  // Ordered WORST FIRST: the read gate reports the worst state in a view's
+  // source tree, which is then a `<` on this enum and needs no second ranking.
+  enum class Baseline { Unseeded, Deferred, Provisional, Seeded };
 
-  // ---- provisional baseline (concurrent pre-tracking write) --------------
-  //
-  // A baseline seeded while ANOTHER connection held a transaction open is
-  // correct for committed storage and may still be short: that transaction
-  // could already have written this table while it was untracked and
-  // untriggered, so its commit reports nothing and those rows are never
-  // accounted for. Measured before this flag: `view 10.0 / sql 13.0`, then
-  // `14.0 / 17.0`, and it never healed.
-  //
-  // The table is marked PROVISIONAL with a transaction-manager watermark: a
-  // start timestamp newer than every transaction active at seed time. While
-  // provisional no exact delta is applied to it — every commit that would have
-  // hands it to the scan-reconcile instead. It is retired by the first
-  // successful reconcile scan taken once the watermark has cleared
-  // (`LowestActiveStart() >= watermark`: every transaction that existed at
-  // seed time has ended), which is the scan that finally sees those rows.
-  //
-  // Zero means "not provisional" — which is also what a catalog with no DuckDB
-  // transaction manager gets, since there is no watermark there to wait on.
-  void mark_provisional(uint64_t watermark) {
-    provisional_watermark_ = watermark;
+  Baseline baseline() const { return baseline_.load(); }
+
+  // The one predicate the apply path asks.
+  bool serves_exact_delta() const { return baseline() == Baseline::Seeded; }
+
+  // Has a scan of committed storage ever stood behind this baseline? False for
+  // both states that have never had one, which is what decides whether
+  // create_view must seed the source before replaying it.
+  bool established() const {
+    const auto b = baseline();
+    return b == Baseline::Provisional || b == Baseline::Seeded;
   }
-  bool is_provisional() const { return provisional_watermark_ != 0; }
-  uint64_t provisional_watermark() const { return provisional_watermark_; }
-  void clear_provisional() { provisional_watermark_ = 0; }
+
+  // The seeding scan could not run: a user transaction was open, and a scan on
+  // an internal connection cannot see its uncommitted rows. `watermark` is a
+  // timestamp the deferring transaction's end passes (its own start + 1), so
+  // ready_watermark_cleared() is the question "has that transaction ended?" —
+  // the same comparison PROVISIONAL uses, against the same counter.
+  void mark_seed_deferred(uint64_t watermark) {
+    auto s = baseline_.load();
+    while (s == Baseline::Unseeded || s == Baseline::Deferred) {
+      if (baseline_.compare_exchange_weak(s, Baseline::Deferred)) {
+        ready_watermark_ = watermark;
+        return;
+      }
+    }
+  }
+
+  // A scan established this baseline. Never DOWNGRADES a PROVISIONAL table:
+  // retiring that state also requires proof that its watermark cleared, which
+  // only the caller can supply (CDCManager::sync_tables).
+  //
+  // Only a scan that COULD have seen everything may call this, which is why
+  // install_rebuild/finish_rebuild take `establishes`: a scan run while a user
+  // transaction is open cannot see that transaction's rows, so it REFRESHES
+  // content without clearing a DEFERRED debt. Measured with it clearing the
+  // debt: crash recovery's resync, which runs from QueryBegin inside the very
+  // transaction that deferred the seed, marked the baseline trusted from a
+  // committed-only read and the commit then reconciled nothing — view 10.0
+  // where SQL read 13.0.
+  void mark_seeded() {
+    auto s = baseline_.load();
+    while (s == Baseline::Unseeded || s == Baseline::Deferred) {
+      if (baseline_.compare_exchange_weak(s, Baseline::Seeded)) {
+        ready_watermark_ = 0;
+        return;
+      }
+    }
+  }
+
+  void mark_provisional(uint64_t watermark) {
+    ready_watermark_ = watermark;
+    baseline_ = Baseline::Provisional;
+  }
+  void retire_provisional() {
+    ready_watermark_ = 0;
+    baseline_ = Baseline::Seeded;
+  }
+
+  // Zero = nothing to wait on. Meaningful in DEFERRED and PROVISIONAL.
+  uint64_t ready_watermark() const { return ready_watermark_; }
 
   // Install the rows fed through begin_rebuild()/add_scanned_row() as the
   // baseline WITHOUT diffing against the previous one (there is none: the
   // table was deferred). Clears the deferred flag.
-  void install_rebuild() {
-    baseline_seeded_ = true;
+  void install_rebuild(bool establishes = true) {
+    if (establishes) {
+      mark_seeded();
+    }
     if (spill_) {
       // No diff wanted: swap the generation in directly. The end_rebuild
       // diff path reads every added payload back from disk — hours at
@@ -727,8 +807,10 @@ public:
     deferred_hash_.clear();
   }
 
-  DuckDBZSet finish_rebuild() {
-    baseline_seeded_ = true;
+  DuckDBZSet finish_rebuild(bool establishes = true) {
+    if (establishes) {
+      mark_seeded();
+    }
     DuckDBZSet delta;
     if (spill_) {
       spill_->end_rebuild(
@@ -900,15 +982,13 @@ private:
   int64_t wm_count_ = 0;
   std::string wm_hash_;
   // Deferred baseline (D3c): true until the first operation that needs
-  // table state materializes it from a storage scan.
+  // table state materializes it from a storage scan. RESIDENCY, not trust —
+  // see mark_deferred().
   bool deferred_ = false;
-  // See baseline_seeded(): false until a scan (or a verified deferred restore)
-  // has established this baseline from committed storage.
-  bool baseline_seeded_ = false;
-  // See mark_provisional(): 0 = not provisional. Atomic because the reconcile
-  // that retires it runs under a SHARED struct lock, having already released
-  // the per-table lock the scan held.
-  std::atomic<uint64_t> provisional_watermark_{0};
+  // The one trust state — see Baseline above.
+  std::atomic<Baseline> baseline_{Baseline::Unseeded};
+  // The transaction-manager timestamp this state waits on; 0 = nothing.
+  std::atomic<uint64_t> ready_watermark_{0};
   int64_t deferred_weight_ = 0; // restore-time COUNT(*)
   std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };

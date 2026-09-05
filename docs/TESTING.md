@@ -95,8 +95,9 @@ five rows; `AllowedInTxn` the rest) — do not trust a quoted count, recount fro
 the tree with `grep -rn 'InternalReadPolicy::' include src` — plus **6 helpers** that take the CALLER's policy rather than
 deciding for themselves (`stream_table_rows`, `stream_table_serialized`,
 `live_watermark`, `sync_table_scan_and_consume`, `fold_fresh_baseline`,
-`reconcile_ready_provisional`), and `sync_tables` / `sync_all`, which default to
-`Forbidden` so the commit reconcile is strict unless a caller says otherwise.
+`reconcile_untrusted_baselines`), and `sync_tables` / `sync_all`, which default
+to `Forbidden` so the commit reconcile is strict unless a caller says
+otherwise.
 
 `Forbidden` — a call here inside an open user transaction is a bug:
 
@@ -106,7 +107,7 @@ deciding for themselves (`stream_table_rows`, `stream_table_serialized`,
 | `sync_table_internal` (auto-spill probe) | a `COUNT(*)` over the USER's table on that same path, deciding whether the scan spills |
 | `sync_table_internal` (baseline fold) | the watermark must describe the state the seeding scan read |
 | the trigger sweep's DDL | the original defect of this family |
-| the provisional reconcile, at commit and at read | measured, not assumed — see below |
+| the untrusted-baseline reconcile, at commit and at read | measured, not assumed — see below |
 
 `AllowedInTxn` — every one for one of exactly two reasons:
 

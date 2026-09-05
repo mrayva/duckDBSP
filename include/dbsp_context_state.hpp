@@ -130,19 +130,6 @@ public:
     tracked_in_txn_.push_back(key);
   }
 
-  // The CDC core could not establish some table's baseline right now, because
-  // reading committed state on an internal connection while this transaction
-  // is open would miss its uncommitted rows (CDCManager::seed_baseline). The
-  // baseline is EMPTY until something scans, and any view built over it is
-  // wrong until then, so this flag is STICKY: it is not cleared at a
-  // transaction boundary, only when a reconcile actually runs.
-  //
-  // TransactionCommit under auto-sync widens itself to a full scan-and-diff
-  // for it; TransactionRollback, which has no commit to reconcile, asks for a
-  // rebuild of every view from committed storage. A commit with auto-sync OFF
-  // reconciles nothing, so it leaves the flag alone.
-  void note_unseeded_baseline() { unseeded_baseline_ = true; }
-
   void QueryBegin(duckdb::ClientContext &context) override {
     if (internal_query_depth > 0) {
       return;
@@ -252,8 +239,6 @@ public:
     }
     capture_ = {};
     tracked_in_txn_.clear();
-    // unseeded_baseline_ is NOT cleared here: an empty baseline outlives the
-    // transaction that left it that way, and only a reconcile repairs it.
   }
 
   void QueryEnd(duckdb::ClientContext &context,
@@ -301,51 +286,13 @@ public:
 
     auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
-      // unseeded_baseline_ is deliberately LEFT SET: this commit reconciles
-      // nothing, so the baseline is still empty. Clearing it here made the
-      // deferred seeding vanish — the view stood on an empty baseline for the
-      // rest of the connection's life (measured: 4.0 against SQL 17.0 after
-      // auto-sync was turned back on). An explicit dbsp_sync(), or the first
-      // commit once auto-sync is back on, is what repairs it.
+      // This commit reconciles nothing, so any untrusted baseline stays
+      // untrusted — which is what the per-table state already says. An
+      // explicit dbsp_sync(), or the first commit once auto-sync is back on,
+      // is what repairs it.
       capture_ = {};
       return;
     }
-
-    // A baseline left unseeded (seed_baseline could not scan inside an open
-    // user transaction) is reconciled HERE, by widening this commit to a full
-    // scan-and-diff. It has to be a WIDENING and not a note in
-    // capture_.touched: the trigger-fed fast path below applies its buffered
-    // deltas and returns without ever reading `touched`, so a trigger-fed
-    // commit discarded the reconcile silently and the view read 3.0 against
-    // SQL 13.0 forever. unknown_writes is the one flag BOTH commit branches
-    // honour. saw_statements keeps the "nothing fed, no statement seen" early
-    // return below from skipping the sync.
-    //
-    // The scan is unconditional once the flag is set, so an explicit
-    // dbsp_sync() that already repaired the baseline costs one extra
-    // no-difference scan here. That is the price of not plumbing sync
-    // observation back into the connection state; it is paid once.
-    //
-    // The flag is NOT cleared here. A reconcile scan can fail — the source
-    // was dropped, a deferred materialization threw — and CDCManager returns
-    // that as `false` rather than by throwing. Clearing the debt before the
-    // scan that pays it meant one failed scan left the baseline empty for the
-    // life of the connection, with nothing owed and nothing said. settle()
-    // below clears it only on a sync that reports success.
-    if (unseeded_baseline_) {
-      capture_.unknown_writes = true;
-      capture_.saw_statements = true;
-    }
-    // Only a FULL reconcile settles the debt: the flag names no table, so a
-    // scoped sync_tables cannot prove it covered the unseeded one. In
-    // practice a scoped sync never runs while the debt stands, because the
-    // widening above forces unknown_writes and every branch below then takes
-    // sync_all.
-    auto settle = [this](bool sync_ok) {
-      if (sync_ok) {
-        unseeded_baseline_ = false;
-      }
-    };
 
     // Auto-persist checkpoint interval (dbsp_autopersist_interval): fires a
     // piggybacked save_checkpoint() once enough commits have accumulated
@@ -366,52 +313,52 @@ public:
       }
     } checkpoint_guard{manager, context};
 
-    // A table seeded while ANOTHER connection held a transaction open is
-    // PROVISIONAL: that transaction may already have written it before it was
-    // tracked, and neither the seeding scan nor any trigger saw those rows.
-    // The repair is one scan, taken once every transaction alive at seed time
-    // has ended, on whichever connection commits next — including a commit
-    // that touched nothing at all, which is the case the reproduction needs
-    // (at connection A's own commit, A's transaction is still active).
+    // THE seeding/reconcile debt, paid in one place. Every tracked table whose
+    // TrackedTable::Baseline is not SEEDED — a seeding scan the CDC core had
+    // to skip because this connection held a transaction open, or a baseline
+    // seeded while ANOTHER connection did — is scanned here, BY NAME. The
+    // state is per-INSTANCE and so is the sweep: whichever connection commits
+    // next pays, including a commit that touched nothing at all, which is the
+    // case the provisional reproduction needs (at connection A's own commit,
+    // A's transaction is still active, so the repair falls to a bare
+    // `SELECT 1` on connection B).
     //
-    // It runs AFTER the branches below, so a table that is still provisional
-    // has had this commit's delta refused and scanned already and this scan
-    // cannot double-count. Declared after checkpoint_guard so it destructs
-    // FIRST: the piggybacked checkpoint save must see the repaired state.
-    struct ProvisionalGuard {
+    // A DESTRUCTOR because it must run on every path out of this function,
+    // including the read-only and nothing-written early returns. It runs AFTER
+    // the branches below, so a table that is still untrusted has had this
+    // commit's delta refused and scanned already and this scan cannot
+    // double-count. Declared after checkpoint_guard so it destructs FIRST: the
+    // piggybacked checkpoint save must see the repaired state.
+    //
+    // FORBIDDEN, on a measurement rather than an assumption. This runs from
+    // TransactionCommit, which fires AFTER Commit() has succeeded, so the rows
+    // this scan reads are committed — including the ones this very transaction
+    // just wrote. The open question was whether the ClientContext still
+    // reports an open user transaction here, which would make a Forbidden
+    // policy throw on exactly the commit that repairs the view. It does NOT:
+    // with this set to Forbidden, the strict-mode case commits an EXPLICIT
+    // transaction while a table is provisional-and-ready and passes, so
+    // user_transaction_open(context) is false by the time the hook runs.
+    // Forbidden and not whitelisted, because that is the honest state: if the
+    // engine ever starts reporting the transaction as open here,
+    // DBSP_STRICT_INTERNAL_QUERY=1 says so instead of a comment quietly going
+    // stale. Pinned by `cdc: a provisional baseline retires under the strict
+    // internal-query switch` in test/unit/test_trigger_source.cpp.
+    struct ReconcileGuard {
       CDCManager &m;
       duckdb::ClientContext &ctx;
-      ~ProvisionalGuard() {
+      ~ReconcileGuard() {
         try {
-          // FORBIDDEN, on a measurement rather than an assumption. This runs
-          // from TransactionCommit, which fires AFTER Commit() has succeeded,
-          // so the rows this scan reads are committed — including the ones
-          // this very transaction just wrote. The open question was whether
-          // the ClientContext still reports an open user transaction here,
-          // which would make a Forbidden policy throw on exactly the commit
-          // that repairs the view. It does NOT: with this set to Forbidden,
-          // the strict-mode case below commits an EXPLICIT transaction while a
-          // table is provisional-and-ready and passes (26 assertions), so
-          // user_transaction_open(context) is false by the time the hook runs.
-          //
-          // Forbidden and not whitelisted, because that is the honest state:
-          // if the engine ever starts reporting the transaction as open here,
-          // DBSP_STRICT_INTERNAL_QUERY=1 says so instead of a comment quietly
-          // going stale. Pinned by `cdc: a provisional baseline retires under
-          // the strict internal-query switch` in
-          // test/unit/test_trigger_source.cpp, which is the only case in the
-          // suite where provisional_tables is ever non-zero.
-          m.reconcile_ready_provisional(
+          m.reconcile_untrusted_baselines(
               ctx, dbsp_native::InternalReadPolicy::Forbidden,
-              "provisional reconcile at commit");
+              "untrusted baseline reconcile at commit");
         } catch (const std::exception &ex) {
-          std::cerr << "DBSP provisional reconcile error: " << ex.what()
-                    << "\n";
+          std::cerr << "DBSP baseline reconcile error: " << ex.what() << "\n";
         } catch (...) {
-          std::cerr << "DBSP provisional reconcile unknown error\n";
+          std::cerr << "DBSP baseline reconcile unknown error\n";
         }
       }
-    } provisional_guard{manager, context};
+    } reconcile_guard{manager, context};
 
     try {
       // Trigger-fed fast path: the bodies reported this transaction's exact
@@ -428,7 +375,7 @@ public:
         // undo.
         if (capture_.triggers_installed) {
           capture_ = {};
-          settle(manager.sync_all(context, &transaction));
+          manager.sync_all(context, &transaction);
           return;
         }
         const bool unknown = capture_.unknown_writes;
@@ -442,7 +389,7 @@ public:
         std::vector<std::string> failed =
             manager.apply_captured_deltas(deltas, &context);
         if (unknown) {
-          settle(manager.sync_all(context, &transaction));
+          manager.sync_all(context, &transaction);
         } else if (!failed.empty()) {
           manager.sync_tables(context, failed,
                               manager.parallel_sync_enabled() &&
@@ -500,8 +447,9 @@ public:
                             &transaction);
       } else {
         // Writes we could not attribute (multi-statement, unparseable SQL):
-        // scan everything, as before H1
-        settle(manager.sync_all(context, &transaction));
+        // nothing names the tables, so this is the one full scan left in the
+        // hook.
+        manager.sync_all(context, &transaction);
       }
     } catch (const std::exception &ex) {
       std::cerr << "DBSP Auto-CDC error: " << ex.what() << "\n";
@@ -516,14 +464,9 @@ public:
       return;
     }
     capture_ = {}; // rolled back: buffered rows never happened
-    // An unseeded baseline has no commit to reconcile it now. Rebuild instead:
-    // rebuild_all_views refreshes EVERY tracked baseline from committed
-    // storage before it replays the views, so it is a stronger repair than the
-    // commit's scan-and-diff and the flag is cleared here too.
-    if (unseeded_baseline_) {
-      unseeded_baseline_ = false;
-      get_cdc_manager(context).request_rebuild();
-    }
+    // An untrusted baseline needs no special case here. It is per-TABLE state
+    // that this rollback does not touch, and the next commit on any connection
+    // scans it by name (CDCManager::reconcile_untrusted_baselines).
     // The tracked-table set is process state, not transactional state — so a
     // dbsp_track inside this transaction has to be undone by hand. Without
     // this, a rolled-back CREATE TABLE u + dbsp_track('u') left u tracked
@@ -595,8 +538,6 @@ private:
   TxnCapture capture_;
   // Keys dbsp_track ADDED under the in-flight transaction (note_table_tracked)
   std::vector<std::string> tracked_in_txn_;
-  // See note_unseeded_baseline().
-  bool unseeded_baseline_ = false;
   // Trigger bodies run on execution threads, and an aggregate over a large
   // transition table may be parallel, so more than one thread can be inside
   // buffer_trigger_delta at once. Guards trigger_deltas only.

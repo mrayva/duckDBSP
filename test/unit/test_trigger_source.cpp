@@ -1338,8 +1338,8 @@ TEST_CASE("cdc: a provisional baseline retires under the strict internal-query "
   //     connection to scan. Whether that is legal turns on one question nobody
   //     had asked: does the ClientContext still report the user's transaction
   //     as OPEN inside TransactionCommit? If it did, the `Forbidden` policy on
-  //     reconcile_ready_provisional would throw on exactly the commit that
-  //     repairs the view. MEASURED here, with an EXPLICIT BEGIN/COMMIT on
+  //     the commit hook's reconcile sweep would throw on exactly the commit
+  //     that repairs the view. MEASURED here, with an EXPLICIT BEGIN/COMMIT on
   //     connection b while the table is provisional-and-ready: it does not —
   //     this case passes under `DBSP_STRICT_INTERNAL_QUERY=1` with the policy
   //     set to Forbidden. So Forbidden is what the call site says, and the
@@ -1403,8 +1403,8 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   // answer with no error is exactly what the invariant forbids.
   //
   // The fix is on the APPLY path, where the per-instance signal already lives:
-  // apply_captured_delta[s] refuse an exact delta onto a table whose
-  // TrackedTable::baseline_seeded() is false and hand it back to the caller,
+  // apply_captured_deltas refuses an exact delta onto a table whose
+  // TrackedTable::Baseline is not SEEDED and hands it back to the caller,
   // which reconciles that table by scan at that same commit.
 
   // Order independence. Every section below needs a genuinely unseeded
@@ -1540,6 +1540,68 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
     REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (6, 1.0)")->HasError());
     REQUIRE(b_view(b) == b_sql(b));
   }
+}
+
+TEST_CASE("cdc: one baseline state drives both the apply path and the read "
+          "path",
+          "[trigger_source][create_view]") {
+  // The claim under test is that TrackedTable::Baseline is the ONLY thing
+  // either consultation point asks. So flip the state once, changing nothing
+  // else, and BOTH behaviours must flip together:
+  //
+  //   not SEEDED -> a read is refused AND an exact delta is refused
+  //       SEEDED -> a read is served  AND an exact delta is applied
+  //
+  // Before this was one state it was four fields in three files, and the two
+  // points read different subsets of them: a trigger-fed commit could apply a
+  // delta the read path would have refused to serve. That is not expressible
+  // once both ask the same question.
+  arm_trigger_source();
+
+  DuckDBTestHarness db; // connection A: holds the transaction open
+  db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
+  duckdb::Connection b(db.instance());
+
+  // A's open transaction defers the seeding scan, so `t` enters DEFERRED and
+  // stays there until a scan of committed storage runs. The scan that ends the
+  // window is the reconcile B's own commit takes below, which is the point:
+  // ONE state change, observed at both consultation points.
+  db.exec("BEGIN TRANSACTION");
+  db.exec("SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
+
+  // --- not SEEDED -------------------------------------------------------
+  // READ: refused, on the deferring connection and on the other one, naming
+  // the table and how to clear it.
+  auto refused = db.query("SELECT * FROM dbsp_query('tv')");
+  REQUIRE(refused->HasError());
+  REQUIRE(refused->GetError().find("UNSEEDED baseline") != std::string::npos);
+  REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->HasError());
+
+  // APPLY: B's write is trigger-fed, so without the gate it would take the
+  // exact-delta fast path. It must be refused and reconciled by scan instead.
+  const auto exact_before = db.manager().exact_delta_syncs();
+  const auto scans_before = db.manager().scan_syncs();
+  REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (2, 3.0)")->HasError());
+  REQUIRE(db.manager().exact_delta_syncs() == exact_before);
+  REQUIRE(db.manager().scan_syncs() > scans_before);
+
+  // --- SEEDED -----------------------------------------------------------
+  db.exec("COMMIT");
+  db.exec("SELECT 1"); // statement boundary: the deferred trigger DDL runs here
+
+  // READ: served, and equal to plain SQL on both connections.
+  REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
+  REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->GetValue(0, 0)
+              .GetValue<double>() ==
+          b.Query("SELECT SUM(v) FROM t")->GetValue(0, 0).GetValue<double>());
+
+  // APPLY: the very next write is served exactly, with no scan at all.
+  const auto exact_seeded = db.manager().exact_delta_syncs();
+  const auto scans_seeded = db.manager().scan_syncs();
+  db.exec("INSERT INTO t VALUES (3, 4.0)");
+  REQUIRE(db.manager().exact_delta_syncs() > exact_seeded);
+  REQUIRE(db.manager().scan_syncs() == scans_seeded);
+  REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
 }
 
 TEST_CASE("cdc: a failed reconcile scan keeps the debt and says so",

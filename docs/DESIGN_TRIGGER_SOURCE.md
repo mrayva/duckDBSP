@@ -342,6 +342,21 @@ Throughput, NumPad `medium` suite, config `E_20_trigger`: see
 
 ## History
 
+**2026-09-04 — the seeding state was folded back into one model.** Six weeks of
+individually-correct fixes had left "is this baseline trustworthy?" stored five
+ways across three files and two lifetimes: `deferred_`, `baseline_seeded_` and
+`provisional_watermark_` on the table, a sticky per-CONNECTION
+`unseeded_baseline_`, and a `ViewReadBlock::Kind` re-derived at the read gate.
+The per-connection copy was the weakest — it named no table, so its debt could
+only be paid by a full `sync_all`, and every awkward construct in
+`TransactionCommit` existed to compensate: a `std::function` trampoline
+installed at LOAD to route one boolean across an include edge, a commit-time
+widening that set "we saw statements" on transactions that had seen none, a
+`settle()` lambda, and a rollback special case. All of it is gone; the section
+above describes what replaced it. Two defects the redundancy was hiding are
+fixed with it (a scan inside the deferring transaction retiring the debt; the
+read path refusing where it could have repaired) — see `CHANGELOG.md`.
+
 The trigger source began as a spike behind `DBSP_DELTA_SOURCE=trigger`
 alongside two other delta sources. On 2026-09-03 the owner made it the only
 one, and the other two were deleted:
@@ -404,82 +419,104 @@ and the strict switch's structural blindness to commit hooks.
   unreachable — and forcing a scan on every transaction that saw a trigger
   install was rejected because it would make each `dbsp_track` cost a full
   `sync_all`.
-- **Never seed a baseline from a read the user's transaction cannot see.** The
-  seeding scan opens its own connection, so inside an open user transaction it
-  misses their uncommitted rows. `CDCManager::seed_baseline` leaves the
-  baseline unseeded there and records the debt on the connection
-  (`note_unseeded_baseline`); the next commit under auto-sync widens itself to
-  a full scan-and-diff to pay it, an explicit `dbsp_sync()` pays it too, and a
-  rollback asks for a view rebuild from committed storage instead. The
-  widening — rather than a note in the transaction's sync SCOPE — is
-  load-bearing: `TransactionCommit` has two branches, and the trigger-fed one
-  applies its buffered deltas and returns without reading that scope, so a
-  scope note was silently discarded on exactly the commits the triggers fed.
-  The flag is sticky for the same reason: a commit with auto-sync OFF
-  reconciles nothing, so it has to leave the debt standing.
+- **One per-table baseline state, and nothing else.** How far a tracked
+  table's baseline can be trusted is `TrackedTable::Baseline`, a single enum on
+  the per-INSTANCE table:
 
-  The debt is per-CONNECTION but the baseline is per-INSTANCE, so the
-  connection holding the deferral is not the only one that can walk into an
-  empty baseline. **The apply path is where that is caught**: both
-  `apply_captured_delta` and `apply_captured_deltas` refuse to apply an exact
-  delta to a table whose `TrackedTable::baseline_seeded()` is false, and hand
-  it back to the commit, which reconciles that table by scan at that same
-  commit. Without it, another connection's commits applied their deltas onto
-  the empty baseline and read the deltas alone for the length of the window —
-  `view 1.0 / sql 11.0`, `2.0 / 12.0`, `3.0 / 13.0` over three commits.
-  Self-healing at the deferring connection's commit, and still a wrong answer
-  with no error while it lasted.
+  | state | what it means | what serves it |
+  |---|---|---|
+  | `Unseeded` | nothing has scanned it; empty BECAUSE NOTHING SCANNED IT, which is not "empty because the table is empty" | the public `dbsp_track()` leaves it here on purpose and documents `dbsp_sync()` as the fill |
+  | `Deferred` | a seeding scan was ASKED FOR and could not run: a user transaction was open, and an internal connection cannot see its uncommitted rows | the commit hook's sweep, once the deferring transaction has ended |
+  | `Provisional(watermark)` | seeded correctly from committed storage while ANOTHER connection held a transaction open, so it may be short by what that transaction wrote before the table was tracked | the same sweep, once every transaction alive at seed time has ended |
+  | `Seeded` | established, nothing outstanding | — the only state that serves an exact delta |
 
-  The APPLY path is not the only one. A PURE READ of the view during the
-  deferral window returned the unseeded value too — `dbsp_query('mv')`
-  `[(None,)]` against plain SQL `10.0`, on the connection holding `BEGIN;
-  dbsp_create_view(...)` open and on any other connection, on `:memory:` and on
-  a file; `dbsp_changes` was worse still, serving `[(None,-1),(10.0,1)]` on a
-  connection whose `dbsp_query` said NULL. **Both read surfaces now REFUSE**:
-  `CDCManager::unseeded_source_of_view` walks the view's sources transitively
-  and `RefuseIfUnseeded` (`src/dbsp_extension.cpp`) throws, naming the table
-  and how to clear it.
+  Exactly two places ask:
 
-  Refuse and not reconcile, because a reconcile here IS the illegal read: it
-  would scan the table on an internal connection while the reader's own
-  transaction is open — the very read that left the baseline empty — and on the
-  deferring connection that transaction is open by construction. The debt is
-  paid where it can be: at that transaction's COMMIT, at an explicit
-  `dbsp_sync()`, or by a ROLLBACK's rebuild. `dbsp_view_state` is not gated,
-  and not because anyone weighed it up: it takes no view argument, so there is
-  no view for the gate to ask about. Its numbers are diagnostics anyway, and a
-  diagnostic that refuses while the state is broken is useless exactly when it
-  is needed.
-  Pinned by `test/python/test_unseeded_read.py`. (`da9164f`.)
+  1. **APPLY** — `apply_captured_deltas` refuses any table that is not
+     `Seeded` (`serves_exact_delta()`) and hands it back to the commit, which
+     reconciles it by scan at that same commit. Without this, another
+     connection's commits applied their deltas onto an empty baseline and read
+     the deltas alone for the length of the window — `view 1.0 / sql 11.0`,
+     `2.0 / 12.0`, `3.0 / 13.0` over three commits, self-healing later and a
+     wrong answer with no error while it lasted.
+  2. **READ** — `view_read_block` walks a view's sources transitively and
+     returns the WORST state in the tree; `RefuseIfUnseeded`
+     (`src/dbsp_extension.cpp`) throws unless it is `Seeded`. A pure read during
+     the window returned the unseeded value too — `dbsp_query('mv')`
+     `[(None,)]` against plain SQL `10.0`, on the deferring connection and on
+     every other one, on `:memory:` and on a file; `dbsp_changes` was worse
+     still, serving `[(None,-1),(10.0,1)]` on a connection whose `dbsp_query`
+     said NULL.
 
-  A reconcile that FAILS must not retire the debt. `sync_tables` returns false
-  when a table it was asked about was not scanned, reports it through
-  `record_error_best_effort` and on stderr, and the commit clears the flag only
-  on success — clearing it first meant one failed scan left the baseline empty
-  for the life of the connection, silently.
+  **Readiness, and why any connection can pay.** `Deferred` and `Provisional`
+  each carry a watermark — a transaction-manager start timestamp their debt's
+  transaction has passed once it ends — and both are compared against
+  `DuckTransactionManager::LowestActiveStart()` by one predicate. A table is
+  scanned only once its watermark has cleared, so a scan can never establish a
+  baseline that a still-open transaction would have changed. That is what makes
+  the debt safe to pay from ANY connection's commit hook, including a commit
+  that touched nothing at all — which is the case the provisional reproduction
+  needs, where the connection that repairs the view is a bare `SELECT 1` on the
+  other connection. It is also what lets the READ path attempt the repair
+  (guarded by "the reader holds no transaction of its own"), so the first read
+  after the window answers instead of refusing.
 
-  This is the third defect of the same family in this work — the sweep's DDL,
-  the sweep's catalog-version read, and the seeding scan. **The law is now
-  enforceable** rather than a rule in a comment: every helper that opens an
-  internal connection takes an explicit `InternalReadPolicy` and
+  `Unseeded` is deliberately NOT swept. `dbsp_track()`'s contract is an
+  explicit `dbsp_sync()`, and scanning it here would establish a baseline
+  without `seed_baseline`'s concurrency check
+  (`mark_provisional_if_concurrent`) — a table tracked while another connection
+  held a write open would be marked trusted while short.
+
+  **Only a scan that could see everything may establish a baseline.**
+  `install_rebuild` / `finish_rebuild` take `establishes`, and a scan run while
+  a user transaction is open passes `false`: it REFRESHES the content and
+  leaves a `Deferred` debt standing. Measured without it: crash recovery's
+  `resync_tracked_tables`, which runs from `QueryBegin` and can be inside the
+  very transaction that deferred the seed, marked the baseline trusted from a
+  committed-only read and the commit then reconciled nothing — `view 10.0`
+  where SQL read `13.0`.
+
+  **A reconcile that FAILS must not retire the debt.** `sync_tables` returns
+  false when a table it was asked about was not scanned, reports it through
+  `record_error_best_effort` and on stderr, and nothing is retired on a failed
+  scan — the per-table state stands and the next commit tries again. Clearing
+  first meant one failed scan left the baseline empty for the life of the
+  connection, silently.
+
+  The commit hook is therefore one sweep and one `sync_all`: the sweep pays
+  named debts, and `sync_all` survives only for `unknown_writes` — a write we
+  could not attribute, where nothing names a table. Pinned by
+  `test/python/test_unseeded_read.py`, `test_provisional_baseline.py`,
+  `test_create_view_seeding.py`, `test_reconcile_telemetry.py` and, in ctest,
+  `cdc: one baseline state drives both the apply path and the read path`, which
+  flips the state once and asserts both consultation points flip with it.
+
+  This is the third defect family of the internal-connection kind in this work
+  — the sweep's DDL, the sweep's catalog-version read, and the seeding scan.
+  **The law is enforceable** rather than a rule in a comment: every helper that
+  opens an internal connection takes an explicit `InternalReadPolicy` and
   `DBSP_STRICT_INTERNAL_QUERY=1` turns a `Forbidden` call inside an open user
   transaction into a throw naming the site (see *The internal-connection law is
   enforceable* below). The seeding scan is `Forbidden`; the two scans that run
   from `QueryBegin` — `rebuild_all_views` and `materialize_all_deferred` →
   `materialize_deferred_locked` — are whitelisted at their call sites, because
-  both REFRESH a baseline that already exists rather than establishing one. That
-  whitelist is a JUDGEMENT, not a proof: the commit reconcile appears to cover
-  the window they open, and nothing pins it. What has changed is that anything
-  NEW opening an internal connection has to answer the question in code.
+  both REFRESH a baseline that already exists rather than establishing one.
+  That whitelist is a JUDGEMENT, not a proof: the commit reconcile appears to
+  cover the window they open, and nothing pins it. What has changed is that
+  anything NEW opening an internal connection has to answer the question in
+  code.
 - **A baseline is only "seeded" once something has scanned it.** The public
   `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
   `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
   because nothing scanned it" from "empty because the table is empty" and seed
   it itself. Anything else that replays a baseline as though it were table
   content must ask the same question.
-- **OPEN — the provisional read gate costs AVAILABILITY it need not cost.**
-  While a source is PROVISIONAL, `dbsp_query` / `dbsp_changes` refuse on every
-  connection that cannot repair the baseline. That is required for a reader
+- **OPEN (narrowed) — the read gate still costs AVAILABILITY while the window
+  is open.** A reader that holds no transaction of its own now RUNS the repair
+  sweep before refusing, so any baseline whose watermark has cleared is scanned
+  and served rather than refused. What remains is the window itself: while the
+  deferring or seeding transaction is still alive, `dbsp_query` /
+  `dbsp_changes` refuse on every connection. That is required for a reader
   INSIDE the deferring transaction, whose own uncommitted writes the baseline
   cannot contain. It is NOT required for an ordinary autocommit reader on
   another connection: that reader's snapshot cannot see the deferring writes
@@ -543,11 +580,12 @@ and the strict switch's structural blindness to commit hooks.
   rolling it straight back — a start timestamp newer than every transaction
   alive at that moment.
 
-  While provisional, both apply paths refuse the table exactly as they refuse
-  an unseeded one, so it rides the `failed` → scan-reconcile route on every
-  connection's commit. The retirement is a sweep in the commit hook
-  (`reconcile_ready_provisional`, guarded so it runs AFTER this commit's own
-  deltas were handled and cannot double-count): once `LowestActiveStart()` has
+  While provisional, the apply path refuses the table exactly as it refuses an
+  unseeded one — one enum, one predicate — so it rides the `failed` →
+  scan-reconcile route on every connection's commit. The retirement is a sweep in the commit hook
+  (`reconcile_untrusted_baselines`, run from a destructor so it fires on every
+  path out of the hook, and AFTER this commit's own deltas were handled so it
+  cannot double-count): once `LowestActiveStart()` has
   risen to the watermark, every transaction that existed at seed time has ended
   and one scan pays the debt. It has to be a sweep and not just the apply path,
   because in the reproduction the connection that repairs the view is the one

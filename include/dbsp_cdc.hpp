@@ -55,28 +55,6 @@
 
 namespace dbsp_native {
 
-// Callbacks the extension installs at load so the CDC core can talk to the
-// per-connection transaction state (DBSPContextState) without depending on its
-// header — that header includes THIS one, so the edge only goes one way.
-//
-// Empty when the core is used without the extension (the in-tree benchmarks
-// and unit tests), which is why every call site checks before invoking.
-struct TxnBookkeeping {
-  // "A baseline was deliberately left unseeded on this connection." It could
-  // not be established now because reading committed state on an internal
-  // connection would have missed the open transaction's uncommitted rows (see
-  // seed_baseline). The connection state remembers it until something repairs
-  // it: a COMMIT under auto-sync widens itself to a full scan-and-diff, and a
-  // ROLLBACK — which has no commit to reconcile — rebuilds every view from
-  // committed storage instead.
-  std::function<void(duckdb::ClientContext &)> baseline_unseeded;
-};
-
-inline TxnBookkeeping &txn_bookkeeping() {
-  static TxnBookkeeping cb;
-  return cb;
-}
-
 // D-lazy: number of views realize_pending_view[_locked] has actually
 // decoded (a stash found and processed), across every CDCManager in the
 // process. Test-observable counter (g_* convention, see
@@ -2445,7 +2423,10 @@ public:
               // rebuild, and the transaction's own writes still arrive through
               // its triggers and its commit reconcile.
               InternalReadPolicy::AllowedInTxn, "rebuild_all_views");
-          table.install_rebuild();
+          // REFRESHES a baseline; it must not retire a DEFERRED seeding debt,
+          // because it runs from QueryBegin and may be inside the very
+          // transaction whose openness deferred that seed.
+          table.install_rebuild(!user_transaction_open(context));
           fold_fresh_baseline(context, name, table,
                               InternalReadPolicy::AllowedInTxn,
                               "rebuild_all_views (baseline fold)");
@@ -2895,7 +2876,7 @@ public:
           // track_table_internal does for auto-tracked sources: scan, then
           // discard the pending changes, because the replay below IS the
           // initialization and the delta must not be applied twice.
-          if (!tracked_tables_.at(source)->baseline_seeded() &&
+          if (!tracked_tables_.at(source)->established() &&
               !seed_baseline(context, source)) {
             // A seeding scan that FAILED must not fall through to the replay:
             // that would build the view over the empty baseline, which is the
@@ -3907,12 +3888,12 @@ public:
           continue;
         }
         auto it = tracked_tables_.find(table_names[i]);
-        if (it == tracked_tables_.end() || !it->second->is_provisional()) {
+        if (it == tracked_tables_.end() ||
+            it->second->baseline() != TrackedTable::Baseline::Provisional) {
           continue;
         }
-        if (provisional_watermark_cleared(context, table_names[i],
-                                          *it->second)) {
-          it->second->clear_provisional();
+        if (ready_watermark_cleared(context, table_names[i], *it->second)) {
+          it->second->retire_provisional();
           provisional_count_--;
         }
       }
@@ -4444,35 +4425,33 @@ public:
     return it->second.get();
   }
 
-  // Why a READ of this view cannot be served, if it cannot.
+  // Why a READ of this view cannot be served, if it cannot. The question is
+  // the same one the apply path asks — the worst TrackedTable::Baseline in the
+  // view's source tree — and the states are defined there.
   //
-  // UNSEEDED: the baseline is EMPTY because nothing has scanned it yet, not
-  // because the table is empty (TrackedTable::baseline_seeded). A view
-  // replayed over one holds the empty answer — measured, `dbsp_query`
-  // returned NULL where SQL read 10.0, on the connection holding
-  // `BEGIN; dbsp_create_view(...)` open AND on every other connection, until
-  // that transaction ended.
+  // A view replayed over an UNSEEDED baseline holds the empty answer:
+  // measured, `dbsp_query` returned NULL where SQL read 10.0, on the
+  // connection holding `BEGIN; dbsp_create_view(...)` open AND on every other
+  // connection, until that transaction ended.
   //
-  // PROVISIONAL: the baseline was seeded correctly from committed storage
-  // while ANOTHER connection held a transaction open, so it may be short by
-  // what that transaction had already written to the table before it was
-  // tracked (TrackedTable::mark_provisional). The repair is a scan taken once
-  // that transaction ends, and it runs from the COMMIT hook — which fires
-  // AFTER the bind that serves a read. So the FIRST read after the deferring
-  // transaction's commit, with no statement in between, was served from the
-  // short baseline: measured `view 10.0 / sql 13.0` on both backends, with
-  // the very next read returning 13.0. A transiently wrong answer with no
-  // error is the one thing the design does not allow, so the read surfaces
-  // ask this question too.
+  // A PROVISIONAL source is repaired by a scan that runs from the COMMIT hook,
+  // which fires AFTER the bind that serves a read. So the FIRST read after the
+  // deferring transaction's commit, with no statement in between, was served
+  // from the short baseline: measured `view 10.0 / sql 13.0` on both backends,
+  // with the very next read returning 13.0. A transiently wrong answer with no
+  // error is the one thing the design does not allow, so the read surfaces ask
+  // this question too.
   //
   // Sources can be other views, so the walk is transitive. A cyclic definition
   // cannot be created (create_view rejects cycles), but `seen` keeps a
   // corrupted one from looping. UNSEEDED is reported in preference to
   // PROVISIONAL: it is the stricter condition and it cannot be repaired by a
   // scan at all.
+  //
+  // CONSULTATION POINT 2 of 2: the WORST TrackedTable::Baseline in the view's
+  // source tree, and the table holding it. SEEDED means the read may proceed.
   struct ViewReadBlock {
-    enum class Kind { None, Unseeded, Provisional };
-    Kind kind = Kind::None;
+    TrackedTable::Baseline state = TrackedTable::Baseline::Seeded;
     std::string table;
   };
 
@@ -5189,18 +5168,11 @@ public:
         failed.push_back(table_name);
         continue;
       }
-      // Same rule as apply_captured_delta above: an unseeded baseline is
-      // empty only because nothing has scanned it, and an exact delta applied
-      // onto it makes the view hold the delta alone. Reconcile by scan.
-      if (!it->second->baseline_seeded()) {
-        failed.push_back(table_name);
-        continue;
-      }
-      // Same refusal for a PROVISIONAL baseline: seeded, correct for committed
-      // storage, and possibly short by what a concurrently open transaction had
-      // already written before the table was tracked. Reconcile by scan until
-      // the watermark clears (TrackedTable::mark_provisional).
-      if (it->second->is_provisional()) {
+      // CONSULTATION POINT 1 of 2. Only a SEEDED baseline serves an exact
+      // delta; UNSEEDED and PROVISIONAL are handed back to the caller, which
+      // reconciles them by scan at this same commit (TrackedTable::Baseline
+      // says what each state costs and what repairs it).
+      if (!it->second->serves_exact_delta()) {
         failed.push_back(table_name);
         continue;
       }
@@ -5239,43 +5211,79 @@ public:
   // in the ordinary single-writer session, and tests assert that.
   uint64_t provisional_tables() const { return provisional_count_.load(); }
 
-  // Scan any table whose provisional watermark has cleared, once, and retire
-  // it. Runs from the commit hook AFTER this commit's own deltas were handled,
-  // so a table that is still provisional had its delta refused and scanned
-  // already — the scan here can never double-count.
+  // Every tracked table whose baseline is not SEEDED and whose debt a scan of
+  // committed storage can pay right now, BY NAME. This is what the commit hook
+  // scans, and it replaces both a per-connection "somewhere a baseline is
+  // unseeded" flag — which named no table and could therefore only be paid by
+  // a full sync_all — and a separate provisional-only sweep.
+  //
+  // A table is included only once its readiness watermark has cleared. For
+  // DEFERRED that means the transaction whose openness deferred the seed has
+  // ENDED, so a scan of committed storage now sees the rows it could not see
+  // before; for PROVISIONAL it means every transaction alive at seed time has
+  // ended, so the scan finally sees the pre-tracking write. Scanning earlier
+  // would read the same incomplete state again and, worse, would mark the
+  // baseline TRUSTED while it is still short.
+  //
+  // Cost in the steady state: a shared lock and one enum load per tracked
+  // table, with no table ever returned.
+  std::vector<std::string> untrusted_baselines(duckdb::ClientContext &context) {
+    std::vector<std::string> out;
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    for (const auto &[name, table] : tracked_tables_) {
+      const auto state = table->baseline();
+      // UNSEEDED is NOT a debt. The public dbsp_track() leaves a baseline
+      // empty ON PURPOSE and documents dbsp_sync() as the way to fill it;
+      // scanning it here would both cost a scan nobody asked for and, worse,
+      // establish a baseline WITHOUT the concurrency check seed_baseline runs
+      // (mark_provisional_if_concurrent), so a table tracked while another
+      // connection held a write open would be marked trusted while short.
+      if (state != TrackedTable::Baseline::Deferred &&
+          state != TrackedTable::Baseline::Provisional) {
+        continue;
+      }
+      if (ready_watermark_cleared(context, name, *table)) {
+        out.push_back(name);
+      }
+    }
+    return out;
+  }
+
+  // Scan every table untrusted_baselines() names, once. Runs from the commit
+  // hook AFTER this commit's own deltas were handled, so a table that is still
+  // untrusted had its delta refused and scanned already — the scan here can
+  // never double-count. sync_tables seeds what it scans and retires a
+  // provisional baseline whose scan SUCCEEDED.
   //
   // This is the step that repairs a view no later commit happens to touch: in
   // the reproduction, connection A's pre-tracking INSERT commits and it is the
   // NEXT statement on B — a bare `SELECT 1` — whose commit finds the watermark
   // clear and pays the scan.
   //
-  // Steady-state cost: one relaxed atomic load. The count is zero unless a
-  // table was seeded while another transaction was open.
-  void reconcile_ready_provisional(duckdb::ClientContext &context,
-                                   InternalReadPolicy policy,
-                                   const char *site) {
-    if (provisional_count_.load() == 0) {
-      return;
+  // The READ path calls it too, guarded by "the reader holds no transaction of
+  // its own". That is safe for exactly the reason the watermark exists: a table
+  // whose deferring or seeding transaction is still alive is not ready, so a
+  // reader can never establish a baseline the open transaction would have
+  // changed. It is what lets the first read after a ROLLBACK answer instead of
+  // refusing.
+  //
+  // Returns false when a scan it asked for did not run, so a caller that
+  // treats "the commit reconciled" as "the baseline is now seeded" cannot be
+  // misled. Nothing is retired on a failed scan: the per-table state stands
+  // and the next commit tries again.
+  bool reconcile_untrusted_baselines(duckdb::ClientContext &context,
+                                     InternalReadPolicy policy,
+                                     const char *site) {
+    std::vector<std::string> owed = untrusted_baselines(context);
+    if (owed.empty()) {
+      return true;
     }
     if (std::getenv("DBSP_DEBUG_SEED")) {
-      std::cerr << "[dbsp] provisional sweep: count="
-                << provisional_count_.load() << " site=" << site << "\n";
+      std::cerr << "[dbsp] untrusted-baseline sweep: " << owed.size()
+                << " table(s) site=" << site << "\n";
     }
-    std::vector<std::string> ready;
-    {
-      std::shared_lock<std::shared_mutex> lock(struct_mutex_);
-      for (const auto &[name, table] : tracked_tables_) {
-        if (table->is_provisional() &&
-            provisional_watermark_cleared(context, name, *table)) {
-          ready.push_back(name);
-        }
-      }
-    }
-    if (ready.empty()) {
-      return;
-    }
-    // sync_tables retires each one whose scan succeeded.
-    sync_tables(context, ready, /*do_parallel=*/false, nullptr, policy, site);
+    return sync_tables(context, owed, /*do_parallel=*/false, nullptr, policy,
+                       site);
   }
 
   // Monotonic count of baseline mutations, advanced on every propagated
@@ -5689,8 +5697,13 @@ private:
 
       // Diff against the previous baseline and swap the new one in
       // (spill mode: digest-index compare + on-disk payloads; RAM mode:
-      // whole-map diff + move)
-      return it->second->finish_rebuild();
+      // whole-map diff + move).
+      //
+      // It ESTABLISHES the baseline only when no user transaction is open. A
+      // scan taken inside one cannot see that transaction's rows, so it
+      // refreshes content without retiring a DEFERRED seeding debt — the debt
+      // is paid at that transaction's commit, where the scan can see it all.
+      return it->second->finish_rebuild(!user_transaction_open(context));
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
@@ -5978,11 +5991,12 @@ private:
 
   // Caller holds struct_mutex_ and view_mutex_ shared. See view_read_block().
   // Keeps walking after finding a PROVISIONAL source so an UNSEEDED one
-  // anywhere in the tree wins.
+  // anywhere in the tree wins — the enum is ordered worst-first, so "worst
+  // wins" is a `<` on it and needs no second ranking of its own.
   void view_read_block_locked(const std::string &name,
                               std::unordered_set<std::string> &seen,
                               ViewReadBlock &out) {
-    if (out.kind == ViewReadBlock::Kind::Unseeded) {
+    if (out.state == TrackedTable::Baseline::Unseeded) {
       return; // nothing outranks this
     }
     if (!seen.insert(name).second) {
@@ -5990,11 +6004,9 @@ private:
     }
     auto tbl = tracked_tables_.find(name);
     if (tbl != tracked_tables_.end()) {
-      if (!tbl->second->baseline_seeded()) {
-        out = {ViewReadBlock::Kind::Unseeded, name};
-      } else if (tbl->second->is_provisional() &&
-                 out.kind == ViewReadBlock::Kind::None) {
-        out = {ViewReadBlock::Kind::Provisional, name};
+      const auto state = tbl->second->baseline();
+      if (state < out.state) {
+        out = {state, name};
       }
       return;
     }
@@ -6004,7 +6016,7 @@ private:
     }
     for (const auto &src : vw->second->source_tables()) {
       view_read_block_locked(src, seen, out);
-      if (out.kind == ViewReadBlock::Kind::Unseeded) {
+      if (out.state == TrackedTable::Baseline::Unseeded) {
         return;
       }
     }
@@ -6017,8 +6029,16 @@ private:
                 << " user_txn_open=" << user_transaction_open(context) << "\n";
     }
     if (user_transaction_open(context)) {
-      if (txn_bookkeeping().baseline_unseeded) {
-        txn_bookkeeping().baseline_unseeded(context);
+      // Record the debt ON THE TABLE, which is where the baseline lives. Both
+      // consultation points already refuse to trust a DEFERRED baseline, and
+      // the commit hook's sweep finds it BY NAME and pays it with one scoped
+      // scan — from any connection, once the deferring transaction has ended.
+      // It used to be a sticky per-CONNECTION boolean that named no table, so
+      // only a full sync_all on that one connection could pay it.
+      auto it = tracked_tables_.find(table_name);
+      if (it != tracked_tables_.end()) {
+        it->second->mark_seed_deferred(
+            deferring_watermark(context, table_name));
       }
       return true;
     }
@@ -6034,6 +6054,35 @@ private:
       mark_provisional_if_concurrent(context, table_name, *it->second);
     }
     return true;
+  }
+
+  // A timestamp the deferring transaction's END passes: its own start + 1, so
+  // `lowest_active_start >= watermark` is exactly "that transaction is no
+  // longer active". Zero (no DuckDB transaction manager, or the lookup threw)
+  // reads as "nothing to wait on", which is the behaviour of every catalog
+  // that cannot answer the question.
+  //
+  // DuckDB removes a transaction from the active set inside Commit(), which
+  // runs BEFORE the TransactionCommit callbacks
+  // (duckdb/src/transaction/transaction_context.cpp), so the deferring
+  // connection's own commit hook already sees the watermark cleared and pays
+  // the debt there — which is where it was paid before this became per-table.
+  uint64_t deferring_watermark(duckdb::ClientContext &context,
+                               const std::string &table_name) {
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return 0;
+      }
+      if (lowest_active_start(*attached) == 0) {
+        return 0; // catalog has no DuckDB transaction manager
+      }
+      return static_cast<uint64_t>(
+                 duckdb::DuckTransaction::Get(context, *attached).start_time) +
+             1;
+    } catch (...) {
+      return 0;
+    }
   }
 
   // A baseline scanned from committed storage is short by whatever an ALREADY
@@ -6079,7 +6128,7 @@ private:
       if (watermark == 0) {
         return;
       }
-      if (!table.is_provisional()) {
+      if (table.baseline() != TrackedTable::Baseline::Provisional) {
         provisional_count_++;
       }
       table.mark_provisional(watermark);
@@ -6097,13 +6146,14 @@ private:
     }
   }
 
-  // Has every transaction that was active when `table` was seeded ended?
-  // Zero watermark (not provisional, or no DuckDB transaction manager) reads
-  // as cleared.
-  bool provisional_watermark_cleared(duckdb::ClientContext &context,
-                                     const std::string &table_name,
-                                     const TrackedTable &table) {
-    const uint64_t watermark = table.provisional_watermark();
+  // Has the transaction this table's state is waiting on ended? PROVISIONAL
+  // waits on every transaction that was active when it was seeded; DEFERRED
+  // waits on the one whose openness deferred the seed. Zero watermark (nothing
+  // to wait on, or no DuckDB transaction manager) reads as cleared.
+  bool ready_watermark_cleared(duckdb::ClientContext &context,
+                               const std::string &table_name,
+                               const TrackedTable &table) {
+    const uint64_t watermark = table.ready_watermark();
     if (watermark == 0) {
       return true;
     }
@@ -6114,7 +6164,7 @@ private:
       }
       const uint64_t lowest = lowest_active_start(*attached);
       if (std::getenv("DBSP_DEBUG_SEED")) {
-        std::cerr << "[dbsp] provisional check " << table_name
+        std::cerr << "[dbsp] watermark check " << table_name
                   << " lowest=" << lowest << " watermark=" << watermark
                   << "\n";
       }
