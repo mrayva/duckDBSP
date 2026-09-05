@@ -314,9 +314,10 @@ suite is minutes, not hours:
 
 | Run | Result |
 |---|---|
-| `ctest -j4` | **45/45 passed**, 78.9 s |
-| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 55.1 s |
-| `test_trigger_source` alone | **34 cases, 980 assertions** |
+| `ctest -j4` | **45/45 passed**, 118.7 s |
+| `DBSP_TEST_VERIFY_VECTORS=1 ctest -j4` | **45/45 passed**, 92.6 s |
+| `DBSP_STRICT_INTERNAL_QUERY=1 ctest -j4` | **45/45 passed**, 87.8 s |
+| `test_trigger_source` alone | **35 cases, 1002 assertions** |
 | `test_dml_shapes` alone | **10 cases, 352 assertions** |
 
 On the PyPI wheel `duckdb==1.6.0.dev379`

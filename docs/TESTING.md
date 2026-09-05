@@ -168,7 +168,7 @@ self-consistently wrong would pass a weight assertion.
 
 ```bash
 cd test/build_test
-./test_trigger_source       # 34 cases, 980 assertions
+./test_trigger_source       # 35 cases, 1002 assertions
 ```
 
 Beyond the oracle it pins the paths specific to this source: the C++
