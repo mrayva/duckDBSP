@@ -1,5 +1,102 @@
 # Changelog
 
+## Quality round — one baseline state, one DDL parser — 2026-09-04
+
+Restructuring, not behaviour change: the suite passes unmodified in all three
+ctest modes and every seeding/DDL Python script still passes. Two defects the
+old shape was hiding are fixed on the way through, and both are named below.
+
+**One `TrackedTable::Baseline`, consulted at exactly two points.** "Is this
+table's baseline trustworthy right now?" was stored five ways — `deferred_`,
+`baseline_seeded_` and `provisional_watermark_` on the table, a sticky
+per-CONNECTION `unseeded_baseline_` on `DBSPContextState`, and a third
+`ViewReadBlock::Kind` re-derived at the read gate. They are now one enum,
+`{Unseeded, Deferred, Provisional, Seeded}`, owned by the per-instance table and
+asked by exactly two callers: the delta APPLY path
+(`apply_captured_deltas`, one `serves_exact_delta()` where three sequential
+refusals stood) and the READ path (`view_read_block`, which returns the worst
+state in the source tree instead of maintaining a parallel enum).
+
+The commit hook now does one thing: `reconcile_untrusted_baselines` scans every
+tracked table that is not `Seeded` and whose readiness watermark has cleared,
+BY NAME. That deletes the whole apparatus the per-connection flag needed,
+because that flag named no table and so could only ever be paid by a full
+`sync_all`:
+
+- `DBSPContextState::note_unseeded_baseline` and `unseeded_baseline_`;
+- the `TxnBookkeeping` `std::function` trampoline in `dbsp_cdc.hpp` and its
+  LOAD-time installation in `src/dbsp_extension.cpp` — a global installed at
+  extension load to route one boolean across an include edge;
+- the commit-time widening (`unknown_writes = true; saw_statements = true;` on
+  a transaction that may have seen no statements, set to defeat an early return
+  three branches below) and the `settle()` lambda that undid it;
+- `TransactionRollback`'s unseeded special case — a rollback owes nothing
+  special now: the table's own state stands and the next commit, or the next
+  read that is allowed to repair, scans it;
+- `ViewReadBlock::Kind`, and `baseline_seeded()` / `is_provisional()` /
+  `clear_provisional()`.
+
+`unknown_writes` survives only where it still means "a write we could not
+attribute", and `sync_all` survives only there — one full scan in the hook
+instead of four.
+
+**Defect fixed: a scan taken inside the deferring transaction retired the debt
+without paying it.** Crash recovery's `resync_tracked_tables` runs from
+`QueryBegin`, which can be inside the very transaction whose openness deferred
+a seeding scan. It set `baseline_seeded_` from a committed-only read, and with
+the debt now per-table that would have retired it — measured, `view 10.0` where
+SQL read `13.0`. `install_rebuild` / `finish_rebuild` now take `establishes`,
+and a scan run while a user transaction is open REFRESHES content without
+clearing a `Deferred` state. The old code survived this only because its
+connection flag was a second, redundant copy.
+
+**A `Deferred` baseline carries a readiness watermark**, taken the same way
+`Provisional` does and compared against the same
+`DuckTransactionManager::LowestActiveStart()`: the deferring transaction's own
+start + 1. Nothing scans an untrustworthy baseline before the transaction it is
+waiting on has ended, so the sweep can safely run on EVERY connection's commit,
+and the read path can run it too — which is what lets the first read after the
+window answer instead of refusing. `UNSEEDED` is deliberately not swept: the
+public `dbsp_track()` leaves a baseline empty by design and documents
+`dbsp_sync()` as the fill, and scanning it here would establish a baseline
+without `seed_baseline`'s concurrency check.
+
+New pin: `cdc: one baseline state drives both the apply path and the read path`
+flips the state once and asserts BOTH consultation points flip with it — a read
+refused and an exact delta refused while it is not `Seeded`, a read served and
+an exact delta applied with no scan once it is.
+
+**One DDL parser.** `include/dbsp_parser_extension.hpp` carried two: a
+token-text one (`ParseCreateMaterializedView` / `ParseDropMaterializedView` /
+`ParseRefreshMaterializedView`, three `ParserExtensionParseData` subclasses and
+the unused `MaterializedViewStatementType` enum) and the raw-text
+`dbsp_rewrite_mv_ddl` the `parser_override` uses. They accepted different DDL
+and reported different errors, which is a maintenance liability that had
+already produced one "indistinguishable from success" failure mode.
+
+The token entry point stays — it is genuinely reachable (`SET
+allow_parser_override_extension='DEFAULT'` after LOAD, and an embedding whose
+build lacks the setting) — but it now rejoins its tokens and hands the string to
+the SAME parser. `dbsp_parse_mv_ddl` produces one `MvDdl` struct;
+`dbsp_mv_ddl_call` formats it as SQL for the override; one
+`MaterializedViewParseData` carries it for the token path, and
+`MaterializedViewPlan` switches on `MvDdl::Kind` where a three-way
+`dynamic_cast` chain stood. The two routes now differ in exactly one respect,
+and it is inherent to the input: token slices rejoined with single spaces
+normalise the stored SQL, where the override sees the user's own bytes.
+
+`DROP` and `REFRESH` no longer require a REGISTRABLE view name — they only look
+a view up, and "does not exist" is a better answer for `REFRESH MATERIALIZED
+VIEW s2.qv` than a parse error about a name the caller was never going to
+register. `CREATE` is unchanged and still refuses one.
+
+**Rot.** `apply_captured_delta` (singular) is deleted: zero callers, and its
+body was a verbatim copy of the plural's refusal ladder — the copy a state-model
+change has to keep in sync, and the one that was never run. History-narrating
+comments in the touched files now state the invariant instead, and
+`live_watermark`'s two stacked doc comments (the first superseded by the second
+and never removed) are one.
+
 ## Fix round 1 — a provisional baseline is not readable either — 2026-09-04
 
 **The FIRST read after the deferring transaction's COMMIT returned a stale

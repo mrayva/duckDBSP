@@ -14,221 +14,6 @@ namespace dbsp_native {
 
 using namespace duckdb;
 
-//===--------------------------------------------------------------------===//
-// Parse Data Structures
-//===--------------------------------------------------------------------===//
-
-// Statement types for materialized views
-enum class MaterializedViewStatementType {
-    CREATE,
-    DROP,
-    REFRESH
-};
-
-// Parse data for CREATE MATERIALIZED VIEW
-struct CreateMaterializedViewParseData : public ParserExtensionParseData {
-    string view_name;
-    string select_query;
-    bool if_not_exists = false;
-    bool or_replace = false;
-
-    unique_ptr<ParserExtensionParseData> Copy() const override {
-        auto result = make_uniq<CreateMaterializedViewParseData>();
-        result->view_name = view_name;
-        result->select_query = select_query;
-        result->if_not_exists = if_not_exists;
-        result->or_replace = or_replace;
-        return std::move(result);
-    }
-
-    string ToString() const override {
-        string result = "CREATE";
-        if (or_replace) {
-            result += " OR REPLACE";
-        }
-        result += " MATERIALIZED VIEW";
-        if (if_not_exists) {
-            result += " IF NOT EXISTS";
-        }
-        result += " " + view_name + " AS " + select_query;
-        return result;
-    }
-};
-
-// Parse data for DROP MATERIALIZED VIEW
-struct DropMaterializedViewParseData : public ParserExtensionParseData {
-    string view_name;
-    bool if_exists = false;
-    bool cascade = false;
-
-    unique_ptr<ParserExtensionParseData> Copy() const override {
-        auto result = make_uniq<DropMaterializedViewParseData>();
-        result->view_name = view_name;
-        result->if_exists = if_exists;
-        result->cascade = cascade;
-        return std::move(result);
-    }
-
-    string ToString() const override {
-        string result = "DROP MATERIALIZED VIEW";
-        if (if_exists) {
-            result += " IF EXISTS";
-        }
-        result += " " + view_name;
-        if (cascade) {
-            result += " CASCADE";
-        }
-        return result;
-    }
-};
-
-// Parse data for REFRESH MATERIALIZED VIEW
-struct RefreshMaterializedViewParseData : public ParserExtensionParseData {
-    string view_name;
-
-    unique_ptr<ParserExtensionParseData> Copy() const override {
-        auto result = make_uniq<RefreshMaterializedViewParseData>();
-        result->view_name = view_name;
-        return std::move(result);
-    }
-
-    string ToString() const override {
-        return "REFRESH MATERIALIZED VIEW " + view_name;
-    }
-};
-
-//===--------------------------------------------------------------------===//
-// Parser Functions
-//===--------------------------------------------------------------------===//
-
-// Parse CREATE [OR REPLACE] MATERIALIZED VIEW statement
-inline ParserExtensionParseResult ParseCreateMaterializedView(const string &query) {
-    // Simple regex-based parsing for now
-    // Format: CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] name AS select_query
-
-    auto query_upper = StringUtil::Upper(query);
-
-    // Check for CREATE OR REPLACE MATERIALIZED VIEW first (longer prefix) —
-    // plain CREATE MATERIALIZED VIEW does not match it, so order matters.
-    static const string kOrReplacePrefix = "CREATE OR REPLACE MATERIALIZED VIEW";
-    static const string kCreatePrefix = "CREATE MATERIALIZED VIEW";
-
-    bool or_replace = false;
-    size_t pos;
-    if (query_upper.find(kOrReplacePrefix) == 0) {
-        or_replace = true;
-        pos = kOrReplacePrefix.length();
-    } else if (query_upper.find(kCreatePrefix) == 0) {
-        pos = kCreatePrefix.length();
-    } else {
-        return ParserExtensionParseResult(); // Not our statement
-    }
-
-    auto result = make_uniq<CreateMaterializedViewParseData>();
-    result->or_replace = or_replace;
-
-    // Extract IF NOT EXISTS
-    while (pos < query.length() && std::isspace(query[pos])) pos++;
-
-    if (query_upper.find("IF NOT EXISTS", pos) == pos) {
-        result->if_not_exists = true;
-        pos += strlen("IF NOT EXISTS");
-        while (pos < query.length() && std::isspace(query[pos])) pos++;
-    }
-
-    // Extract view name (up to AS keyword)
-    size_t as_pos = query_upper.find(" AS ", pos);
-    if (as_pos == string::npos) {
-        return ParserExtensionParseResult("Missing AS keyword in CREATE MATERIALIZED VIEW");
-    }
-
-    result->view_name = query.substr(pos, as_pos - pos);
-    StringUtil::Trim(result->view_name);
-
-    // Extract SELECT query (everything after AS)
-    pos = as_pos + 4; // Skip " AS "
-    result->select_query = query.substr(pos);
-    StringUtil::Trim(result->select_query);
-
-    // Remove trailing semicolon if present
-    if (!result->select_query.empty() && result->select_query.back() == ';') {
-        result->select_query.pop_back();
-    }
-
-    return ParserExtensionParseResult(std::move(result));
-}
-
-// Parse DROP MATERIALIZED VIEW statement
-inline ParserExtensionParseResult ParseDropMaterializedView(const string &query) {
-    auto query_upper = StringUtil::Upper(query);
-
-    // Check for DROP MATERIALIZED VIEW
-    if (query_upper.find("DROP MATERIALIZED VIEW") != 0) {
-        return ParserExtensionParseResult();
-    }
-
-    auto result = make_uniq<DropMaterializedViewParseData>();
-
-    size_t pos = strlen("DROP MATERIALIZED VIEW");
-    while (pos < query.length() && std::isspace(query[pos])) pos++;
-
-    // Extract IF EXISTS
-    if (query_upper.find("IF EXISTS", pos) == pos) {
-        result->if_exists = true;
-        pos += strlen("IF EXISTS");
-        while (pos < query.length() && std::isspace(query[pos])) pos++;
-    }
-
-    // Extract view name (up to CASCADE/RESTRICT or end)
-    size_t end_pos = query.length();
-    size_t cascade_pos = query_upper.find("CASCADE", pos);
-    size_t restrict_pos = query_upper.find("RESTRICT", pos);
-
-    if (cascade_pos != string::npos) {
-        end_pos = cascade_pos;
-        result->cascade = true;
-    } else if (restrict_pos != string::npos) {
-        end_pos = restrict_pos;
-        result->cascade = false;
-    }
-
-    result->view_name = query.substr(pos, end_pos - pos);
-    StringUtil::Trim(result->view_name);
-
-    // Remove trailing semicolon
-    if (!result->view_name.empty() && result->view_name.back() == ';') {
-        result->view_name.pop_back();
-        StringUtil::Trim(result->view_name);
-    }
-
-    return ParserExtensionParseResult(std::move(result));
-}
-
-// Parse REFRESH MATERIALIZED VIEW statement
-inline ParserExtensionParseResult ParseRefreshMaterializedView(const string &query) {
-    auto query_upper = StringUtil::Upper(query);
-
-    if (query_upper.find("REFRESH MATERIALIZED VIEW") != 0) {
-        return ParserExtensionParseResult();
-    }
-
-    auto result = make_uniq<RefreshMaterializedViewParseData>();
-
-    size_t pos = strlen("REFRESH MATERIALIZED VIEW");
-    while (pos < query.length() && std::isspace(query[pos])) pos++;
-
-    result->view_name = query.substr(pos);
-    StringUtil::Trim(result->view_name);
-
-    // Remove trailing semicolon
-    if (!result->view_name.empty() && result->view_name.back() == ';') {
-        result->view_name.pop_back();
-        StringUtil::Trim(result->view_name);
-    }
-
-    return ParserExtensionParseResult(std::move(result));
-}
-
 // DuckDB 2.0 replaced the PostgreSQL-derived parser with a PEG parser, and
 // with it the parse hook's contract: instead of the raw statement text the
 // extension now receives the tokenized tail of the query from the PEG failure
@@ -254,41 +39,6 @@ inline string dbsp_tokens_to_query(const vector<SimpleToken> &tokens) {
         query += token.text;
     }
     return query;
-}
-
-// Main parse function - tries all statement types
-inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info,
-                                                        const vector<SimpleToken> &tokens) {
-    const auto query = dbsp_tokens_to_query(tokens);
-    auto query_upper = StringUtil::Upper(query);
-
-    ParserExtensionParseResult result;
-    // Try CREATE [OR REPLACE] MATERIALIZED VIEW
-    if (query_upper.find("CREATE OR REPLACE MATERIALIZED VIEW") == 0 ||
-        query_upper.find("CREATE MATERIALIZED VIEW") == 0) {
-        result = ParseCreateMaterializedView(query);
-    } else if (query_upper.find("DROP MATERIALIZED VIEW") == 0) {
-        result = ParseDropMaterializedView(query);
-    } else if (query_upper.find("REFRESH MATERIALIZED VIEW") == 0) {
-        result = ParseRefreshMaterializedView(query);
-    } else {
-        // Not a materialized view statement
-        return result;
-    }
-
-    switch (result.type) {
-    case ParserExtensionResultType::PARSE_SUCCESSFUL:
-        result.consumed_tokens = NumericCast<int64_t>(tokens.size());
-        break;
-    case ParserExtensionResultType::DISPLAY_EXTENSION_ERROR:
-        // A negative count is what makes the peeler surface `error` — a zero
-        // count would silently hand the input to the next extension.
-        result.consumed_tokens = -1;
-        break;
-    default:
-        break;
-    }
-    return result;
 }
 
 //===--------------------------------------------------------------------===//
@@ -509,7 +259,8 @@ inline string dbsp_trimmed(const string &s) {
 // quotes in the message being the only clue that the DDL, not the user, put
 // them there.
 inline bool dbsp_normalize_view_name(const string &raw, string &out,
-                                     string &reason) {
+                                     string &reason,
+                                     bool lookup_only = false) {
     out.clear();
     if (raw.empty()) {
         reason = "the view name is empty";
@@ -537,6 +288,12 @@ inline bool dbsp_normalize_view_name(const string &raw, string &out,
     } else {
         out = raw;
     }
+    if (lookup_only) {
+        // DROP / REFRESH only LOOK the view up. A name no view can carry is
+        // simply not found, and "does not exist" is a better answer than a
+        // parse error about registrability.
+        return true;
+    }
     if (out.find('.') != string::npos) {
         reason = "the view name " + raw +
                  " is qualified; materialized views are registered by a plain "
@@ -559,23 +316,36 @@ inline bool dbsp_normalize_view_name(const string &raw, string &out,
     return true;
 }
 
-// What `dbsp_rewrite_mv_ddl` made of a query.
+// What the parser made of a query.
 enum class MvDdlMatch {
     NotOurs,   // no MATERIALIZED VIEW statement here; stay silent
-    Rewritten, // `out` holds the equivalent call
-    Declined,  // it IS one of ours and could not be rewritten; `reason` says why
+    Rewritten, // it parsed; `out` holds what it means
+    Declined,  // it IS one of ours and could not be parsed; `reason` says why
 };
 
-// Rewrite one MATERIALIZED VIEW DDL statement into the equivalent call on the
-// extension's own functions.
+// One MATERIALIZED VIEW DDL statement, parsed. Both entry points — the
+// raw-text override and the token-stream fallback — produce this, so there is
+// exactly one grammar in the extension and one set of error messages.
+struct MvDdl {
+    enum class Kind { Create, Drop, Refresh };
+    Kind kind = Kind::Create;
+    string name;
+    string body;            // Create only: the SELECT, byte-exact where the
+                            // input was (the override's route)
+    bool or_replace = false; // Create only
+    bool cascade = false;    // Drop only
+    bool if_exists = false;  // Drop only
+};
+
+// THE parser for this extension's DDL.
 //
 // The NotOurs / Declined split exists because a silent decline is how a
 // defect hides: an escaping bug once made every rewrite unparseable, the
 // override declined, the statement fell back to the token path, and the only
 // symptom was that stored SQL stayed normalised. A Declined result is reported
 // by the caller.
-inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
-                                      string &reason) {
+inline MvDdlMatch dbsp_parse_mv_ddl(const string &query, MvDdl &ddl,
+                                    string &reason) {
     size_t pos = dbsp_skip_ws_comments(query, 0);
 
     // Everything below is a single statement. A trailing statement is DECLINED
@@ -599,7 +369,11 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
     };
 
     // Name scan + normalisation, shared by all three statements.
-    auto take_name = [&](string &name) -> bool {
+    // `lookup_only` (DROP / REFRESH) skips the REGISTRABILITY checks: those two
+    // only look a view up, and a name no view can carry simply is not found —
+    // which is the answer the caller wants ("does not exist"), not a parse
+    // error about a name they were never going to register.
+    auto take_name = [&](string &name, bool lookup_only) -> bool {
         const size_t name_start = pos;
         const size_t name_end = dbsp_skip_identifier(query, pos);
         if (name_end == name_start) {
@@ -608,7 +382,7 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
         }
         const string raw = query.substr(name_start, name_end - name_start);
         pos = dbsp_skip_ws_comments(query, name_end);
-        return dbsp_normalize_view_name(raw, name, reason);
+        return dbsp_normalize_view_name(raw, name, reason, lookup_only);
     };
 
     if (dbsp_keyword_at(query, pos, "CREATE")) {
@@ -647,21 +421,18 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
             }
             pos = dbsp_skip_ws_comments(query, p + 6);
         }
-        string name;
-        if (!take_name(name)) {
+        if (!take_name(ddl.name, /*lookup_only=*/false)) {
             return MvDdlMatch::Declined;
         }
         if (!dbsp_keyword_at(query, pos, "AS")) {
             reason = "expected AS after the view name";
             return MvDdlMatch::Declined;
         }
-        string body;
-        if (!single_statement(pos + 2, body)) {
+        if (!single_statement(pos + 2, ddl.body)) {
             return MvDdlMatch::Declined;
         }
-        out = "SELECT * FROM dbsp_create_materialized_view(" +
-              dbsp_sql_literal(name) + ", " + dbsp_sql_literal(body) + ", " +
-              (or_replace ? "true" : "false") + ")";
+        ddl.kind = MvDdl::Kind::Create;
+        ddl.or_replace = or_replace;
         return MvDdlMatch::Rewritten;
     }
 
@@ -685,13 +456,11 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
             if_exists = true;
             pos = dbsp_skip_ws_comments(query, p + 6);
         }
-        string name;
-        if (!take_name(name)) {
+        if (!take_name(ddl.name, /*lookup_only=*/true)) {
             return MvDdlMatch::Declined;
         }
-        bool cascade = false;
         if (dbsp_keyword_at(query, pos, "CASCADE")) {
-            cascade = true;
+            ddl.cascade = true;
             pos = dbsp_skip_ws_comments(query, pos + 7);
         } else if (dbsp_keyword_at(query, pos, "RESTRICT")) {
             pos = dbsp_skip_ws_comments(query, pos + 8);
@@ -703,9 +472,8 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
             reason = "trailing text after the DROP statement";
             return MvDdlMatch::Declined;
         }
-        out = "SELECT * FROM dbsp_drop_materialized_view(" +
-              dbsp_sql_literal(name) + ", " + (cascade ? "true" : "false") +
-              ", " + (if_exists ? "true" : "false") + ")";
+        ddl.kind = MvDdl::Kind::Drop;
+        ddl.if_exists = if_exists;
         return MvDdlMatch::Rewritten;
     }
 
@@ -719,8 +487,7 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
             return MvDdlMatch::NotOurs;
         }
         pos = dbsp_skip_ws_comments(query, pos + 4);
-        string name;
-        if (!take_name(name)) {
+        if (!take_name(ddl.name, /*lookup_only=*/true)) {
             return MvDdlMatch::Declined;
         }
         if (pos < query.size() && query[pos] == ';') {
@@ -730,13 +497,47 @@ inline MvDdlMatch dbsp_rewrite_mv_ddl(const string &query, string &out,
             reason = "trailing text after the REFRESH statement";
             return MvDdlMatch::Declined;
         }
-        out = "SELECT * FROM dbsp_refresh_materialized_view(" +
-              dbsp_sql_literal(name) + ")";
+        ddl.kind = MvDdl::Kind::Refresh;
         return MvDdlMatch::Rewritten;
     }
 
     return MvDdlMatch::NotOurs;
 }
+
+// The equivalent call on the extension's own table functions, as SQL text.
+// Formatting only: `dbsp_parse_mv_ddl` above is the parser.
+inline string dbsp_mv_ddl_call(const MvDdl &ddl) {
+    switch (ddl.kind) {
+    case MvDdl::Kind::Create:
+        return "SELECT * FROM dbsp_create_materialized_view(" +
+               dbsp_sql_literal(ddl.name) + ", " + dbsp_sql_literal(ddl.body) +
+               ", " + (ddl.or_replace ? "true" : "false") + ")";
+    case MvDdl::Kind::Drop:
+        return "SELECT * FROM dbsp_drop_materialized_view(" +
+               dbsp_sql_literal(ddl.name) + ", " +
+               (ddl.cascade ? "true" : "false") + ", " +
+               (ddl.if_exists ? "true" : "false") + ")";
+    case MvDdl::Kind::Refresh:
+        return "SELECT * FROM dbsp_refresh_materialized_view(" +
+               dbsp_sql_literal(ddl.name) + ")";
+    }
+    return "";
+}
+
+// The one ParseData the token path carries: a parsed statement, not a
+// statement-shaped class hierarchy. MaterializedViewPlan switches on `kind`
+// where it used to dynamic_cast down three types.
+struct MaterializedViewParseData : public ParserExtensionParseData {
+    MvDdl ddl;
+
+    unique_ptr<ParserExtensionParseData> Copy() const override {
+        auto result = make_uniq<MaterializedViewParseData>();
+        result->ddl = ddl;
+        return std::move(result);
+    }
+
+    string ToString() const override { return dbsp_mv_ddl_call(ddl); }
+};
 
 inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
                                                      const string &query,
@@ -748,9 +549,9 @@ inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
     if (!dbsp_contains_ci(query, "MATERIALIZED")) {
         return ParserOverrideResult();
     }
-    string rewritten;
+    MvDdl ddl;
     string reason;
-    const auto match = dbsp_rewrite_mv_ddl(query, rewritten, reason);
+    const auto match = dbsp_parse_mv_ddl(query, ddl, reason);
     if (match == MvDdlMatch::NotOurs) {
         return ParserOverrideResult();
     }
@@ -772,13 +573,51 @@ inline ParserOverrideResult MaterializedViewOverride(ParserExtensionInfo *info,
         inner.parser_override_setting = AllowParserOverride::DEFAULT_OVERRIDE;
         inner.extensions = nullptr;
         Parser parser(inner);
-        parser.ParseQuery(rewritten);
+        parser.ParseQuery(dbsp_mv_ddl_call(ddl));
         return ParserOverrideResult(std::move(parser.statements));
     } catch (std::exception &e) {
         std::cerr << "DBSP: MATERIALIZED VIEW DDL rewrite failed to parse ("
                   << e.what() << "); falling back to the core parser\n";
         return ParserOverrideResult(e);
     }
+}
+
+// The token-stream hook. It runs only for statements the core PEG parser
+// FAILED on, and only when `allow_parser_override_extension` is DEFAULT (the
+// override below is skipped then) — a database where the user set it back after
+// LOAD, or an embedding whose build has no such setting at all. Both are real,
+// so this entry point stays.
+//
+// What does NOT stay is a second parser behind it. The tokens are rejoined into
+// a statement and handed to `dbsp_parse_mv_ddl` — the SAME parse the override
+// runs — so the two routes accept the same DDL, refuse the same DDL and say the
+// same thing when they refuse. They differ in exactly one respect, and it is
+// inherent to the input: SimpleToken::text is a source slice, so rejoining them
+// with single spaces NORMALISES the SQL this path stores, where the override
+// sees the user's own bytes.
+inline ParserExtensionParseResult MaterializedViewParse(ParserExtensionInfo *info,
+                                                        const vector<SimpleToken> &tokens) {
+    const auto query = dbsp_tokens_to_query(tokens);
+    MvDdl ddl;
+    string reason;
+    switch (dbsp_parse_mv_ddl(query, ddl, reason)) {
+    case MvDdlMatch::NotOurs:
+        return ParserExtensionParseResult(); // consumed_tokens stays 0
+    case MvDdlMatch::Declined: {
+        // A negative count is what makes the peeler surface `error` — a zero
+        // count would silently hand the input to the next extension.
+        ParserExtensionParseResult result("MATERIALIZED VIEW: " + reason);
+        result.consumed_tokens = -1;
+        return result;
+    }
+    case MvDdlMatch::Rewritten:
+        break;
+    }
+    auto data = make_uniq<MaterializedViewParseData>();
+    data->ddl = std::move(ddl);
+    ParserExtensionParseResult result(std::move(data));
+    result.consumed_tokens = NumericCast<int64_t>(tokens.size());
+    return result;
 }
 
 //===--------------------------------------------------------------------===//

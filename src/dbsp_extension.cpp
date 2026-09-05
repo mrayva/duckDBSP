@@ -2415,60 +2415,46 @@ namespace dbsp_native {
 ParserExtensionPlanResult
 MaterializedViewPlan(ParserExtensionInfo *info, ClientContext &context,
                      unique_ptr<ParserExtensionParseData> parse_data_p) {
+  // One parse-data type, one switch. It used to be three ParseData subclasses
+  // and a three-way dynamic_cast chain, one arm per statement — the shape a
+  // second parser produces.
+  auto *data =
+      dynamic_cast<::dbsp_native::MaterializedViewParseData *>(parse_data_p.get());
+  if (data == nullptr) {
+    throw InternalException("MATERIALIZED VIEW plan: unexpected parse data");
+  }
+  const auto &ddl = data->ddl;
 
   ParserExtensionPlanResult result;
-
-  // Handle CREATE MATERIALIZED VIEW
-  if (auto *create_data =
-          dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("create_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                        LogicalType::BOOLEAN},
-                       CreateMaterializedViewExecute,
-                       CreateMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(create_data->view_name));
-    result.parameters.push_back(Value(create_data->select_query));
-    result.parameters.push_back(Value(create_data->or_replace));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
+  result.return_type = StatementReturnType::QUERY_RESULT;
+  switch (ddl.kind) {
+  case ::dbsp_native::MvDdl::Kind::Create:
+    result.function = TableFunction("create_materialized_view",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                     LogicalType::BOOLEAN},
+                                    CreateMaterializedViewExecute,
+                                    CreateMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
+    result.parameters.push_back(Value(ddl.body));
+    result.parameters.push_back(Value(ddl.or_replace));
+    return result;
+  case ::dbsp_native::MvDdl::Kind::Drop:
+    result.function = TableFunction("drop_materialized_view",
+                                    {LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                                    DropMaterializedViewExecute,
+                                    DropMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
+    result.parameters.push_back(Value(ddl.cascade));
+    return result;
+  case ::dbsp_native::MvDdl::Kind::Refresh:
+    result.function = TableFunction("refresh_materialized_view",
+                                    {LogicalType::VARCHAR},
+                                    RefreshMaterializedViewExecute,
+                                    RefreshMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
     return result;
   }
-
-  // Handle DROP MATERIALIZED VIEW
-  if (auto *drop_data =
-          dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("drop_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::BOOLEAN},
-                       DropMaterializedViewExecute, DropMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(drop_data->view_name));
-    result.parameters.push_back(Value(drop_data->cascade));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
-    return result;
-  }
-
-  // Handle REFRESH MATERIALIZED VIEW
-  if (auto *refresh_data =
-          dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("refresh_materialized_view", {LogicalType::VARCHAR},
-                       RefreshMaterializedViewExecute,
-                       RefreshMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(refresh_data->view_name));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
-    return result;
-  }
-
-  throw InternalException("Unknown materialized view statement type");
+  throw InternalException("Unknown materialized view statement kind");
 }
 
 } // namespace dbsp_native
