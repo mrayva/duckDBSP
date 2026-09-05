@@ -1,5 +1,79 @@
 # Changelog
 
+## Quality round, fix 1 — an in-window dbsp_sync() cannot pay the debt, and now says so — 2026-09-04
+
+**Third defect of the seeding family closed, and declared this time.** Old
+`finish_rebuild()` set the baseline seeded UNCONDITIONALLY, so `dbsp_sync()`
+called INSIDE the transaction that deferred a seeding scan retired the debt —
+from a scan that could not see that transaction's uncommitted rows. The next
+read was then served a baseline short by exactly them. The previous commit
+stopped that (a scan taken inside an open transaction no longer establishes)
+but did not say so, and left three artefacts behind. All three are fixed:
+
+- `dbsp_sync()` reported `Synced all tracked tables` for a call that
+  established nothing. It now appends what is still owed — `; 1 baseline(s)
+  still owed a seeding scan (db.main.t) — a scan taken while a transaction is
+  open cannot establish one; COMMIT or ROLLBACK, then sync or read again`.
+- The read refusal told the DEFERRED story for both states and advised
+  `dbsp_sync()`, which no longer works in-window. The text is branched:
+  UNSEEDED (a `dbsp_track()` left empty by design) says to run `dbsp_sync()`
+  with no transaction open; DEFERRED says only ending the transaction repairs
+  it, and why a sync cannot.
+- `sync_table`'s policy comment still called itself "the documented repair for
+  a baseline whose seeding was deferred inside a transaction". It is not, from
+  inside that transaction, and now says which case is which.
+
+Pinned by `in_window_sync` in `test/python/test_create_view_seeding.py`, which
+was RED on the missing status: `dbsp_sync() reported 'Synced all tracked
+tables' for a call that paid nothing`. The existing `repair == "sync"` arm runs
+AFTER the COMMIT and could not have caught it.
+
+**The readiness watermark never lowers.** Two connections can defer the SAME
+table. `mark_seed_deferred` overwrote the watermark, so an older transaction's
+lower one cleared while the newer transaction was still open, and the reconcile
+established the baseline without its rows. Measured RED before the fix:
+`view [(10.0,)] != SQL [(13.0,)]`, and it never healed — the write predated the
+triggers and so fed nothing. It now takes the maximum. Pinned by
+`watermark_never_lowers` in the same file.
+
+**One retirement rule, not two.** `retire_scanned_baseline` replaces the
+Deferred-side retirement (which was implicit in a `finish_rebuild` parameter)
+and the Provisional-side one (a loop in `sync_tables`). It runs after every
+successful scan, through the single funnel `sync_table_scan_and_consume`, and
+asks three questions in order: is anything owed; could THIS scan see everything
+(no user transaction open); has the transaction the state waits on ended. A NO
+to any leaves the state exactly where it was, so a failed or ineligible scan
+cannot drop a debt without paying it. When it establishes, it then runs
+`mark_provisional_if_concurrent` — the same concurrency question `seed_baseline`
+asks — with the reference timestamp taken on the spot, because a commit hook has
+no caller transaction to be relative to. No reproduction was constructed for
+that last gap; it is a symmetry the code now has rather than a measured defect.
+
+**`establishes` is mandatory.** `install_rebuild(bool)` no longer defaults to
+the unsafe value, and every call site states its reason: `true` only at the
+seeding scan, `false` at `rebuild_all_views` (a refresh) and at
+`materialize_deferred_locked` (restore-pending content, already SEEDED).
+`finish_rebuild()` lost the flag entirely — it installs content and never
+touches the trust state.
+
+**`TrackedTable::deferred_` is `restore_pending_`.** The D3c lazy-restore
+RESIDENCY flag shared a word with `Baseline::Deferred`, which is a TRUST state
+meaning the opposite thing (a scan is owed, where restore-pending means the
+content is trusted and merely not materialized). `is_deferred()` →
+`restore_pending()`, `mark_deferred()` → `mark_restore_pending()`,
+`deferred_weight/hash` → `restore_weight/hash`. The CDCManager-level D3c
+vocabulary (`deferred_tables_`, `materialize_all_deferred`, …) is unchanged: it
+names the subsystem, not the flag.
+
+**Rot.** `CDCManager::request_rebuild()` had zero callers once the rollback
+special case went; deleted.
+
+**Corrections to the previous entry.** "One full scan in the hook instead of
+four" was wrong: `TransactionCommit` still reaches `sync_all` from the same
+three places. What changed is that a seeding debt no longer forces the
+`unknown_writes` route. And the two DDL routes differ in a second respect on a
+qualified name — see the corrected paragraph below.
+
 ## Quality round — one baseline state, one DDL parser — 2026-09-04
 
 Restructuring, not behaviour change: the suite passes unmodified in all three
@@ -37,8 +111,11 @@ because that flag named no table and so could only ever be paid by a full
   `clear_provisional()`.
 
 `unknown_writes` survives only where it still means "a write we could not
-attribute", and `sync_all` survives only there — one full scan in the hook
-instead of four.
+attribute". `TransactionCommit` still reaches `sync_all` from the same three
+places it always did (`triggers_installed`, `unknown_writes` on the trigger-fed
+path, `!know_all_writes` on the fallback path); what changed is that a seeding
+debt no longer FORCES the `unknown_writes` route, so those full scans are taken
+only when a write genuinely cannot be attributed to a table.
 
 **Defect fixed: a scan taken inside the deferring transaction retired the debt
 without paying it.** Crash recovery's `resync_tracked_tables` runs from
@@ -89,6 +166,16 @@ normalise the stored SQL, where the override sees the user's own bytes.
 a view up, and "does not exist" is a better answer for `REFRESH MATERIALIZED
 VIEW s2.qv` than a parse error about a name the caller was never going to
 register. `CREATE` is unchanged and still refuses one.
+
+Two things that paragraph would otherwise overclaim. First, the two routes
+differ in a second respect on a QUALIFIED name: the token path rejoins its
+slices with spaces, so `s2.qv` arrives as `s2 . qv` and is DECLINED with
+"trailing text after the REFRESH statement" — loud, where the old token parser
+took the whole tail as a name and reported "does not exist". Both refuse; only
+the message moved, and only on the route no ordinary user reaches. Second, the
+token path's `DROP` arm silently drops `IF EXISTS` (the plan hook's
+`drop_materialized_view` takes name and cascade only) — pre-existing, unchanged
+here, and stated so it stops being invisible.
 
 **Rot.** `apply_captured_delta` (singular) is deleted: zero callers, and its
 body was a verbatim copy of the plural's refusal ladder — the copy a state-model

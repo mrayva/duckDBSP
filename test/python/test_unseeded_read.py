@@ -16,8 +16,9 @@ that transaction ended. `dbsp_changes` was worse: it served
 same connection served NULL.
 
 Both surfaces now throw, naming the deferring state. Once the window ends —
-by COMMIT (which widens itself to a scan-and-diff) or by ROLLBACK (which asks
-for a view rebuild from committed storage) — the reads work and are EXACT.
+by COMMIT (whose hook sweeps the tables that owe a seeding scan) or by ROLLBACK
+(after which the first read runs that same sweep itself, because the table it
+would scan is finally ready) — the reads work and are EXACT.
 The assertions below compare against plain SQL, so a constant offset cannot
 hide, and they run again after a later edit on each connection.
 
@@ -92,8 +93,10 @@ def case(label, a, b, probe_reads):
         refuses(b, "SELECT * FROM dbsp_changes('mv')", f"{label}/other-conn changes")
         # The refusals aborted A's transaction — DuckDB requires it be rolled
         # back, so this shape ends the window by ROLLBACK rather than COMMIT.
-        # That is the other repair route (a rollback asks for a view rebuild
-        # from committed storage), and the reads below have to work either way.
+        # A rollback runs no commit hook, so the repair falls to the READ path,
+        # which runs the same sweep before refusing: the table's readiness
+        # watermark has cleared now that the transaction is gone, so the first
+        # read scans it and answers. The reads below have to work either way.
         a.execute("ROLLBACK")
     else:
         a.execute("COMMIT")

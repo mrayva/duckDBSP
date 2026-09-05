@@ -441,8 +441,10 @@ and the strict switch's structural blindness to commit hooks.
      `2.0 / 12.0`, `3.0 / 13.0` over three commits, self-healing later and a
      wrong answer with no error while it lasted.
   2. **READ** — `view_read_block` walks a view's sources transitively and
-     returns the WORST state in the tree; `RefuseIfUnseeded`
-     (`src/dbsp_extension.cpp`) throws unless it is `Seeded`. A pure read during
+     returns the WORST state in the tree; `EnsureViewReadable`
+     (`src/dbsp_extension.cpp`) throws unless it is `Seeded`, with a different
+     remedy for each state — `dbsp_sync()` repairs UNSEEDED, and only ending
+     the transaction repairs DEFERRED. A pure read during
      the window returned the unseeded value too — `dbsp_query('mv')`
      `[(None,)]` against plain SQL `10.0`, on the deferring connection and on
      every other one, on `:memory:` and on a file; `dbsp_changes` was worse
@@ -468,14 +470,49 @@ and the strict switch's structural blindness to commit hooks.
   (`mark_provisional_if_concurrent`) — a table tracked while another connection
   held a write open would be marked trusted while short.
 
+  **`dbsp_sync()` inside the deferring transaction cannot pay the debt, and
+  says so.** The scan it runs opens its own connection and cannot see that
+  transaction's uncommitted rows, so establishing from it would serve a view
+  short by exactly those rows. `retire_scanned_baseline` refuses to establish
+  while the CALLER holds a transaction open, and `dbsp_sync()` reports what is
+  still owed (`… ; N baseline(s) still owed a seeding scan …`) rather than the
+  plain "Synced" of a call that worked. Called with no transaction open it
+  establishes normally, which is the documented repair for a table left empty
+  by `dbsp_track()`. Pinned by `in_window_sync` in
+  `test/python/test_create_view_seeding.py`.
+
   **Only a scan that could see everything may establish a baseline.**
-  `install_rebuild` / `finish_rebuild` take `establishes`, and a scan run while
-  a user transaction is open passes `false`: it REFRESHES the content and
-  leaves a `Deferred` debt standing. Measured without it: crash recovery's
-  `resync_tracked_tables`, which runs from `QueryBegin` and can be inside the
-  very transaction that deferred the seed, marked the baseline trusted from a
-  committed-only read and the commit then reconciled nothing — `view 10.0`
-  where SQL read `13.0`.
+  `finish_rebuild()` installs CONTENT and never touches the trust state;
+  `install_rebuild(establishes)` takes a MANDATORY flag and only the seeding
+  scan passes `true`. Everything else — a refresh from `rebuild_all_views`, a
+  restore-pending materialization — passes `false` and leaves the trust state
+  to `retire_scanned_baseline`, which is the ONE rule that retires an untrusted
+  baseline and asks all three questions above. Measured without that rule:
+  crash recovery's `resync_tracked_tables`, which runs from `QueryBegin` and
+  can be inside the very transaction that deferred the seed, marked the
+  baseline trusted from a committed-only read and the commit then reconciled
+  nothing — `view 10.0` where SQL read `13.0`.
+
+  **The watermark never lowers.** Two connections can defer the same table, and
+  the debt is waiting on whichever transaction ends LAST, so
+  `mark_seed_deferred` takes the MAXIMUM of the watermark it holds and the one
+  offered. Overwriting let an older transaction's lower watermark clear while
+  the newer transaction was still open, and the reconcile then established the
+  baseline without its rows — `view 10.0` against SQL `13.0`, and it never
+  healed, because the write predated the triggers and so fed nothing. Pinned by
+  `watermark_never_lowers`.
+
+  **An establishing reconcile asks the concurrency question too.** When
+  `retire_scanned_baseline` establishes a baseline it runs
+  `mark_provisional_if_concurrent` over it, exactly as `seed_baseline` does,
+  with the reference start timestamp taken ON THE SPOT rather than from a
+  caller transaction that does not exist in a commit hook. Without it, an
+  unrelated connection's `sync_tables(touched)` could establish a baseline with
+  no concurrency check at all, which is the gap the PROVISIONAL state exists to
+  close. No reproduction was constructed for it — the readiness watermark
+  already blocks the shapes that produce one, and `capture_.triggers_installed`
+  covers the rest — so it is a symmetry the code now has rather than a measured
+  defect closed.
 
   **A reconcile that FAILS must not retire the debt.** `sync_tables` returns
   false when a table it was asked about was not scanned, reports it through
@@ -484,9 +521,13 @@ and the strict switch's structural blindness to commit hooks.
   first meant one failed scan left the baseline empty for the life of the
   connection, silently.
 
-  The commit hook is therefore one sweep and one `sync_all`: the sweep pays
-  named debts, and `sync_all` survives only for `unknown_writes` — a write we
-  could not attribute, where nothing names a table. Pinned by
+  The commit hook is therefore one sweep plus the fallbacks it does not
+  replace. `TransactionCommit` still reaches `sync_all` from three places —
+  `triggers_installed`, `unknown_writes` on the trigger-fed path, and
+  `!know_all_writes` on the fallback path — exactly as it did before. What
+  changed is that a seeding debt no longer FORCES the `unknown_writes` route:
+  the sweep pays it by name, so the full scans are taken only when a write
+  genuinely cannot be attributed to a table. Pinned by
   `test/python/test_unseeded_read.py`, `test_provisional_baseline.py`,
   `test_create_view_seeding.py`, `test_reconcile_telemetry.py` and, in ctest,
   `cdc: one baseline state drives both the apply path and the read path`, which
@@ -508,7 +549,7 @@ and the strict switch's structural blindness to commit hooks.
   code.
 - **A baseline is only "seeded" once something has scanned it.** The public
   `dbsp_track` leaves it empty on purpose and expects a `dbsp_sync`;
-  `TrackedTable::baseline_seeded()` is what lets `create_view` tell "empty
+  `TrackedTable::established()` is what lets `create_view` tell "empty
   because nothing scanned it" from "empty because the table is empty" and seed
   it itself. Anything else that replays a baseline as though it were table
   content must ask the same question.
