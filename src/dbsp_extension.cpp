@@ -466,21 +466,52 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
 
+  // What `dbsp_sync()` could NOT do, said out loud.
+  //
+  // A sync run INSIDE a transaction cannot establish a baseline: its scan
+  // opens its own connection and cannot see that transaction's uncommitted
+  // rows, so a view built on what it read would be short by exactly them.
+  // CDCManager::retire_scanned_baseline refuses to establish there — and a
+  // call that refuses must not report the same "Synced" as one that worked,
+  // or the caller reads the success and then reads a refusal.
+  const auto owed_note = [&](const std::vector<std::string> &owed) {
+    if (owed.empty()) {
+      return std::string();
+    }
+    std::string names;
+    for (size_t i = 0; i < owed.size() && i < 3; i++) {
+      names += (i == 0 ? "" : ", ") + owed[i];
+    }
+    if (owed.size() > 3) {
+      names += ", …";
+    }
+    return "; " + std::to_string(owed.size()) +
+           " baseline(s) still owed a seeding scan (" + names +
+           ") — a scan taken while a transaction is open cannot establish "
+           "one; COMMIT or ROLLBACK, then sync or read again";
+  };
+
   if (data.sync_all) {
     // WHITELISTED. dbsp_sync() is USER-INVOKED: the caller asked for a
     // reconcile against committed storage, so committed storage is what it
-    // should read — and this is the documented repair for a baseline whose
-    // seeding was deferred inside a transaction.
+    // should read.
     manager.sync_all(context, nullptr,
                      dbsp_native::InternalReadPolicy::AllowedInTxn,
                      "dbsp_sync()");
     output.SetChildCardinality(1);
-    output.SetValue(0, 0, Value("Synced all tracked tables"));
+    output.SetValue(0, 0,
+                    Value("Synced all tracked tables" +
+                          owed_note(manager.unestablished_baselines())));
   } else {
-    bool ok = manager.sync_table(context, CanonicalTableRef(context, data.table_name));
+    const std::string key = CanonicalTableRef(context, data.table_name);
+    bool ok = manager.sync_table(context, key);
+    std::string msg =
+        ok ? "Synced: " + data.table_name : std::string("Failed to sync");
+    if (ok && !manager.baseline_established(key)) {
+      msg += owed_note({key});
+    }
     output.SetChildCardinality(1);
-    output.SetValue(
-        0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
+    output.SetValue(0, 0, Value(msg));
   }
   manager.maybe_save_checkpoint(context);
   data.done = true;
@@ -544,14 +575,24 @@ static void EnsureViewReadable(ClientContext &context,
       return;
     }
   }
-  if (block.state != Baseline::Provisional) { // UNSEEDED or DEFERRED
+  if (block.state == Baseline::Deferred) {
     throw InvalidInputException(
         fn + "('" + view_name + "'): source table '" + block.table +
-        "' has an UNSEEDED baseline — its seeding scan was deferred because a "
-        "transaction was open when the view was created, and nothing has "
-        "scanned the table since. Reading now would return the unseeded "
-        "(empty) answer, not the table's content. End that transaction (COMMIT "
-        "or ROLLBACK), or run dbsp_sync(), and read again.");
+        "' has an UNSEEDED baseline — its seeding scan was DEFERRED because a "
+        "transaction was open when the view was created, and no scan since has "
+        "been able to establish it. Reading now would return the unseeded "
+        "(empty) answer, not the table's content. dbsp_sync() cannot repair it "
+        "from inside that transaction either — a scan run there cannot see the "
+        "transaction's own rows, and says so. End the transaction (COMMIT or "
+        "ROLLBACK) and read again.");
+  }
+  if (block.state == Baseline::Unseeded) {
+    throw InvalidInputException(
+        fn + "('" + view_name + "'): source table '" + block.table +
+        "' has an UNSEEDED baseline — nothing has scanned it. dbsp_track() "
+        "leaves a baseline empty by design and expects a dbsp_sync(). Reading "
+        "now would return the unseeded (empty) answer, not the table's "
+        "content. Run dbsp_sync() with no transaction open, and read again.");
   }
   throw InvalidInputException(
       fn + "('" + view_name + "'): source table '" + block.table +

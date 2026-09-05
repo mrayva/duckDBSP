@@ -3738,8 +3738,14 @@ public:
           // WHITELISTED. sync_table is the USER-INVOKED entry point
           // (`dbsp_sync('t')`, and crash recovery): the caller asked for a
           // reconcile against committed storage, so committed storage is
-          // exactly what it should read. It is also the documented repair for
-          // a baseline whose seeding was deferred inside a transaction.
+          // exactly what it should read.
+          //
+          // It is NOT a repair for a baseline whose seeding was deferred, when
+          // called from inside the transaction that deferred it: the scan runs
+          // on an internal connection and cannot see that transaction's rows,
+          // so retire_scanned_baseline refuses to establish and dbsp_sync()
+          // reports what is still owed. Called with no transaction open, it
+          // establishes and the debt is gone.
           InternalReadPolicy::AllowedInTxn, "dbsp_sync(table)");
     }
 
@@ -3877,26 +3883,11 @@ public:
       if (!sources.empty()) {
         propagate_changes_multi(sources);
       }
-      // Retire a PROVISIONAL baseline: this scan SUCCEEDED (it produced a
-      // delta, empty or not) and the watermark has cleared, so every
-      // transaction that was open when the table was seeded has ended and
-      // whatever it wrote is in committed storage — which is what this scan
-      // just read. Retiring on a FAILED scan would drop the debt without
-      // paying it, the same mistake the unseeded flag made once already.
-      for (size_t i = 0; i < table_names.size(); i++) {
-        if (!deltas[i].has_value()) {
-          continue;
-        }
-        auto it = tracked_tables_.find(table_names[i]);
-        if (it == tracked_tables_.end() ||
-            it->second->baseline() != TrackedTable::Baseline::Provisional) {
-          continue;
-        }
-        if (ready_watermark_cleared(context, table_names[i], *it->second)) {
-          it->second->retire_provisional();
-          provisional_count_--;
-        }
-      }
+      // Retirement is NOT here. Every state a scan can retire — DEFERRED and
+      // PROVISIONAL alike — is retired by the ONE rule in
+      // retire_scanned_baseline, which sync_table_scan_and_consume runs for
+      // this and every other scan path. A scan that FAILED never reaches it,
+      // so a failed reconcile can never drop a debt without paying it.
     }
 
     // Report AFTER the locks above are released: record_error_best_effort
@@ -5209,6 +5200,32 @@ public:
 
   // Tables currently held PROVISIONAL (TrackedTable::mark_provisional). Zero
   // in the ordinary single-writer session, and tests assert that.
+  // Tracked tables whose baseline no scan has ESTABLISHED yet — UNSEEDED
+  // (nobody has asked) or DEFERRED (a seed was asked for and could not run).
+  //
+  // A different question from untrusted_baselines(): this one is "what is
+  // still OWED", not "what can be paid right now", and it is what lets
+  // `dbsp_sync()` report honestly instead of saying "Synced" for a call that
+  // established nothing.
+  std::vector<std::string> unestablished_baselines() const {
+    std::vector<std::string> out;
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    for (const auto &[name, table] : tracked_tables_) {
+      if (!table->established()) {
+        out.push_back(name);
+      }
+    }
+    return out;
+  }
+
+  // Same question for one table. False for a name that is not tracked, which
+  // is not "owed" — it is not ours.
+  bool baseline_established(const std::string &table_key) const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_key);
+    return it == tracked_tables_.end() || it->second->established();
+  }
+
   uint64_t provisional_tables() const { return provisional_count_.load(); }
 
   // Every tracked table whose baseline is not SEEDED and whose debt a scan of
@@ -5697,13 +5714,12 @@ private:
 
       // Diff against the previous baseline and swap the new one in
       // (spill mode: digest-index compare + on-disk payloads; RAM mode:
-      // whole-map diff + move).
-      //
-      // It ESTABLISHES the baseline only when no user transaction is open. A
-      // scan taken inside one cannot see that transaction's rows, so it
-      // refreshes content without retiring a DEFERRED seeding debt — the debt
-      // is paid at that transaction's commit, where the scan can see it all.
-      return it->second->finish_rebuild(!user_transaction_open(context));
+      // whole-map diff + move). finish_rebuild installs CONTENT only; whether
+      // this scan may also retire an untrusted TRUST state is one question,
+      // asked in one place, immediately below.
+      auto delta = it->second->finish_rebuild();
+      retire_scanned_baseline(context, table_name, *it->second);
+      return delta;
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
@@ -6110,6 +6126,15 @@ private:
   void mark_provisional_if_concurrent(duckdb::ClientContext &context,
                                       const std::string &table_name,
                                       TrackedTable &table) {
+  // The reference is the CALLER'S OWN transaction start, and it has to be:
+  // a start timestamp probed on the spot instead would count the caller's own
+  // statement transaction as a concurrent older one and mark every table it
+  // touched PROVISIONAL. Measured while trying exactly that on the reconcile
+  // path: `lowest_active_start=36 mine=53(probe)` for a bare `dbsp_sync()`,
+  // which then refused every read of the view it had just repaired. So this
+  // question can only be asked where there IS a caller transaction to be
+  // relative to — the seeding scan — and `retire_scanned_baseline` says what
+  // covers the reconcile path instead.
     try {
       auto attached = attached_of_table_key(context, table_name);
       if (!attached) {
@@ -6149,6 +6174,59 @@ private:
   // Has the transaction this table's state is waiting on ended? PROVISIONAL
   // waits on every transaction that was active when it was seeded; DEFERRED
   // waits on the one whose openness deferred the seed. Zero watermark (nothing
+  // THE rule that retires an untrusted baseline, for BOTH states that have
+  // one, run after every scan that succeeded (sync_table_scan_and_consume is
+  // the single funnel: dbsp_sync, the commit sweep, the read-path repair and
+  // crash recovery all reach storage through it).
+  //
+  // The rule, in order, and a NO to any question leaves the state exactly
+  // where it was — which is what makes a failed or ineligible scan incapable
+  // of dropping a debt without paying it:
+  //
+  //   1. Is anything owed at all? SEEDED tables are done.
+  //   2. Could THIS scan see everything the state is about? A scan taken while
+  //      the CALLER holds a transaction open cannot see that transaction's
+  //      rows, so it establishes nothing. This is what makes an in-window
+  //      `dbsp_sync()` honest instead of silently serving a short baseline.
+  //   3. For PROVISIONAL only, has every transaction alive at seed time ended?
+  //      That debt is a PRE-TRACKING write sitting in another connection's
+  //      transaction; only a scan taken after it commits can see it, so the
+  //      readiness watermark gates the retirement.
+  //
+  // DEFERRED does not ask (3) HERE, and the asymmetry is the point rather than
+  // an oversight. Its debt is "the connection that wanted this baseline could
+  // not scan for it", and question (2) is exactly that question asked of the
+  // caller. What the deferring transaction itself wrote is covered by its own
+  // commit — through its triggers, or through `capture_.touched` — and, for
+  // the window before either of those exist, by the readiness watermark on the
+  // SWEEP (untrusted_baselines), which will not go looking for a DEFERRED
+  // table until the transaction it waits on has ended. Making the retirement
+  // itself wait as well would refuse reads that the design pins as SERVED:
+  // `cdc: an unseeded baseline is never served to another connection` requires
+  // that a second connection writing during the window gets the RIGHT answer
+  // (110.0, not 100.0 and not an error), and that answer comes from exactly
+  // this scan establishing the baseline.
+  void retire_scanned_baseline(duckdb::ClientContext &context,
+                               const std::string &table_name,
+                               TrackedTable &table) {
+    const auto state = table.baseline();
+    if (state == TrackedTable::Baseline::Seeded) {
+      return;
+    }
+    if (user_transaction_open(context)) {
+      return;
+    }
+    if (state == TrackedTable::Baseline::Provisional) {
+      if (!ready_watermark_cleared(context, table_name, table)) {
+        return;
+      }
+      table.retire_provisional();
+      provisional_count_--;
+      return;
+    }
+    table.mark_seeded();
+  }
+
   // to wait on, or no DuckDB transaction manager) reads as cleared.
   bool ready_watermark_cleared(duckdb::ClientContext &context,
                                const std::string &table_name,

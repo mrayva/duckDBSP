@@ -745,7 +745,18 @@ public:
     auto s = baseline_.load();
     while (s == Baseline::Unseeded || s == Baseline::Deferred) {
       if (baseline_.compare_exchange_weak(s, Baseline::Deferred)) {
-        ready_watermark_ = watermark;
+        // NEVER LOWER IT. Two connections can defer the same table, and the
+        // watermark says which transaction the debt is waiting on — the LAST
+        // one to end. Overwriting let an older transaction's lower watermark
+        // clear while the newer transaction was still open, and the reconcile
+        // scan then established the baseline without its rows: measured
+        // `view 10.0` against SQL `13.0`, and it never healed, because the
+        // write predated the triggers and so fed nothing. Pinned by
+        // `watermark_never_lowers` in test/python/test_create_view_seeding.py.
+        uint64_t seen = ready_watermark_.load();
+        while (watermark > seen &&
+               !ready_watermark_.compare_exchange_weak(seen, watermark)) {
+        }
         return;
       }
     }
@@ -807,10 +818,11 @@ public:
     deferred_hash_.clear();
   }
 
-  DuckDBZSet finish_rebuild(bool establishes = true) {
-    if (establishes) {
-      mark_seeded();
-    }
+  // Installs CONTENT and diffs it; it never touches the trust state. The one
+  // caller is CDCManager::sync_table_scan_and_consume, and the decision to
+  // retire an untrusted baseline is taken once, next to it, by
+  // CDCManager::retire_scanned_baseline.
+  DuckDBZSet finish_rebuild() {
     DuckDBZSet delta;
     if (spill_) {
       spill_->end_rebuild(
@@ -981,7 +993,7 @@ private:
   std::atomic<bool> wm_dirty_{true};
   int64_t wm_count_ = 0;
   std::string wm_hash_;
-  // Deferred baseline (D3c): true until the first operation that needs
+  // Restore-pending baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan. RESIDENCY, not trust —
   // see mark_deferred().
   bool deferred_ = false;

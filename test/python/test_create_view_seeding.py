@@ -199,6 +199,117 @@ def auto_sync_off_case(label, path, repair):
         con.close()
 
 
+def watermark_never_lowers_case(label, path):
+    """A second deferral must not LOWER the readiness watermark.
+
+    Two connections can defer the seeding of the SAME table, and the watermark
+    says which transaction the debt is waiting on. Recording the newest
+    deferral overwrote it, so an OLDER transaction's (lower) watermark cleared
+    while the NEWER transaction was still open — and the reconcile scan then
+    established the baseline from committed storage, missing exactly the rows
+    that transaction had not committed yet. Measured before the fix:
+    view [(10.0,)] against SQL [(13.0,)], and it never healed, because the
+    write happened before the triggers existed and so fed nothing.
+
+    B begins FIRST (older), A begins second and defers with the higher
+    watermark, B defers with the lower one, then B commits — leaving A alone
+    and open. The debt must still stand.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0)")
+
+        b.execute("BEGIN TRANSACTION")           # older
+        # Touch the tracked table's own catalog: DuckDB starts a per-database
+        # transaction lazily, so BEGIN alone does not yet fix B's start
+        # timestamp for that catalog.
+        b.execute("SELECT count(*) FROM t").fetchall()
+        a.execute("BEGIN TRANSACTION")           # newer
+        a.execute("INSERT INTO t VALUES (2, 3.0)")   # uncommitted, untriggered
+        a.execute(
+            "SELECT * FROM dbsp_create_view('tv','SELECT SUM(v) AS s FROM t')"
+        ).fetchall()                              # t tracked + DEFERRED (A's wm)
+        b.execute(
+            "SELECT * FROM dbsp_create_view('tv2','SELECT SUM(v) AS s FROM t')"
+        ).fetchall()                              # defers again (B's LOWER wm)
+        b.execute("COMMIT")                       # B's sweep must NOT establish
+
+        a.execute("COMMIT")
+        v = a.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+        sq = a.execute("SELECT SUM(v) FROM t").fetchall()
+        assert v == sq, (
+            f"{label}: view {v} != SQL {sq} — a lowered watermark let the "
+            f"baseline be established while the deferring transaction was open"
+        )
+        a.execute("INSERT INTO t VALUES (3, 4.0)")   # and no constant offset
+        v = a.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+        sq = a.execute("SELECT SUM(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — the watermark never lowers ({v})", flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
+def in_window_sync_case(label, path):
+    """`dbsp_sync()` INSIDE the deferring transaction cannot pay the debt.
+
+    The scan it runs opens its own connection, so it cannot see the open
+    transaction's uncommitted rows — establishing a baseline from it would
+    serve a view short by exactly those rows. It used to do precisely that:
+    `finish_rebuild()` marked the baseline seeded unconditionally, so an
+    in-window `dbsp_sync()` retired the debt and the next read was served the
+    short answer. Now the scan REFRESHES without establishing, the read still
+    refuses, and — the half that keeps this from being a silent no-op —
+    `dbsp_sync()` says what it could not do instead of reporting success.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute("INSERT INTO t VALUES (2, 3.0)")
+        a.execute(
+            "SELECT * FROM dbsp_create_view('tv','SELECT SUM(v) AS s FROM t')"
+        ).fetchall()
+
+        status = a.execute("SELECT * FROM dbsp_sync()").fetchall()[0][0]
+        assert "still owed" in status, (
+            f"{label}: dbsp_sync() reported {status!r} for a call that paid "
+            f"nothing"
+        )
+
+        # The other connection must still be refused: the baseline is short by
+        # A's uncommitted rows and no scan can find them.
+        try:
+            rows = b.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+            raise AssertionError(
+                f"{label}: B was served {rows} from a baseline the in-window "
+                f"sync could not establish"
+            )
+        except duckdb.InvalidInputException as e:
+            assert "baseline" in str(e), f"{label}: unexpected error {e}"
+
+        # The debt is paid where it can be: at the transaction's own COMMIT.
+        a.execute("COMMIT")
+        for who, con in (("A", a), ("B", b)):
+            v = con.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+            sq = con.execute("SELECT SUM(v) FROM t").fetchall()
+            assert v == sq, f"{label}/{who} after COMMIT: view {v} != SQL {sq}"
+        print(f"ok: {label} — in-window dbsp_sync() is honest, and the commit "
+              f"pays", flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
 with tempfile.TemporaryDirectory() as tmp:
     n = 0
     for mode in ("file", "memory"):
@@ -214,6 +325,12 @@ with tempfile.TemporaryDirectory() as tmp:
             path = (":memory:" if mode == "memory"
                     else os.path.join(tmp, f"d_{n}.duckdb"))
             auto_sync_off_case(f"{mode}/auto_sync_off_{repair}", path, repair)
+    # Two connections against one file: an in-window dbsp_sync() must not
+    # establish, and must not claim it did.
+    in_window_sync_case("in_window_sync",
+                        os.path.join(tmp, "in_window.duckdb"))
+    watermark_never_lowers_case("watermark_never_lowers",
+                                os.path.join(tmp, "wm_lower.duckdb"))
 
 
 # ---------------------------------------------------------------------------
