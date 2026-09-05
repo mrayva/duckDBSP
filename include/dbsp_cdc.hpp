@@ -1498,7 +1498,7 @@ public:
   // Guarded by view_mutex_ (tier 3) -- the same lock that already guards
   // NativeMaterializedView content -- not a new lock level: presence in
   // this map is a property of a view's CONTENT (decoded or not), exactly
-  // like TrackedTable::deferred_ is a property of a table's baseline
+  // like TrackedTable::restore_pending_ is a property of a table's baseline
   // content and lives on the table's own per-table lock, not struct_mutex_.
   struct PendingViewCkpt {
     std::unordered_map<uint64_t, std::vector<uint8_t>> nodes;
@@ -6179,33 +6179,55 @@ private:
   // the single funnel: dbsp_sync, the commit sweep, the read-path repair and
   // crash recovery all reach storage through it).
   //
-  // The rule, in order, and a NO to any question leaves the state exactly
-  // where it was — which is what makes a failed or ineligible scan incapable
-  // of dropping a debt without paying it:
+  // Three questions, and only a YES to all of them makes a baseline SEEDED:
   //
   //   1. Is anything owed at all? SEEDED tables are done.
-  //   2. Could THIS scan see everything the state is about? A scan taken while
-  //      the CALLER holds a transaction open cannot see that transaction's
-  //      rows, so it establishes nothing. This is what makes an in-window
-  //      `dbsp_sync()` honest instead of silently serving a short baseline.
-  //   3. For PROVISIONAL only, has every transaction alive at seed time ended?
-  //      That debt is a PRE-TRACKING write sitting in another connection's
-  //      transaction; only a scan taken after it commits can see it, so the
-  //      readiness watermark gates the retirement.
+  //   2. Could THIS scan see the CALLER's own rows? A scan taken while the
+  //      caller holds a transaction open cannot, so it establishes nothing —
+  //      this is what makes an in-window `dbsp_sync()` honest instead of
+  //      silently serving a short baseline.
+  //   3. Has the transaction the STATE is waiting on ended? That is the stored
+  //      readiness watermark, and it is the same question for both untrusted
+  //      states: for PROVISIONAL, every transaction alive at seed time; for
+  //      DEFERRED, the transaction whose openness deferred the seed. The
+  //      reference is that transaction's start, recorded when the state was
+  //      taken — NOT the caller's, which is why this question can be asked
+  //      from a commit hook where there is no caller transaction at all.
   //
-  // DEFERRED does not ask (3) HERE, and the asymmetry is the point rather than
-  // an oversight. Its debt is "the connection that wanted this baseline could
-  // not scan for it", and question (2) is exactly that question asked of the
-  // caller. What the deferring transaction itself wrote is covered by its own
-  // commit — through its triggers, or through `capture_.touched` — and, for
-  // the window before either of those exist, by the readiness watermark on the
-  // SWEEP (untrusted_baselines), which will not go looking for a DEFERRED
-  // table until the transaction it waits on has ended. Making the retirement
-  // itself wait as well would refuse reads that the design pins as SERVED:
-  // `cdc: an unseeded baseline is never served to another connection` requires
-  // that a second connection writing during the window gets the RIGHT answer
-  // (110.0, not 100.0 and not an error), and that answer comes from exactly
-  // this scan establishing the baseline.
+  // A NO to (2) leaves the state exactly where it was.
+  //
+  // A NO to (3) is an OPEN DEFECT, and this is where it lives. Question (3) is
+  // asked for PROVISIONAL and NOT for DEFERRED, which means a scan taken by a
+  // connection holding no transaction of its own establishes a DEFERRED
+  // baseline it could not see the whole of. Measured: connection A opens a
+  // transaction, writes an UNTRACKED table and creates a view over it
+  // (DEFERRED); connection B, holding no transaction, runs `dbsp_sync()`; B's
+  // scan cannot see A's rows either, but the caller test passes for B, so the
+  // baseline is marked SEEDED at 10.0. A's own commit then finds nothing owed —
+  // A's write was pre-trigger, and its table was untracked when the statement
+  // folded, so `capture_.touched` never named it — and the view reads `10.0`
+  // against SQL `13.0`, permanently. Reproduced by `third_party_scan` in
+  // test/python/test_create_view_seeding.py (run with DBSP_KNOWN_DEFECTS=1).
+  //
+  // Asking (3) for DEFERRED as well DOES close it, and was measured to work —
+  // the scan then installs content and demotes the baseline to PROVISIONAL,
+  // which is exactly what that state means. It is not landed because the read
+  // gate refuses a PROVISIONAL source on EVERY connection (see the read-gate
+  // OPEN item in docs/DESIGN_TRIGGER_SOURCE.md, "the gate does not distinguish
+  // the two, so it refuses both"), so the demotion turns four sections of
+  // `cdc: an unseeded baseline is never served to another connection` from
+  // SERVED-with-the-right-answer into refusals. That case pins availability
+  // during the window; this comment pins the conflict. Owner ruling needed —
+  // see docs/DESIGN_TRIGGER_SOURCE.md.
+  //
+  // The seeding-path concurrency check (mark_provisional_if_concurrent) is NOT
+  // asked here, and cannot be: it needs a reference start timestamp, and a
+  // reconcile has no caller transaction to use. A timestamp probed on the spot
+  // counts the caller's OWN statement transaction as an older concurrent one —
+  // measured, `lowest_active_start=36 mine=53(probe)` on a bare `dbsp_sync()`,
+  // which then marked the table PROVISIONAL and refused every read of the view
+  // it had just repaired. The stored watermark answers the same question
+  // without a reference of its own.
   void retire_scanned_baseline(duckdb::ClientContext &context,
                                const std::string &table_name,
                                TrackedTable &table) {
@@ -6217,13 +6239,13 @@ private:
       return;
     }
     if (state == TrackedTable::Baseline::Provisional) {
-      if (!ready_watermark_cleared(context, table_name, table)) {
-        return;
+      if (ready_watermark_cleared(context, table_name, table)) {
+        table.retire_provisional();
+        provisional_count_--;
       }
-      table.retire_provisional();
-      provisional_count_--;
       return;
     }
+    // The open defect above: no question (3) for DEFERRED.
     table.mark_seeded();
   }
 

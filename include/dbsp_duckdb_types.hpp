@@ -765,17 +765,17 @@ public:
   }
 
   // A scan established this baseline. Never DOWNGRADES a PROVISIONAL table:
-  // retiring that state also requires proof that its watermark cleared, which
-  // only the caller can supply (CDCManager::sync_tables).
+  // retiring that state needs proof its watermark cleared, which only
+  // CDCManager::retire_scanned_baseline can supply.
   //
-  // Only a scan that COULD have seen everything may call this, which is why
-  // install_rebuild/finish_rebuild take `establishes`: a scan run while a user
-  // transaction is open cannot see that transaction's rows, so it REFRESHES
-  // content without clearing a DEFERRED debt. Measured with it clearing the
-  // debt: crash recovery's resync, which runs from QueryBegin inside the very
-  // transaction that deferred the seed, marked the baseline trusted from a
-  // committed-only read and the commit then reconciled nothing — view 10.0
-  // where SQL read 13.0.
+  // Only a scan that could have seen everything may call this, and only
+  // retire_scanned_baseline knows whether one did — which is why
+  // finish_rebuild() takes no say in it at all and install_rebuild's
+  // `establishes` is true at exactly one site, the seeding scan. Measured with
+  // any scan clearing the debt: crash recovery's resync, which runs from
+  // QueryBegin inside the very transaction that deferred the seed, marked the
+  // baseline trusted from a committed-only read and the commit then reconciled
+  // nothing — view 10.0 where SQL read 13.0.
   void mark_seeded() {
     auto s = baseline_.load();
     while (s == Baseline::Unseeded || s == Baseline::Deferred) {

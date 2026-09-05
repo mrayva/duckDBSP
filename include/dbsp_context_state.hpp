@@ -447,8 +447,10 @@ public:
                             &transaction);
       } else {
         // Writes we could not attribute (multi-statement, unparseable SQL):
-        // nothing names the tables, so this is the one full scan left in the
-        // hook.
+        // nothing names a table, so nothing can be scoped. One of the three
+        // sync_all sites in this hook — the other two are the
+        // triggers-installed and unknown-writes branches above — plus the
+        // user-invoked one behind dbsp_sync().
         manager.sync_all(context, &transaction);
       }
     } catch (const std::exception &ex) {

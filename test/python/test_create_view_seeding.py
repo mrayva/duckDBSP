@@ -255,6 +255,69 @@ def watermark_never_lowers_case(label, path):
         a.close()
 
 
+def third_party_scan_case(label, path):
+    """A THIRD connection's scan must not establish a deferred baseline either.
+
+    The in-window rule asks whether the CALLER holds a transaction open, and
+    connection B does not — but the rows the baseline is missing belong to
+    connection A, which does. B's `dbsp_sync()` scanned committed state, saw
+    `Seeded` as its right, and marked the table so; A's COMMIT then found
+    nothing owed, and A's pre-tracking write was neither trigger-fed (there
+    were no triggers when it ran) nor in `capture_.touched` (the table was
+    untracked when the statement folded). Measured before the fix:
+    view [(10.0,)] against SQL [(13.0,)], permanently.
+
+    OPEN DEFECT — this reproduction FAILS. It is not in the default run
+    because it does not yet describe the shipped behaviour; run it with
+    DBSP_KNOWN_DEFECTS=1.
+
+    The fix that closes it is known and was measured to work: make
+    `retire_scanned_baseline` ask the readiness watermark for DEFERRED as it
+    already does for PROVISIONAL, and DEMOTE to Provisional when it has not
+    cleared. It is not landed because the read gate refuses a PROVISIONAL
+    source on every connection, so the demotion turns four sections of
+    `cdc: an unseeded baseline is never served to another connection` from
+    SERVED-with-the-right-answer into refusals. That case pins availability
+    during the deferral window, this one pins correctness after it, and the two
+    cannot both hold until the read gate can tell an ordinary autocommit reader
+    from one inside the deferring transaction. See the read-gate OPEN item in
+    docs/DESIGN_TRIGGER_SOURCE.md.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        a.execute(f"LOAD '{EXT}'")
+        b.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute("INSERT INTO t VALUES (2, 3.0)")   # untracked, pre-trigger
+        a.execute(
+            "SELECT * FROM dbsp_create_view('mv','SELECT sum(v) AS s FROM t')"
+        ).fetchall()
+
+        # B holds no transaction, so its scan is "legal" by the caller test —
+        # and still cannot see A's rows.
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()
+
+        a.execute("COMMIT")
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, (
+            f"{label}: view {v} != SQL {sq} — a third connection's scan "
+            f"established a baseline while the deferring transaction was open"
+        )
+        a.execute("INSERT INTO t VALUES (3, 4.0)")   # and no constant offset
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — a third party cannot establish it ({v})",
+              flush=True)
+    finally:
+        b.close()
+        a.close()
+
+
 def in_window_sync_case(label, path):
     """`dbsp_sync()` INSIDE the deferring transaction cannot pay the debt.
 
@@ -331,6 +394,12 @@ with tempfile.TemporaryDirectory() as tmp:
                         os.path.join(tmp, "in_window.duckdb"))
     watermark_never_lowers_case("watermark_never_lowers",
                                 os.path.join(tmp, "wm_lower.duckdb"))
+    if os.environ.get("DBSP_KNOWN_DEFECTS"):
+        third_party_scan_case("third_party_scan",
+                              os.path.join(tmp, "third_party.duckdb"))
+    else:
+        print("skip: third_party_scan — OPEN DEFECT, see its docstring "
+              "(DBSP_KNOWN_DEFECTS=1 to run it)", flush=True)
 
 
 # ---------------------------------------------------------------------------

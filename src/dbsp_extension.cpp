@@ -474,6 +474,9 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   // CDCManager::retire_scanned_baseline refuses to establish there — and a
   // call that refuses must not report the same "Synced" as one that worked,
   // or the caller reads the success and then reads a refusal.
+  //
+  // A scan that did not RUN leaves the same debt standing, so the note names
+  // both causes rather than blaming an open transaction it cannot check.
   const auto owed_note = [&](const std::vector<std::string> &owed) {
     if (owed.empty()) {
       return std::string();
@@ -487,8 +490,10 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
     }
     return "; " + std::to_string(owed.size()) +
            " baseline(s) still owed a seeding scan (" + names +
-           ") — a scan taken while a transaction is open cannot establish "
-           "one; COMMIT or ROLLBACK, then sync or read again";
+           ") — either a transaction is open, and a scan taken there cannot "
+           "establish one (COMMIT or ROLLBACK, then sync or read again), or "
+           "the scan did not run, which dbsp_stats() reports as "
+           "reconcile_failures / last_reconcile_error";
   };
 
   if (data.sync_all) {
