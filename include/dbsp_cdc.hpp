@@ -1485,7 +1485,7 @@ public:
   }
 
   // --- Lazy per-view checkpoint restore (D-lazy) --------------------------
-  // Precedent: D3c's TrackedTable::is_deferred() + materialize_deferred_
+  // Precedent: D3c's TrackedTable::restore_pending() + materialize_deferred_
   // locked (baseline materialization). This is the same lazy-materialize-
   // on-first-need shape applied to a VIEW's checkpoint blobs instead of a
   // table's storage scan: load_from_duck_table's checkpoint fast path
@@ -2303,7 +2303,7 @@ public:
       size_t deferred_now = 0;
       std::shared_lock<std::shared_mutex> lock(struct_mutex_);
       for (const auto &[_, tt] : tracked_tables_) {
-        if (tt->is_deferred()) {
+        if (tt->restore_pending()) {
           deferred_now++;
         }
       }
@@ -2347,11 +2347,6 @@ public:
   // rebuild_all_views at the next statement boundary.
   bool rebuild_pending() const { return rebuild_pending_.load(); }
 
-  // Ask for every view to be rebuilt from committed storage at the next
-  // statement boundary. The escape hatch for "this cannot be reconciled
-  // incrementally" — see seed_baseline's rollback path.
-  void request_rebuild() { rebuild_pending_ = true; }
-
   // Materialize every deferred baseline NOW, from pre-write storage.
   // Called by QueryBegin before a write statement executes: once the
   // write commits, the restore-time table content is gone and a later
@@ -2367,7 +2362,7 @@ public:
         continue;
       }
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      if (!tt->is_deferred()) {
+      if (!tt->restore_pending()) {
         continue;
       }
       try {
@@ -2410,7 +2405,7 @@ public:
         std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
         TrackedTable &table = *tt; // lambda capture (structured bindings
                                    // are not capturable pre-C++20)
-        const bool was_deferred = table.is_deferred();
+        const bool was_deferred = table.restore_pending();
         try {
           table.begin_rebuild();
           stream_table_rows(
@@ -2423,10 +2418,13 @@ public:
               // rebuild, and the transaction's own writes still arrive through
               // its triggers and its commit reconcile.
               InternalReadPolicy::AllowedInTxn, "rebuild_all_views");
-          // REFRESHES a baseline; it must not retire a DEFERRED seeding debt,
-          // because it runs from QueryBegin and may be inside the very
-          // transaction whose openness deferred that seed.
-          table.install_rebuild(!user_transaction_open(context));
+          // establishes=false: this REFRESHES a baseline that already exists.
+          // It runs from QueryBegin, possibly inside the very transaction
+          // whose openness deferred a seed, and it asks neither the readiness
+          // nor the concurrency question — so it must never retire an
+          // untrusted state. A table left owing one is picked up by the next
+          // reconcile, which does ask both.
+          table.install_rebuild(/*establishes=*/false);
           fold_fresh_baseline(context, name, table,
                               InternalReadPolicy::AllowedInTxn,
                               "rebuild_all_views (baseline fold)");
@@ -2570,7 +2568,7 @@ public:
     std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     {
       auto it = tracked_tables_.find(table_name);
-      if (it != tracked_tables_.end() && it->second->is_deferred()) {
+      if (it != tracked_tables_.end() && it->second->restore_pending()) {
         deferred_tables_--;
       }
     }
@@ -2856,7 +2854,7 @@ public:
           // D3c: replay needs real table state — materialize a deferred
           // baseline first (struct_mutex_ exclusive: no table lock needed;
           // view_mutex_ already held)
-          if (tracked_tables_.at(source)->is_deferred()) {
+          if (tracked_tables_.at(source)->restore_pending()) {
             materialize_deferred_locked(context, source, nullptr,
                                         /*view_lock_held=*/true);
           }
@@ -3025,7 +3023,7 @@ public:
         continue; // untracked — node keeps its local index
       }
       if (source_is_table && !cold &&
-          tracked_tables_.at(req.table)->is_deferred()) {
+          tracked_tables_.at(req.table)->restore_pending()) {
         materialize_deferred_locked(context, req.table, nullptr,
                                     /*view_lock_held=*/true);
       }
@@ -3061,7 +3059,7 @@ public:
         source_view_pending = false; // realized above; fill normally below
       }
       const bool defer_fill =
-          (source_is_table && tracked_tables_.at(req.table)->is_deferred()) ||
+          (source_is_table && tracked_tables_.at(req.table)->restore_pending()) ||
           source_view_pending;
       std::shared_ptr<SharedArrangement> arr;
       auto it = arrangements_.find(req.fingerprint);
@@ -3116,8 +3114,8 @@ public:
             if (source_is_table) {
               const auto &tt = tracked_tables_.at(req.table);
               adopted = adopt_arrangement_sidecar(*arr, req.fingerprint,
-                                                  tt->deferred_weight(),
-                                                  tt->deferred_hash());
+                                                  tt->restore_weight(),
+                                                  tt->restore_hash());
             } else {
               // defer_fill && !source_is_table ⇒ the source view is
               // pending, i.e. its stash was accepted (fingerprint match,
@@ -5200,6 +5198,8 @@ public:
 
   // Tables currently held PROVISIONAL (TrackedTable::mark_provisional). Zero
   // in the ordinary single-writer session, and tests assert that.
+  uint64_t provisional_tables() const { return provisional_count_.load(); }
+
   // Tracked tables whose baseline no scan has ESTABLISHED yet — UNSEEDED
   // (nobody has asked) or DEFERRED (a seed was asked for and could not run).
   //
@@ -5225,8 +5225,6 @@ public:
     auto it = tracked_tables_.find(table_key);
     return it == tracked_tables_.end() || it->second->established();
   }
-
-  uint64_t provisional_tables() const { return provisional_count_.load(); }
 
   // Every tracked table whose baseline is not SEEDED and whose debt a scan of
   // committed storage can pay right now, BY NAME. This is what the commit hook
@@ -5680,13 +5678,13 @@ private:
     // baseline is unrecoverable, so the reconciliation delta for the
     // restored views cannot be computed — install current storage as the
     // baseline and schedule a full view rebuild (next QueryBegin).
-    if (it->second->is_deferred()) {
+    if (it->second->restore_pending()) {
       int64_t live_count = 0;
       std::string live_hash;
       if (live_watermark(context, table_name, live_count, live_hash, policy,
                          site) &&
-          live_count == it->second->deferred_weight() &&
-          live_hash == it->second->deferred_hash()) {
+          live_count == it->second->restore_weight() &&
+          live_hash == it->second->restore_hash()) {
         return DuckDBZSet(); // unchanged since restore: stay lazy
       }
       try {
@@ -5760,7 +5758,7 @@ private:
                                    const DuckDBZSet *pending,
                                    bool view_lock_held) {
     auto it = tracked_tables_.find(table_name);
-    if (it == tracked_tables_.end() || !it->second->is_deferred()) {
+    if (it == tracked_tables_.end() || !it->second->restore_pending()) {
       return true;
     }
     DbspScopeTimer timer("baseline_materialize", table_name);
@@ -5777,7 +5775,7 @@ private:
       return true;
     }
 
-    int64_t expected = tt.deferred_weight();
+    int64_t expected = tt.restore_weight();
     if (pending) {
       for (const auto &[row, w] : *pending) {
         expected += w;
@@ -5797,7 +5795,12 @@ private:
                                         // stays deferred
     const bool clean = (scanned == expected);
 
-    tt.install_rebuild();
+    // establishes=false: this MATERIALIZES a restore-pending baseline whose
+    // trust state mark_restore_pending already set to SEEDED — the restore
+    // verified its watermark against live storage. It has nothing to
+    // establish, and saying so keeps the one establishing site the seeding
+    // scan.
+    tt.install_rebuild(/*establishes=*/false);
     deferred_tables_--;
 
     if (!clean) {
@@ -5905,7 +5908,7 @@ private:
         continue;
       }
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      if (tt->is_deferred()) {
+      if (tt->restore_pending()) {
         materialize_deferred_locked(context, name, nullptr, false);
       }
     }
@@ -5918,7 +5921,7 @@ private:
     if (it == tracked_tables_.end()) {
       return false;
     }
-    if (!it->second->is_deferred()) {
+    if (!it->second->restore_pending()) {
       return true;
     }
     return materialize_deferred_locked(context, edited_table, pending, false);
@@ -6123,9 +6126,6 @@ private:
   // Cost when nothing else is open: `LowestActiveStart()` is this transaction's
   // own start, the comparison is false, and the table is never provisional —
   // no extra scan, ever. That is the ordinary single-writer case.
-  void mark_provisional_if_concurrent(duckdb::ClientContext &context,
-                                      const std::string &table_name,
-                                      TrackedTable &table) {
   // The reference is the CALLER'S OWN transaction start, and it has to be:
   // a start timestamp probed on the spot instead would count the caller's own
   // statement transaction as a concurrent older one and mark every table it
@@ -6135,6 +6135,9 @@ private:
   // question can only be asked where there IS a caller transaction to be
   // relative to — the seeding scan — and `retire_scanned_baseline` says what
   // covers the reconcile path instead.
+  void mark_provisional_if_concurrent(duckdb::ClientContext &context,
+                                      const std::string &table_name,
+                                      TrackedTable &table) {
     try {
       auto attached = attached_of_table_key(context, table_name);
       if (!attached) {
@@ -6171,9 +6174,6 @@ private:
     }
   }
 
-  // Has the transaction this table's state is waiting on ended? PROVISIONAL
-  // waits on every transaction that was active when it was seeded; DEFERRED
-  // waits on the one whose openness deferred the seed. Zero watermark (nothing
   // THE rule that retires an untrusted baseline, for BOTH states that have
   // one, run after every scan that succeeded (sync_table_scan_and_consume is
   // the single funnel: dbsp_sync, the commit sweep, the read-path repair and
@@ -6227,6 +6227,9 @@ private:
     table.mark_seeded();
   }
 
+  // Has the transaction this table's state is waiting on ended? PROVISIONAL
+  // waits on every transaction that was active when it was seeded; DEFERRED
+  // waits on the one whose openness deferred the seed. Zero watermark (nothing
   // to wait on, or no DuckDB transaction manager) reads as cleared.
   bool ready_watermark_cleared(duckdb::ClientContext &context,
                                const std::string &table_name,
@@ -6305,7 +6308,7 @@ private:
       std::lock_guard<std::mutex> g(seeds_mutex_);
       auto seed = deferred_seeds_.find(table_name);
       if (seed != deferred_seeds_.end()) {
-        tracked_tables_[table_name]->mark_deferred(seed->second.first,
+        tracked_tables_[table_name]->mark_restore_pending(seed->second.first,
                                                    seed->second.second);
         deferred_tables_++;
         return true;
@@ -6429,7 +6432,11 @@ private:
             [&](DuckDBRow &&row) { tt.add_scanned_row(std::move(row)); },
             InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
-      tt.install_rebuild();
+      // establishes=true: THE seeding scan, and the only site that passes
+      // true. seed_baseline refuses to reach here inside an open user
+      // transaction, and runs the concurrency check
+      // (mark_provisional_if_concurrent) over the baseline this installs.
+      tt.install_rebuild(/*establishes=*/true);
       fold_fresh_baseline(context, table_name, tt,
                           InternalReadPolicy::Forbidden,
                           "sync_table_internal (baseline fold)");

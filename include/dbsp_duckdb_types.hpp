@@ -473,20 +473,20 @@ public:
   // of rescanning the whole table. Returns false (leaving the table
   // deferred, nothing allocated) on any mismatch.
   bool try_adopt_durable_spill() {
-    if (!deferred_ || spill_ != nullptr || !spill_durable_ ||
+    if (!restore_pending_ || spill_ != nullptr || !spill_durable_ ||
         spill_path_hint_.empty()) {
       return false;
     }
     auto candidate = std::make_unique<SpilledBaseline>(spill_path_hint_);
     candidate->set_keep_files(true);
-    if (!candidate->try_load_index(deferred_weight_, deferred_hash_)) {
+    if (!candidate->try_load_index(restore_weight_, restore_hash_)) {
       return false; // dtor keeps the (possibly stale) files for later saves
     }
     spill_ = std::move(candidate);
     pending_changes_.clear();
     sequence_++;
-    deferred_ = false;
-    deferred_hash_.clear();
+    restore_pending_ = false;
+    restore_hash_.clear();
     return true;
   }
 
@@ -650,7 +650,7 @@ public:
     }
   }
 
-  // ---- deferred baseline (D3c lazy restore) ----------------------------
+  // ---- restore-pending baseline (D3c lazy restore) ---------------------
   // A checkpoint-restored table whose save-time watermark matched live
   // storage does not need its baseline materialized to serve reads: the
   // restored sink already holds the view results. The baseline (and any
@@ -659,22 +659,24 @@ public:
   // semantically "exactly the committed table content", summarized by the
   // restore-time watermark carried here.
 
-  void mark_deferred(int64_t expected_weight, std::string row_hash) {
-    deferred_ = true;
-    deferred_weight_ = expected_weight;
-    deferred_hash_ = std::move(row_hash);
+  void mark_restore_pending(int64_t expected_weight, std::string row_hash) {
+    restore_pending_ = true;
+    restore_weight_ = expected_weight;
+    restore_hash_ = std::move(row_hash);
     // A deferred baseline IS the committed table content by construction —
     // the restore verified the save-time watermark against live storage. So
     // deferral is a RESIDENCY state, not a trust state: the content is
     // trusted, it is merely not materialized yet, and an exact delta is served
     // through prepare_deferred_for_delta rather than refused. Hence SEEDED
-    // here, with `deferred_` living beside the trust enum rather than in it.
+    // here, with `restore_pending_` living beside the trust enum rather than in it.
     mark_seeded();
   }
 
-  bool is_deferred() const { return deferred_; }
-  int64_t deferred_weight() const { return deferred_weight_; }
-  const std::string &deferred_hash() const { return deferred_hash_; }
+  // RESIDENCY, not trust — and deliberately not sharing a word with
+  // Baseline::Deferred, which is the trust state for "a seeding scan is owed".
+  bool restore_pending() const { return restore_pending_; }
+  int64_t restore_weight() const { return restore_weight_; }
+  const std::string &restore_hash() const { return restore_hash_; }
 
   // ---- baseline trust state ---------------------------------------------
   //
@@ -784,6 +786,13 @@ public:
     }
   }
 
+  // Watermark BEFORE state; mark_seed_deferred writes state before watermark.
+  // Neither order is safe on its own against a concurrent reader, and neither
+  // needs to be: both run under CDCManager::struct_mutex_ held EXCLUSIVELY (a
+  // fresh track/create) or under the scanned table's own exclusive lock, so no
+  // reader can observe the pair half-written. The atomics are for the LOCK-FREE
+  // readers of `baseline()` on the apply and read paths, which take only a
+  // shared lock and read one field.
   void mark_provisional(uint64_t watermark) {
     ready_watermark_ = watermark;
     baseline_ = Baseline::Provisional;
@@ -799,7 +808,14 @@ public:
   // Install the rows fed through begin_rebuild()/add_scanned_row() as the
   // baseline WITHOUT diffing against the previous one (there is none: the
   // table was deferred). Clears the deferred flag.
-  void install_rebuild(bool establishes = true) {
+  // `establishes`: MANDATORY, because the wrong answer is silent. TRUE only
+  // for a scan that could see everything a not-yet-Seeded baseline is waiting
+  // on — in practice the seeding scan, which CDCManager::seed_baseline already
+  // refuses to run inside an open user transaction. Every other caller
+  // REFRESHES content and passes false; establishing then belongs to
+  // CDCManager::retire_scanned_baseline, which asks the readiness and
+  // concurrency questions a refresh does not.
+  void install_rebuild(bool establishes) {
     if (establishes) {
       mark_seeded();
     }
@@ -814,8 +830,8 @@ public:
     }
     pending_changes_.clear();
     sequence_++;
-    deferred_ = false;
-    deferred_hash_.clear();
+    restore_pending_ = false;
+    restore_hash_.clear();
   }
 
   // Installs CONTENT and diffs it; it never touches the trust state. The one
@@ -876,17 +892,17 @@ public:
   }
 
   size_t state_size() const {
-    if (deferred_) {
+    if (restore_pending_) {
       // Distinct-row count is unknown while deferred; total weight is the
       // best (upper-bound) answer and exact for duplicate-free tables.
-      return static_cast<size_t>(deferred_weight_);
+      return static_cast<size_t>(restore_weight_);
     }
     return spill_ ? spill_->distinct_rows() : current_state_.size();
   }
 
   int64_t state_total_weight() const {
-    if (deferred_) {
-      return deferred_weight_; // restore-time COUNT(*), watermark-verified
+    if (restore_pending_) {
+      return restore_weight_; // restore-time COUNT(*), watermark-verified
     }
     if (spill_) {
       return spill_->total_weight();
@@ -909,7 +925,7 @@ public:
   // as StateBytes.
 
   const char *state_mode() const {
-    if (deferred_) {
+    if (restore_pending_) {
       return "deferred";
     }
     return spill_ ? "spilled" : "boxed";
@@ -917,7 +933,7 @@ public:
 
   size_t resident_bytes(StateAccounting &acct) const {
     size_t b = acct.zset_bytes(pending_changes_);
-    if (deferred_) {
+    if (restore_pending_) {
       return b; // nothing materialized yet
     }
     if (spill_) {
@@ -995,14 +1011,14 @@ private:
   std::string wm_hash_;
   // Restore-pending baseline (D3c): true until the first operation that needs
   // table state materializes it from a storage scan. RESIDENCY, not trust —
-  // see mark_deferred().
-  bool deferred_ = false;
+  // see mark_restore_pending().
+  bool restore_pending_ = false;
   // The one trust state — see Baseline above.
   std::atomic<Baseline> baseline_{Baseline::Unseeded};
   // The transaction-manager timestamp this state waits on; 0 = nothing.
   std::atomic<uint64_t> ready_watermark_{0};
-  int64_t deferred_weight_ = 0; // restore-time COUNT(*)
-  std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
+  int64_t restore_weight_ = 0; // restore-time COUNT(*)
+  std::string restore_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };
 
 // Base class for native materialized views
@@ -1151,7 +1167,7 @@ public:
   }
 
   // --- Lazy per-view checkpoint restore (D-lazy) -------------------------
-  // Mirrors TrackedTable::is_deferred()/mark_deferred() for views: a view
+  // Mirrors TrackedTable::restore_pending()/mark_restore_pending() for views: a view
   // cold-created (skip_init_replay) from the D3b checkpoint fast path with
   // dbsp_lazy_restore ON has its node/sink blobs stashed, undecoded, in
   // CDCManager::pending_restore_ instead of being injected immediately.
