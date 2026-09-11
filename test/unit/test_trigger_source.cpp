@@ -1271,6 +1271,10 @@ TEST_CASE("cdc: a deferred baseline is reconciled on EVERY commit path",
   SECTION("the debt is paid ONCE: later commits keep the fast path") {
     // The widening is a full scan-and-diff, so a flag that never cleared would
     // turn every subsequent commit on this connection into a sync_all.
+    // A1: the commit-hook sweep scans but cannot establish while anyone —
+    // including the committer itself, still registered at hook time — is
+    // open, so the first read after the commit pays the reconcile instead.
+    // The debt is still paid exactly once; only the payer moved.
     DuckDBTestHarness db;
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     tracked_but_unseeded(db);
@@ -1278,7 +1282,8 @@ TEST_CASE("cdc: a deferred baseline is reconciled on EVERY commit path",
     db.exec("INSERT INTO t VALUES (2, 3.0)");
     db.exec(
         "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
-    db.exec("COMMIT"); // pays the reconcile
+    db.exec("COMMIT"); // scans, but cannot establish yet
+    REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
     const auto scans = db.manager().scan_syncs();
     db.exec("INSERT INTO t VALUES (3, 4.0)");
     db.exec("INSERT INTO t VALUES (4, 5.0)");
@@ -1402,10 +1407,14 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   // self-healing at A's commit, but an incremental view returning a wrong
   // answer with no error is exactly what the invariant forbids.
   //
-  // The fix is on the APPLY path, where the per-instance signal already lives:
-  // apply_captured_deltas refuses an exact delta onto a table whose
+  // The fix was on the APPLY path, where the per-instance signal already
+  // lives: apply_captured_deltas refuses an exact delta onto a table whose
   // TrackedTable::Baseline is not SEEDED and hands it back to the caller,
-  // which reconciles that table by scan at that same commit.
+  // which reconciles that table by scan at that same commit. The A1
+  // correctness-first decision goes one step further: an UNTAINTED establish
+  // is refused while ANY older transaction is still open, so B's in-window
+  // reads below refuse instead of serving 110.0 — the accepted availability
+  // cost — and agree once A's transaction has ended.
 
   // Order independence. Every section below needs a genuinely unseeded
   // baseline, and it only gets one once the process-global trigger flag is on
@@ -1453,8 +1462,10 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
     db.exec(
         "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
     REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
-    REQUIRE(b_view(b) == b_sql(b)); // 110.0, not 100.0
+    // A1: refused while A's older transaction is still open (was 110.0).
+    REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->HasError());
     db.exec("COMMIT");
+    REQUIRE(b_view(b) == b_sql(b)); // 113.0 once A has ended
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t")); // 113
     db.exec("INSERT INTO t VALUES (7, 4.0)"); // and no constant offset
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
@@ -1473,9 +1484,12 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
       REQUIRE_FALSE(
           b.Query("INSERT INTO t VALUES (" + std::to_string(20 + i) + ", 1.0)")
               ->HasError());
-      REQUIRE(b_view(b) == b_sql(b)); // 11.0, 12.0, 13.0 — never 1.0, 2.0, 3.0
+      // A1: refused while A's older transaction is still open (was 11.0,
+      // 12.0, 13.0 — never 1.0, 2.0, 3.0; now never served at all in-window).
+      REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->HasError());
     }
     db.exec("COMMIT");
+    REQUIRE(b_view(b) == b_sql(b)); // 13.0 once A has ended
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
   }
 
@@ -1489,7 +1503,8 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
     db.exec(
         "SELECT * FROM dbsp_create_view('tv', 'SELECT SUM(v) AS s FROM t')");
     REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
-    REQUIRE(b_view(b) == b_sql(b)); // 110.0, not 100.0
+    // A1: refused while A's older transaction is still open (was 110.0).
+    REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->HasError());
     db.exec("ROLLBACK");
     db.exec("SELECT 1"); // statement boundary: the rebuild runs here
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
@@ -1500,7 +1515,9 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
   SECTION("B is inside its own explicit transaction") {
     // B's own commit is the one that must reconcile, and B's connection is
     // NOT the one holding the deferral — the scan it runs at commit time sees
-    // committed state, which is what the reconcile wants.
+    // committed state, which is what the reconcile wants. A1: the read that
+    // follows is still refused while A's older transaction is open (was
+    // 110.0); B's commit itself is unaffected.
     DuckDBTestHarness db;
     db.createTable("t", "id INTEGER, v DOUBLE", {"(1, 10.0)"});
     tracked_but_unseeded(db);
@@ -1512,8 +1529,9 @@ TEST_CASE("cdc: an unseeded baseline is never served to another connection",
     REQUIRE_FALSE(b.Query("BEGIN TRANSACTION")->HasError());
     REQUIRE_FALSE(b.Query("INSERT INTO t VALUES (5, 100.0)")->HasError());
     REQUIRE_FALSE(b.Query("COMMIT")->HasError());
-    REQUIRE(b_view(b) == b_sql(b)); // 110.0
+    REQUIRE(b.Query("SELECT * FROM dbsp_query('tv')")->HasError());
     db.exec("COMMIT");
+    REQUIRE(b_view(b) == b_sql(b)); // 110.0 once A has ended
     REQUIRE(view_sum(db, "tv") == sql_sum(db, "SELECT SUM(v) FROM t"));
   }
 

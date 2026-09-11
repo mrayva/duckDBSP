@@ -59,3 +59,56 @@ TEST_CASE("canary: autocommit hook ordering", "[engine_assumptions]") {
   // catalog entries here for autocommit statements
   REQUIRE_FALSE(probe->end_active);
 }
+
+TEST_CASE("internal connection keeps hooks suppressed through teardown",
+          "[engine_assumptions][internal_connection]") {
+  struct TeardownProbe : ClientContextState {
+    bool *guarded = nullptr;
+    ~TeardownProbe() override {
+      if (guarded) {
+        *guarded = dbsp_native::internal_query_depth > 0;
+      }
+    }
+  };
+  DuckDBTestHarness db;
+  const int before = dbsp_native::internal_query_depth;
+  bool guarded = false;
+  {
+    dbsp_native::InternalConnection owner(
+        *db.conn().context, dbsp_native::InternalReadPolicy::Forbidden,
+        "lifecycle canary");
+    REQUIRE(dbsp_native::internal_query_depth == before + 1);
+    auto probe = owner->context->registered_state->GetOrCreate<TeardownProbe>(
+        "dbsp_internal_teardown_probe");
+    probe->guarded = &guarded;
+    REQUIRE_FALSE(owner->Query("SELECT 1")->HasError());
+  }
+  REQUIRE(guarded);
+  REQUIRE(dbsp_native::internal_query_depth == before);
+}
+
+TEST_CASE("internal connection preserves explicit transaction policy",
+          "[engine_assumptions][internal_connection]") {
+  DuckDBTestHarness db;
+  db.exec("BEGIN");
+  const int before = dbsp_native::internal_query_depth;
+  auto forbidden = [&] {
+    dbsp_native::InternalConnection owner(
+        *db.conn().context, dbsp_native::InternalReadPolicy::Forbidden,
+        "policy canary");
+  };
+  if (dbsp_native::strict_internal_query()) {
+    REQUIRE_THROWS_WITH(forbidden(), Catch::Contains("policy canary"));
+  } else {
+    REQUIRE_NOTHROW(forbidden());
+  }
+  REQUIRE(dbsp_native::internal_query_depth == before);
+  {
+    dbsp_native::InternalConnection owner(
+        *db.conn().context, dbsp_native::InternalReadPolicy::AllowedInTxn,
+        "committed bookkeeping is deliberately independent");
+    REQUIRE_FALSE(owner->Query("SELECT 1")->HasError());
+  }
+  REQUIRE(dbsp_native::internal_query_depth == before);
+  db.exec("ROLLBACK");
+}

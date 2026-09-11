@@ -132,11 +132,10 @@ inline bool user_transaction_open(duckdb::ClientContext &context) {
 /// of the fourth.
 ///
 /// It stays a RULE rather than a blanket assertion because there are legitimate
-/// exceptions. The design that was rejected is a check inside
-/// `InternalQueryGuard`: 39 call sites, no `ClientContext` to ask, and
-/// exceptions that would false-positive. Instead each helper that opens an
-/// internal connection takes an explicit policy, so every exception is
-/// whitelisted IN CODE at its call site with its reason.
+/// exceptions. `InternalConnection` owns the recursion guard and connection
+/// and checks this policy before constructing the connection. Shared scan
+/// helpers retain caller policy/site arguments because their transaction
+/// contracts differ. Guard-only scopes do not have a ClientContext to check.
 ///
 /// Off by default. A `Forbidden` call inside a user transaction is a bug the
 /// commit reconcile usually papers over, and turning that paper-over into a

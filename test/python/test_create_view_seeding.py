@@ -309,17 +309,16 @@ def third_party_scan_case(label, path):
 
 
 def untainted_third_party_scan_case(label, path):
-    """The other half of the taint rule: a third party's scan is WELCOME here.
+    """Untainted does NOT mean any scan may establish it — only a scan with
+    no pre-track transaction still open.
 
-    A tracks the table BEFORE writing to it, so every write A makes is
-    accounted for — `capture_.touched` names the table at A's own commit (and
-    once the triggers exist they feed it directly). A scan at committed state
-    plus those deltas is exactly right, so B's `dbsp_sync()` may establish the
-    baseline, B is SERVED during the window instead of refused, and A's commit
-    lands the rest.
-
-    This is the case that must not regress when `third_party_scan` is fixed:
-    refusing here would trade a rare wrong answer for a common outage.
+    A tracks the table BEFORE writing to it, so A's own writes are accounted
+    for — but A opened its transaction BEFORE the track, and the establisher
+    cannot tell an empty pre-track transaction from one holding untracked
+    writes (A1, correctness-first owner decision 2026-09-10). B's in-window
+    sync must therefore refuse rather than establish while A is still open;
+    once A commits, the baseline establishes and every read agrees. A writer
+    that opens AFTER the track does not block establishes (the 110.0 pins).
     """
     a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
     b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
@@ -334,13 +333,18 @@ def untainted_third_party_scan_case(label, path):
         ).fetchall()                                  # tracked first: untainted
         a.execute("INSERT INTO t VALUES (2, 3.0)")    # accounted for by touched
 
-        b.execute("SELECT * FROM dbsp_sync()").fetchall()
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()  # must not establish
 
-        # SERVED, and correct for B's own snapshot: A's row is uncommitted, so
-        # plain SQL on B does not see it either.
-        v = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
-        sq = b.execute("SELECT sum(v) FROM t").fetchall()
-        assert v == sq, f"{label}/B in window: view {v} != SQL {sq}"
+        # REFUSED while A (open since before the track) is still open — even
+        # though A's own write postdates it. Plain SQL on B agrees the refusal
+        # is honest: it cannot see A's row either.
+        try:
+            rows = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            raise AssertionError(
+                f"{label}: B was served {rows} while a pre-track "
+                f"transaction still open")
+        except duckdb.InvalidInputException as e:
+            assert "baseline" in str(e), f"{label}: unexpected error {e}"
 
         a.execute("COMMIT")
         v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
@@ -350,8 +354,8 @@ def untainted_third_party_scan_case(label, path):
         v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
         sq = a.execute("SELECT sum(v) FROM t").fetchall()
         assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
-        print(f"ok: {label} — untainted, so a third party may establish it "
-              f"({v})", flush=True)
+        print(f"ok: {label} — refused while a pre-track transaction is open, "
+              f"agrees once it ends ({v})", flush=True)
     finally:
         b.close()
         a.close()
@@ -452,6 +456,58 @@ def tainted_change_third_party_scan_case(label, path, change_sql):
         print(f"ok: {label} — a pre-tracking {change_sql.split()[0]} taints "
               f"the deferral too ({v})", flush=True)
     finally:
+        b.close()
+        a.close()
+
+
+def concurrent_writer_third_party_case(label, path):
+    """A1: a concurrent non-deferring writer's rows must not be baked out.
+
+    A starts and writes t while t is untracked; D starts AFTER A and also
+    writes t while it is still untracked; A tracks t (tainted) and commits.
+    The commit sweep must NOT establish the baseline while D is still open,
+    and B's in-window sync must refuse rather than establish short — D's
+    write was folded while t was untracked, so nothing but a post-D scan
+    can pay it. Measured before the fix: view established without D's rows
+    (13.0 served, then permanently short of truth), B served in-window.
+    """
+    a = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    b = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    d = duckdb.connect(path, config={"allow_unsigned_extensions": "true"})
+    try:
+        for con in (a, b, d):
+            con.execute(f"LOAD '{EXT}'")
+        a.execute("CREATE TABLE t (id INTEGER, v DOUBLE)")
+        a.execute("INSERT INTO t VALUES (1, 10.0), (2, 3.0)")
+        a.execute("BEGIN TRANSACTION")
+        a.execute("INSERT INTO t VALUES (4, 4.0)")     # A holds uncommitted
+        d.execute("BEGIN TRANSACTION")
+        d.execute("INSERT INTO t VALUES (5, 5.0)")     # D holds uncommitted
+        a.execute(
+            "SELECT * FROM dbsp_create_view('mv','SELECT sum(v) AS s FROM t')"
+        ).fetchall()
+
+        a.execute("COMMIT")                            # sweep must wait: D open
+        b.execute("SELECT * FROM dbsp_sync()").fetchall()  # must not establish
+        try:
+            rows = b.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            raise AssertionError(
+                f"{label}: B was served {rows} while D still open")
+        except duckdb.InvalidInputException as e:
+            assert "baseline" in str(e), f"{label}: unexpected error {e}"
+
+        d.execute("COMMIT")                            # sweep pays with all rows
+        for who, con in (("A", a), ("B", b), ("D", d)):
+            v = con.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+            sq = con.execute("SELECT sum(v) FROM t").fetchall()
+            assert v == sq, f"{label}/{who} after D COMMIT: view {v} != SQL {sq}"
+        a.execute("INSERT INTO t VALUES (6, 1.0)")     # and no constant offset
+        v = a.execute("SELECT * FROM dbsp_query('mv')").fetchall()
+        sq = a.execute("SELECT sum(v) FROM t").fetchall()
+        assert v == sq, f"{label} after edit: view {v} != SQL {sq}"
+        print(f"ok: {label} — D's rows paid at D's commit ({v})", flush=True)
+    finally:
+        d.close()
         b.close()
         a.close()
 
@@ -592,6 +648,18 @@ def cross_connection_case(label, path, shape):
             assert v == s, f"{label}/{tag}: view {v} != SQL {s}"
             return v
 
+        def refused(who, tag):
+            # A1 correctness-first: an untainted establish is refused while
+            # A1 correctness-first: an untainted establish is refused while
+            # ANY older transaction is still open — A's window transaction
+            # qualifies even though it never wrote before the track.
+            try:
+                rows = who.execute("SELECT * FROM dbsp_query('tv')").fetchall()
+                raise AssertionError(
+                    f"{label}/{tag}: served {rows} while A still open")
+            except duckdb.InvalidInputException as e:
+                assert "baseline" in str(e), f"{label}/{tag}: {e}"
+
         a.execute("BEGIN TRANSACTION")
         if shape == "a_writes_too":
             a.execute("INSERT INTO t VALUES (2, 3.0)")
@@ -602,17 +670,19 @@ def cross_connection_case(label, path, shape):
         if shape == "repeated":
             for i in range(3):
                 b.execute(f"INSERT INTO t VALUES ({20 + i}, 1.0)")
-                agree(b, f"B write {i}")     # 11.0, 12.0, 13.0
+                refused(b, f"B write {i}")     # was 11.0, 12.0, 13.0: refused
             a.execute("COMMIT")
+            agree(b, "after A commit")
         elif shape == "b_in_txn":
             b.execute("BEGIN TRANSACTION")
             b.execute("INSERT INTO t VALUES (5, 100.0)")
             b.execute("COMMIT")
-            agree(b, "B explicit commit")    # 110.0
+            refused(b, "B explicit commit")    # was 110.0: refused
             a.execute("COMMIT")
+            agree(b, "after A commit")
         elif shape == "rollback":
             b.execute("INSERT INTO t VALUES (5, 100.0)")
-            agree(b, "B write while A open")  # 110.0
+            refused(b, "B write while A open")  # was 110.0: refused
             a.execute("ROLLBACK")
             b.execute("SELECT 1").fetchall()
             agree(b, "after A rollback")
@@ -620,8 +690,9 @@ def cross_connection_case(label, path, shape):
             agree(b, "next B write")
         else:  # a_writes_too / plain
             b.execute("INSERT INTO t VALUES (5, 100.0)")
-            agree(b, "B write while A open")  # 110.0
+            refused(b, "B write while A open")  # was 110.0: refused
             a.execute("COMMIT")
+            agree(b, "after A commit")
         v = agree(a, "final")
         a.execute("INSERT INTO t VALUES (7, 4.0)")  # no constant offset
         agree(a, "after a later edit")
@@ -636,6 +707,9 @@ with tempfile.TemporaryDirectory() as tmp:
                                "b_in_txn", "rollback")):
         cross_connection_case(f"cross/{shape}",
                               os.path.join(tmp, f"x_{i}.duckdb"), shape)
+    concurrent_writer_third_party_case(
+        "concurrent_writer_third_party",
+        os.path.join(tmp, "concurrent_writer.duckdb"))
 
 drain = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
 drain.execute(f"LOAD '{EXT}'")

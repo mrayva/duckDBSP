@@ -126,6 +126,33 @@ struct InternalQueryGuard {
   InternalQueryGuard &operator=(const InternalQueryGuard &) = delete;
 };
 
+// Own the recursion guard before opening the connection; reverse member
+// destruction keeps hooks suppressed through Connection/ClientContext teardown.
+// Policy remains explicit: callers sharing a scan helper can have different
+// transaction contracts, and the commit hook has already lost that context.
+class InternalConnection {
+public:
+  InternalConnection(duckdb::ClientContext &context, InternalReadPolicy policy,
+                     const char *site)
+      : connection_(checked_database(context, policy, site)) {}
+
+  duckdb::Connection &operator*() { return connection_; }
+  duckdb::Connection *operator->() { return &connection_; }
+  InternalConnection(const InternalConnection &) = delete;
+  InternalConnection &operator=(const InternalConnection &) = delete;
+
+private:
+  static duckdb::DatabaseInstance &checked_database(
+      duckdb::ClientContext &context, InternalReadPolicy policy,
+      const char *site) {
+    enforce_internal_read_policy(context, policy, site);
+    return duckdb::DatabaseInstance::GetDatabase(context);
+  }
+
+  InternalQueryGuard guard_;
+  duckdb::Connection connection_;
+};
+
 // ---- instance transaction watermark ---------------------------------------
 //
 // A table is seeded from COMMITTED storage. Another connection holding a
@@ -881,12 +908,11 @@ public:
       // at restore, beside circuit state that is likewise committed-only
       // (deltas apply at commit), so a reader that cannot see an open
       // transaction's rows is reading exactly the right thing.
-      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                   "save_checkpoint (bookkeeping DDL + "
-                                   "source watermarks)");
       DbspScopeTimer t_write("ckpt_write", "tables+watermarks");
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(
+          context, InternalReadPolicy::AllowedInTxn,
+          "save_checkpoint (bookkeeping DDL + source watermarks)");
+      auto &con = *con_owner;
       con.Query("BEGIN");
       if (preserve_pending.empty()) {
         con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, "
@@ -1310,14 +1336,14 @@ public:
     // against live COMMITTED storage, which is the state the saved circuit
     // corresponds to. Reached from load_from_duck_table, which can run inside
     // an open user transaction.
-    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                 "checkpoint_valid (restore watermarks)");
     const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
     const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(
+          context, InternalReadPolicy::AllowedInTxn,
+          "checkpoint_valid (restore watermarks)");
+      auto &con = *con_owner;
       // Scope the existence check to the right catalog when one is given.
       std::string exists_sql;
       if (catalog.empty()) {
@@ -1982,10 +2008,9 @@ public:
       // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
       // user's, so it never needs to see their uncommitted catalog — the
       // hazard the sweep's DDL hit.
-      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                   "save_view_definitions");
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "save_view_definitions");
+      auto &con = *con_owner;
       con.Query("BEGIN");
       auto res = con.Query(
           "CREATE TABLE IF NOT EXISTS " + qtable +
@@ -2735,11 +2760,9 @@ public:
         // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the
         // user's, so it never needs to see their uncommitted catalog — the
         // hazard the sweep's DDL hit.
-        enforce_internal_read_policy(context,
-                                     InternalReadPolicy::AllowedInTxn,
-                                     "create_view _dbsp_views upsert");
-        InternalQueryGuard guard;
-        duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+        InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                      "create_view _dbsp_views upsert");
+        auto &con = *con_owner;
         con.Query("CREATE TABLE IF NOT EXISTS _dbsp_views (name VARCHAR "
                   "PRIMARY KEY, sql VARCHAR, sources VARCHAR, created_at "
                   "BIGINT)");
@@ -3507,10 +3530,9 @@ public:
       // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
       // user's, so it never needs to see their uncommitted catalog — the
       // hazard the sweep's DDL hit.
-      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                   "erase_persisted_view_row");
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "erase_persisted_view_row");
+      auto &con = *con_owner;
       con.Query("DELETE FROM _dbsp_views WHERE name = '" + name + "'");
       // Ignore errors (including "table does not exist") — persistence is
       // best-effort throughout this file.
@@ -3535,10 +3557,9 @@ public:
       // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
       // user's, so it never needs to see their uncommitted catalog — the
       // hazard the sweep's DDL hit.
-      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                   "erase_persisted_checkpoint_rows");
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "erase_persisted_checkpoint_rows");
+      auto &con = *con_owner;
       con.Query("DELETE FROM _dbsp_ckpt WHERE name = '" + name + "'");
       // Ignore errors (including "table does not exist") — persistence is
       // best-effort throughout this file.
@@ -4454,6 +4475,53 @@ public:
     ViewReadBlock out;
     view_read_block_locked(view_name, seen, out);
     return out;
+  }
+
+  // Shared by the establish gate (retire_scanned_baseline) and the read
+  // gate's message (EnsureViewReadable): whether an UNTAINTED baseline may
+  // be established by a scan taken now. (A1, correctness-first owner
+  // decision 2026-09-10: an older open transaction may hold untracked
+  // pre-establish writes invisible to this scan. Reads no table data, only
+  // start timestamps.)
+  //
+  // With a live statement transaction, the reference is its own start: only
+  // a transaction OLDER than the scan is waited on (self never blocks). With
+  // no live transaction — the commit-hook sweep runs after Commit() cleared
+  // it — there is nothing to be older than, so only a completely empty
+  // active set establishes: anyone still open may hold folded writes, and
+  // the committer itself cannot be told apart. That keeps the commit-pays
+  // path (alone) while refusing the third-party establish the old rule
+  // allowed. Anything else unresolvable answers false: refusing is safe.
+  bool untainted_establish_allowed(duckdb::ClientContext &context,
+                                   const std::string &table_name) {
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return false;
+      }
+      auto &tm = duckdb::TransactionManager::Get(*attached);
+      if (!tm.IsDuckTransactionManager()) {
+        return true;
+      }
+      uint64_t mine;
+      try {
+        mine = static_cast<uint64_t>(
+            duckdb::DuckTransaction::Get(context, *attached).start_time);
+      } catch (...) {
+        // No live statement transaction (commit-hook sweep): establish only
+        // when nobody at all is still active.
+        const uint64_t hook_lowest = static_cast<uint64_t>(
+            duckdb::DuckTransactionManager::Get(*attached)
+                .LowestActiveStart());
+        return hook_lowest ==
+               static_cast<uint64_t>(duckdb::MAX_TRANSACTION_ID);
+      }
+      const uint64_t lowest = static_cast<uint64_t>(
+          duckdb::DuckTransactionManager::Get(*attached).LowestActiveStart());
+      return lowest >= mine;
+    } catch (...) {
+      return false;
+    }
   }
 
   // Scan a view's rows under shared locks: safe against concurrent
@@ -5461,10 +5529,9 @@ public:
       // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the user's,
       // so it never needs to see their uncommitted catalog — the hazard the
       // sweep's DDL hit.
-      enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                   "initialize_persistence_table");
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "initialize_persistence_table");
+      auto &con = *con_owner;
       auto result = con.Query(
         "CREATE TABLE IF NOT EXISTS _dbsp_views ("
         "  name VARCHAR PRIMARY KEY,"
@@ -5531,10 +5598,9 @@ private:
                     const std::string &table_key,
                     const std::function<void(DuckDBRow &&)> &emit,
                     InternalReadPolicy policy, const char *site) {
-    enforce_internal_read_policy(context, policy, site);
-    InternalQueryGuard guard;
-    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
-    duckdb::Connection fresh_con(fresh_db);
+    InternalConnection fresh_con_owner(context, policy,
+                                  site);
+    auto &fresh_con = *fresh_con_owner;
     // Streaming execution (H5): rows are consumed chunk by chunk below,
     // so materializing the whole table into a QueryResult first was one
     // extra full-table copy per sync
@@ -5636,9 +5702,9 @@ private:
                              std::string &hash, InternalReadPolicy policy,
                              const char *site) {
     try {
-      enforce_internal_read_policy(context, policy, site);
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, policy,
+                                    site);
+      auto &con = *con_owner;
       // Shadow-proof alias — see save_checkpoint's watermark loop.
       auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
                           "__dbsp_wm_row)) AS VARCHAR) FROM " +
@@ -6082,8 +6148,20 @@ private:
               "table.",
               table_name);
         }
-        it->second->mark_seed_deferred(probe.watermark,
-                                       new_tracking && probe.tainted);
+        // Record the debt, without moving a recorded watermark forward past
+        // the retrying transaction itself: a retry (new_tracking=false) runs
+        // over an ALREADY-tracked table, so every write the caller holds went
+        // to triggers or commit capture — widening to the probe's watermark
+        // would hold the debt until the caller itself ends, availability for
+        // no coverage gain. The recorded watermark already covers everyone
+        // open at TRACK time, and anyone who opened later is trigger-covered.
+        // The one exception is a table that never recorded a debt (Unseeded
+        // direct track): there the probe's watermark is the first coverage,
+        // taken as-is.
+        const uint64_t recorded = it->second->ready_watermark();
+        it->second->mark_seed_deferred(
+            (new_tracking || recorded == 0) ? probe.watermark : recorded,
+            new_tracking && probe.tainted);
       }
       return true;
     }
@@ -6115,13 +6193,25 @@ private:
   //               buffer), or any append (local storage). It reads the
   //               caller's OWN transaction state, not committed storage, so
   //               the internal-connection law does not apply to it.
-  //   watermark — this transaction's start + 1, so `lowest_active_start >=
-  //               watermark` is exactly "that transaction is no longer
-  //               active". DuckDB removes a transaction from the active set
+  //   watermark — a start timestamp strictly newer than every transaction
+  //               active on the catalog RIGHT NOW (`probe_new_start_timestamp`,
+  //               which mints one by opening and rolling back a probe
+  //               transaction — the manager's counter is not publicly
+  //               readable). `lowest_active_start >= watermark` is exactly
+  //               "every transaction that was open at tracking time has
+  //               ended". That INCLUDES a concurrent writer that started after
+  //               the deferring transaction but before the track: its
+  //               untracked pre-establish writes are invisible to any scan
+  //               taken while it is open, and establishing without them bakes
+  //               them out permanently (A1: measured `view 13.0` against SQL
+  //               `17.0`, permanently). The deferring transaction's own
+  //               start + 1 is NOT enough — it clears while such a writer is
+  //               still open. DuckDB removes a transaction from the active set
   //               inside Commit(), BEFORE the TransactionCommit callbacks
   //               (duckdb/src/transaction/transaction_context.cpp), so the
   //               deferring connection's own commit hook sees it cleared and
-  //               pays the debt there.
+  //               pays the debt there — and so does any other connection's,
+  //               once every covered transaction has ended.
   //
   // CONSERVATIVE, deliberately. The engine does record WHICH table each
   // uncommitted change belongs to — DeleteInfo, UpdateInfo and AppendInfo all
@@ -6173,7 +6263,15 @@ private:
       }
       auto &txn = duckdb::DuckTransaction::Get(context, *attached);
       probe.tainted = txn.ChangesMade();
-      probe.watermark = static_cast<uint64_t>(txn.start_time) + 1;
+      // Widened (A1, correctness-first owner decision): strictly newer than
+      // every transaction active right now, not the caller's own start + 1.
+      // Zero means the probe could not mint one — answer nothing rather than
+      // record a debt no watermark can retire (same refusal as below).
+      const uint64_t watermark = probe_new_start_timestamp(context, *attached);
+      if (watermark == 0) {
+        return probe;
+      }
+      probe.watermark = watermark;
       probe.answered = true;
       return probe;
     } catch (...) {
@@ -6279,11 +6377,17 @@ private:
   //   * UNTAINTED (TrackedTable::pre_trigger_rows() false) — the deferring
   //     transaction tracked the table BEFORE it wrote to it, so every write it
   //     makes is accounted for: by its triggers, or by `capture_.touched`
-  //     naming the table at its own commit. A scan at committed state plus
-  //     those deltas is exactly right, so ANY scan may establish the baseline.
-  //     That is what keeps a second connection reading correct answers during
-  //     the window — `cdc: an unseeded baseline is never served to another
-  //     connection` pins 110.0, not an error.
+  //     naming the table at its own commit. Those account for the DEFERRING
+  //     transaction only. A scan may therefore establish the baseline ONLY
+  //     once no transaction OLDER than the scan itself is still open: an
+  //     older open transaction may hold untracked pre-establish writes that
+  //     are invisible here and would be baked out permanently once SEEDED
+  //     (A1, correctness-first owner decision 2026-09-10). In hook context
+  //     there is no caller transaction, so "older" degrades to "anyone else
+  //     open" and the deferring connection's own commit still pays when it
+  //     is alone. This refuses the untainted third-party establish the old
+  //     rule allowed — the 110.0-during-the-window pins become
+  //     refusal-in-window, the accepted availability cost.
   //   * TAINTED — the deferring transaction already held uncommitted changes
   //     when the table was tracked (any at all — appends, deletes, updates:
   //     `DuckTransaction::ChangesMade()`, see probe_deferring_transaction for
@@ -6297,8 +6401,9 @@ private:
   //
   // A tainted table therefore stays DEFERRED — reads refused, which is the
   // acceptable price for the rare write-then-track-in-one-transaction shape —
-  // until the deferring transaction ends and the watermark clears. Its own
-  // commit sweep is normally the scan that does it.
+  // until the deferring transaction ends and the watermark clears. The first
+  // statement-context scan after that establishes it; a commit-hook sweep
+  // scans but cannot establish while anyone is still registered (A1).
   //
   // The seeding-path concurrency check (mark_provisional_if_concurrent) is NOT
   // asked here, and cannot be: it needs a reference start timestamp, and a
@@ -6333,6 +6438,20 @@ private:
     if (table.pre_trigger_rows() &&
         !ready_watermark_cleared(context, table_name, table)) {
       return; // rows nobody will report, and their transaction is still alive
+    }
+    // UNTAINTED establish (A1, correctness-first): no older open transaction.
+    // The widened readiness watermark covers every transaction open at TRACK
+    // time for the sweep pre-filter; this refuses the establish itself while
+    // ANY transaction older than the establishing scan is still open — such
+    // a transaction may hold untracked pre-establish writes invisible here
+    // that would be baked out permanently once SEEDED. With no live
+    // statement transaction (commit-hook sweep) only an empty active set
+    // establishes. Refusal is transient: the next scan after that
+    // transaction ends establishes normally. This is the accepted
+    // availability cost: reads during the window are refused instead of
+    // served (the 110.0 pins).
+    if (!untainted_establish_allowed(context, table_name)) {
+      return;
     }
     table.mark_seeded();
   }
@@ -6490,8 +6609,8 @@ private:
     // the strict switch exists to produce.
     enforce_internal_read_policy(context, policy, site);
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, policy, site);
+      auto &con = *con_owner;
       auto wm = con.Query(
           "SELECT COUNT(*), CAST(bit_xor(hash(__dbsp_wm_row)) AS VARCHAR) "
           "FROM " +
@@ -6523,11 +6642,10 @@ private:
           // the same shape and the same path as the seeding scan below, and it
           // decides whether that scan spills. A count taken without the
           // caller's uncommitted rows is the wrong count for them.
-          enforce_internal_read_policy(
+          InternalConnection con_owner(
               context, InternalReadPolicy::Forbidden,
               "sync_table_internal (auto-spill probe)");
-          InternalQueryGuard guard;
-          duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+          auto &con = *con_owner;
           auto cnt = con.Query("SELECT COUNT(*) FROM " +
                                quote_table_key(table_name));
           if (!cnt->HasError() && cnt->RowCount() == 1 &&
@@ -6584,10 +6702,9 @@ private:
       duckdb::ClientContext &context, const std::string &table_key,
       const std::function<void(const std::vector<uint8_t> &)> &emit,
       InternalReadPolicy policy, const char *site) {
-    enforce_internal_read_policy(context, policy, site);
-    InternalQueryGuard guard;
-    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
-    duckdb::Connection fresh_con(fresh_db);
+    InternalConnection fresh_con_owner(context, policy,
+                                  site);
+    auto &fresh_con = *fresh_con_owner;
     auto sql_result =
         fresh_con.SendQuery("SELECT * FROM " + quote_table_key(table_key));
     if (!sql_result || sql_result->HasError()) {

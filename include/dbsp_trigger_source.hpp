@@ -734,10 +734,9 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     // user's uncommitted catalog changes, which is why it sits ABOVE the
     // "defer while the user's transaction is open" check rather than below it.
     // See the paragraph above.
-    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                 "trigger sweep duckdb_triggers() read");
-    InternalQueryGuard guard;
-    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+    InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                  "trigger sweep duckdb_triggers() read");
+    auto &con = *con_owner;
     const auto live_triggers = read_dbsp_triggers(con);
     for (auto &c : unproven) {
       if (triggers_present(live_triggers, c.key, c.table, c.fingerprint)) {
@@ -828,10 +827,9 @@ inline ReconcileResult install_pending_triggers(duckdb::ClientContext &context,
     // "note" not found` out of a user's own COMMIT. The deferral check above
     // already keeps it out of an open transaction, so a throw under the strict
     // switch means that check has been bypassed.
-    enforce_internal_read_policy(context, InternalReadPolicy::Forbidden,
-                                 "trigger sweep DDL");
-    InternalQueryGuard guard;
-    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+    InternalConnection con_owner(context, InternalReadPolicy::Forbidden,
+                                  "trigger sweep DDL");
+    auto &con = *con_owner;
 
     // The DBSP triggers already on the tables we are about to touch. Needed
     // because a body generated under an OLDER fingerprint carries an older
@@ -965,10 +963,9 @@ inline void maybe_drain_trigger_sinks(duckdb::ClientContext &context) {
     // there by construction), so the strict switch could not fire here anyway.
     // Declared so the question is asked in code rather than left to whoever
     // reads this next.
-    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
-                                 "maybe_drain_trigger_sinks");
-    InternalQueryGuard guard;
-    duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+    InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                  "maybe_drain_trigger_sinks");
+    auto &con = *con_owner;
     // Ask the catalog which sinks exist rather than trusting an install
     // record: in a non-trigger mode this process never installed anything and
     // has no record, yet the sinks are there and filling.

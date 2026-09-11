@@ -140,9 +140,10 @@ It is OFF by default deliberately: such a call is a bug the commit reconcile
 usually papers over, and turning that paper-over into a crash in production
 would trade a wrong answer for an outage.
 
-An assertion inside `InternalQueryGuard` was rejected — 39 call sites, no
-`ClientContext` to ask, and legitimate exceptions that would false-positive.
-Every exception is whitelisted IN CODE at its call site with its reason.
+`InternalQueryGuard` remains a context-free recursion guard.
+`InternalConnection` checks policy at construction and owns that guard through
+connection destruction. Shared helpers still forward explicit policy and site;
+every exception is documented at its call site.
 
 Proof it bites, run 2026-09-04: flipping the `duckdb_triggers()` whitelist to
 `Forbidden` turns the strict run red (`trigger_source` fails, 44/45) with
@@ -384,3 +385,16 @@ bands — regressions here have reverted otherwise-working designs.
   flags); sanitizer-build numbers are 20-30x slower and never quoted.
 
 For questions or issues, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+### Internal connection ownership
+
+`InternalConnection` in `dbsp_cdc.hpp` binds the recursion guard to the
+connection lifetime and checks the caller's explicit read policy before opening
+it. The guard survives connection destruction, including context teardown.
+Directly adjacent policy/guard/connection sites use this owner. Other legacy
+connection sites and policy/site forwarding remain; this is not blanket coverage
+of all internal connections. Checks preceding catch boundaries are retained.
+The strict switch still cannot detect a user transaction already cleared before
+the commit hook. The `[internal_connection]` canaries cover teardown suppression,
+construction-failure unwinding, and explicit allowed/forbidden transaction policy;
+run them both normally and with `DBSP_STRICT_INTERNAL_QUERY=1` in a fresh process.

@@ -685,14 +685,16 @@ owner decision).
   table's watermark — but the reasoning has to be got right before the gate is
   loosened, and a wrong answer is worse than an error.
 
-- **OPEN — a concurrent writer that never deferred anything.** The readiness
-  watermark a DEFERRED table carries is the deferring transaction's own start
-  + 1, and it is consulted only when the deferral is tainted. It therefore
-  covers exactly one transaction — the one that deferred a seed on that table
-  (for PROVISIONAL, every transaction alive at ITS seed time). A transaction on
-  another connection that wrote the table while it was untracked, and deferred
-  nothing, is invisible to it. Two shapes, both measured on the round-4 tree,
-  both permanent wrong answers with no error:
+- **CLOSED 2026-09-10 — a concurrent writer that never deferred anything.**
+  (Owner decision: correctness-first. Resolution at the end.)
+  The readiness watermark a DEFERRED table carried was the deferring
+  transaction's own start + 1, and it was consulted only when the deferral
+  was tainted. It therefore covered exactly one transaction — the one that
+  deferred a seed on that table (for PROVISIONAL, every transaction alive at
+  ITS seed time). A transaction on another connection that wrote the table
+  while it was untracked, and deferred nothing, was invisible to it. Two
+  shapes, both measured on the round-4 tree, both permanent wrong answers
+  with no error:
 
   ```
   -- tainted deferral, younger writer
@@ -708,36 +710,28 @@ owner decision).
   -- untainted deferral, any concurrent writer
   A: BEGIN; SELECT count(*) FROM t;                  -- A has written nothing
   D: BEGIN; INSERT INTO t VALUES (3, 4.0);           -- t untracked
-  A: dbsp_create_view('mv', 'SELECT sum(v) FROM t')  -- t tracked, DEFERRED, UNTAINTED
+  A: dbsp_create_view('mv', 'SELECT sum(v) AS s FROM t')  -- t tracked, DEFERRED, UNTAINTED
   B: SELECT * FROM dbsp_sync()                       -- untainted: any scan may establish -> SEEDED at 10.0
   A: COMMIT; D: COMMIT                               -- D's row is reported by nothing
      dbsp_query('mv') -> 10.0    SELECT sum(v) FROM t -> 14.0    then 11.0 / 15.0
   ```
 
-  Why the watermark cannot see it: in the first shape D's start is above A's
-  watermark, so D's openness never holds the scan back; in the second the
-  watermark is not consulted at all, because the untainted rule lets any scan
-  establish. What this path lacks is the seeding path's concurrency check: a
-  NON-deferred seed runs `mark_provisional_if_concurrent` and waits on every
-  older open transaction, while a deferred seed's establishing scan runs later,
-  from a hook with no caller transaction to be relative to, and asks nothing
-  about other writers. Pre-existing — every scan that has ever retired
-  DEFERRED had this blind spot; the taint rule (fix 3) closed the
-  third-party-scan wrong answer, not this one. Measured 2026-09-04; not pinned.
-
-  Fix direction, and its cost: take the DEFERRED watermark at tracking time as
-  a start timestamp newer than every transaction alive at that moment
-  (`probe_new_start_timestamp`, exactly as PROVISIONAL does) instead of the
-  deferring transaction's own start, and consult it for untainted deferrals
-  too. That holds the establishing scan until every transaction that could
-  have written the table untracked is gone, which closes both shapes. It also
-  refuses the untainted third-party establish for as long as ANY transaction
-  that was open at tracking time is still open — the deferring transaction
-  included, so the shape `cdc: an unseeded baseline is never served to another
-  connection` pins at 110.0 becomes a refusal for the length of A's
-  transaction, and so does `untainted_third_party_scan`. That is the trade this
-  design has refused so far (a rare wrong answer against a common outage); it
-  is an owner decision, not a fix-round edit.
+  Resolution: the DEFERRED watermark is now taken as `probe_new_start_timestamp`
+  at tracking time (strictly newer than every transaction alive then, exactly
+  as PROVISIONAL does), so the sweep pre-filter holds the establishing scan
+  until every track-time contemporary is gone — closing the tainted shape.
+  And an UNTAINTED establish is additionally refused while ANY transaction
+  older than the establishing scan is still open
+  (`untainted_establish_allowed`), closing the untainted shape: a concurrent
+  writer's untracked rows can no longer be baked out by a scan that cannot see
+  them. A retry over an already-tracked table keeps the recorded watermark
+  (its writes are trigger-fed or commit-captured). The accepted cost is
+  availability: the untainted third-party establish refuses for the length of
+  any older open transaction, so `cdc: an unseeded baseline is never served
+  to another connection` pins refusal-in-window instead of 110.0, and so does
+  `untainted_third_party_scan`. Pinned by `concurrent_writer_third_party` in
+  test/python/test_create_view_seeding.py (RED before: B served 17.0 while D
+  open, view permanently short after).
 
 - **The strict switch cannot see a commit hook.** `DBSP_STRICT_INTERNAL_QUERY=1`
   fires on `user_transaction_open(context)`, and DuckDB clears the transaction

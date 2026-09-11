@@ -581,19 +581,25 @@ static void EnsureViewReadable(ClientContext &context,
     }
   }
   if (block.state == Baseline::Deferred) {
-    // Two different reasons nothing has established it yet, and they call for
-    // different remedies — say the one that applies (ViewReadBlock carries the
-    // taint of the blocking table).
+    // Three different reasons nothing has established it yet, and they call
+    // for different remedies — say the one that applies (ViewReadBlock
+    // carries the taint of the blocking table; the older-open check is read
+    // live because that state moves under every commit).
     const string why =
         block.pre_trigger_rows
             ? "That transaction may be on ANOTHER connection, and it had "
               "already changed the table when it was tracked: nothing else can "
               "report those changes, so no scan taken while it is open — "
               "dbsp_sync() included — can establish the baseline. "
-            : "That transaction is this connection's own, or no scan has run "
-              "since: another connection's scan (a dbsp_sync(), or any commit "
-              "there) can establish it, and so can the deferring transaction's "
-              "own COMMIT or ROLLBACK. ";
+            : !manager.untainted_establish_allowed(context, block.table)
+              ? "Another connection still holds a transaction open that is "
+                "older than this read: it may hold writes the table did not "
+                "have triggers for yet, so no scan taken while it is open — "
+                "dbsp_sync() included — can establish the baseline. "
+              : "That transaction is this connection's own, or no scan has run "
+                "since: another connection's scan (a dbsp_sync(), or any commit "
+                "there) can establish it, and so can the deferring transaction's "
+                "own COMMIT or ROLLBACK. ";
     throw InvalidInputException(
         fn + "('" + view_name + "'): source table '" + block.table +
         "' has an UNSEEDED baseline — its seeding scan was DEFERRED because a "
