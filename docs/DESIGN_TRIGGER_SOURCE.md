@@ -685,6 +685,24 @@ owner decision).
   table's watermark — but the reasoning has to be got right before the gate is
   loosened, and a wrong answer is worse than an error.
 
+  Costed 2026-09-10 (no code; owner-ordered analysis). Shape: in
+  `EnsureViewReadable`'s autocommit branch, run the reconcile scan and serve
+  its content WITHOUT establishing (no `mark_seeded`, no retire) — the scan
+  sees committed state, which excludes the open transaction's writes exactly
+  as the reader's own snapshot does, so serving it is sound for THAT reader
+  only. Refusals stay for explicit-transaction readers (indistinguishable
+  from the insider), for `dbsp_changes` (a state scan cannot produce a delta
+  stream), and everywhere once the window ends normally. Cost: ~150–250 lines
+  across Ensure/reconcile/funnel plus 6–10 new pins; every in-window
+  autocommit read pays a full scan (nothing may be cached, or a later reader
+  inherits content its own window check did not approve); risk concentrates
+  on the silent-wrong-answer surface the gate exists to protect (a stale-
+  content-serve bug would look exactly like the invariant holding). Benefit:
+  dashboard-style polling keeps working through a writer's transaction.
+  Verdict for the owner: viable but high-cost-for-availability; the refused
+  read tells the truth today, and truthful refusal is the design's whole
+  posture. Not started.
+
 - **CLOSED 2026-09-10 — a concurrent writer that never deferred anything.**
   (Owner decision: correctness-first. Resolution at the end.)
   The readiness watermark a DEFERRED table carried was the deferring
