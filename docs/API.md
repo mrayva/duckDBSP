@@ -947,6 +947,39 @@ Per-commit apply is DELETE (retractions) + INSERT (additions) via a staged
 temp table; any delta weight beyond ±1 rebuilds the table from its own
 current rows + the delta.
 
+By default that DELETE has to identify the retracted row by comparing EVERY
+column of the view (`t.c IS NOT DISTINCT FROM s.c`, one per column), so
+applying a one-row delta scans the whole backing table across all its
+columns — O(rows × columns) per commit. Declare a key with
+`dbsp_set_view_key` to turn it into an equi-join.
+
+### dbsp_set_view_key(view_name, key_columns)
+
+Declares the view's unique, non-null row key as a comma-separated column
+list. The delta-apply DELETE then matches those columns by equality instead
+of comparing every column, which the planner can hash: measured 1.45x on a
+whole authority commit of a 199-column view over a 1M-row grid, and 17x on
+the DELETE in isolation.
+
+```sql
+SELECT * FROM dbsp_set_view_key('orders_mv', 'customer_id');
+SELECT * FROM dbsp_set_view_key('orders_mv', '');  -- clear
+```
+
+Requires `dbsp_mv_tables(true)` first — the key is verified against the
+`__mv_` backing table. The call FAILS if the columns are not unique over the
+view's current rows, if any is NULL, if a column is not in the view, or if
+the view is unknown. Uniqueness is checked against the rows that exist at
+declaration time, which is all it can do: declare a key the view's SQL
+GUARANTEES (a GROUP BY's grouping columns, a dense coordinate grid), never
+one that merely happens to be unique right now — a key that stops being
+unique later retracts the wrong row.
+
+Plain `=` is the point. `IS NOT DISTINCT FROM` is not an equi-join key, so
+narrowing the predicate without switching to equality does not help; it
+measured slower than matching every column. That is why the key must be
+non-null.
+
 **Table-backed reads (Phase 1c)**: once a view's table is written, the sink
 stops integrating — the RAM result is dropped and the __mv_ table IS the
 result. `dbsp_query`, create-time replay of view sources, and shared-

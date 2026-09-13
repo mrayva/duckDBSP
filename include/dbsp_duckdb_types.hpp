@@ -1133,6 +1133,30 @@ public:
   // Reset the view
   virtual void reset() = 0;
 
+  // --- Declared row key (delta-apply fast path) ------------------------
+  // A delta is applied to the backing table by deleting the retracted row
+  // and inserting the new one. Without a key that DELETE has to match on
+  // EVERY column (`IS NOT DISTINCT FROM` per column), so applying a
+  // one-row delta scans the whole view across all its columns: measured
+  // O(rows x columns) per commit, ~0.5ms per column on a 1M-row view, and
+  // the dominant cost of an incremental edit.
+  //
+  // When the creator declares a key, the DELETE matches those columns with
+  // plain equality instead, which is an equi-join the planner can hash
+  // (17x on 1M rows x 199 columns). `IS NOT DISTINCT FROM` is NOT an
+  // equi-join key, which is why narrowing the predicate without switching
+  // to equality does not help — it measured slower.
+  //
+  // CONTRACT, and the caller owns it: the columns must be UNIQUE over the
+  // view's rows and NEVER NULL. create_view verifies uniqueness against
+  // the initial result and refuses the key otherwise; a key that only
+  // becomes non-unique later would retract the wrong row. Empty = no key
+  // declared = the all-columns path, which stays the default.
+  const std::vector<std::string> &key_columns() const { return key_columns_; }
+  void set_key_columns(std::vector<std::string> cols) {
+    key_columns_ = std::move(cols);
+  }
+
   virtual void
   scan(const std::function<void(const DuckDBRow &, Weight)> &callback) const {
     for (const auto &[row, weight] : get_result()) {
@@ -1228,6 +1252,8 @@ protected:
   std::string name_;
   std::string sql_;
   uint64_t version_;
+  // Declared unique/non-null row key; empty = match on all columns.
+  std::vector<std::string> key_columns_;
   // apply_changes_batch state (default multi-source path only)
   DuckDBZSet batch_delta_;
   bool batched_ = false;

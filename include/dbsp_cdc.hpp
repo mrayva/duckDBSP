@@ -4694,6 +4694,97 @@ public:
     }
   }
 
+  // Declare the view's unique, non-null row key. The delta-apply DELETE
+  // then matches those columns by equality instead of comparing every
+  // column of the row, which is the difference between an equi-join and a
+  // full scan of the view per edit (17x on 1M rows x 199 columns; see
+  // mv_apply_delta). Idempotent; pass an empty vector to clear.
+  //
+  // Refuses a key that is not actually a key. Uniqueness and non-nullness
+  // are checked against the view's CURRENT backing rows, which is the best
+  // this can do -- a key that stops being unique later would silently
+  // retract the wrong row, so callers must declare a key that the view's
+  // SQL guarantees (a GROUP BY's grouping columns, or a dense coordinate
+  // grid), never one that merely happens to be unique today.
+  bool set_view_key(const std::string &view_name,
+                    const std::vector<std::string> &cols) {
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      last_error_ = "set_view_key: unknown view '" + view_name + "'";
+      return false;
+    }
+    if (cols.empty()) {
+      it->second->set_key_columns({});
+      return true;
+    }
+    const auto &schema = it->second->result_schema();
+    for (const auto &c : cols) {
+      if (!is_valid_identifier(c)) {
+        last_error_ = "set_view_key: invalid column name '" + c + "'";
+        return false;
+      }
+      bool found = false;
+      for (const auto &sc : schema.columns) {
+        if (sc.name == c) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        last_error_ =
+            "set_view_key: column '" + c + "' is not in view '" + view_name + "'";
+        return false;
+      }
+    }
+    if (!mv_tables_enabled_) {
+      last_error_ = "set_view_key: mv_tables is not enabled";
+      return false;
+    }
+    std::string keylist;
+    std::string nullcheck;
+    for (size_t i = 0; i < cols.size(); i++) {
+      if (i > 0) {
+        keylist += ", ";
+        nullcheck += " OR ";
+      }
+      keylist += mv_quote(cols[i]);
+      nullcheck += mv_quote(cols[i]) + " IS NULL";
+    }
+    const std::string qt = mv_quote(mv_table_for(view_name));
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(*mv_db_);
+      auto dup = con.Query("SELECT 1 FROM " + qt + " GROUP BY " + keylist +
+                           " HAVING COUNT(*) > 1 LIMIT 1");
+      if (dup->HasError()) {
+        last_error_ = "set_view_key: uniqueness check failed: " + dup->GetError();
+        return false;
+      }
+      if (dup->RowCount() > 0) {
+        last_error_ = "set_view_key: columns are not unique over view '" +
+                      view_name + "'";
+        return false;
+      }
+      auto nulls =
+          con.Query("SELECT 1 FROM " + qt + " WHERE " + nullcheck + " LIMIT 1");
+      if (nulls->HasError()) {
+        last_error_ = "set_view_key: null check failed: " + nulls->GetError();
+        return false;
+      }
+      if (nulls->RowCount() > 0) {
+        last_error_ =
+            "set_view_key: key columns contain NULL in view '" + view_name + "'";
+        return false;
+      }
+    } catch (const std::exception &e) {
+      last_error_ = std::string("set_view_key failed: ") + e.what();
+      return false;
+    }
+    it->second->set_key_columns(cols);
+    return true;
+  }
+
 private:
   std::string mv_columns_ddl(const TableSchema &schema) const {
     std::string ddl;
@@ -4813,13 +4904,39 @@ private:
       return true;
     }
     const std::string qt = mv_quote(mv_table_for(name));
+    // The retract predicate. Without a declared key this must compare
+    // EVERY column, so applying a one-row delta scans the whole view
+    // across all its columns -- O(rows x columns) per commit, and the
+    // dominant cost of an incremental edit (measured ~0.5ms per column on
+    // a 1M-row view; 199 columns = 113ms to retract ONE row).
+    //
+    // A declared key collapses that to an equi-join the planner can hash:
+    // 17x on 1M rows x 199 columns. Plain `=`, never IS NOT DISTINCT FROM
+    // -- the latter is not an equi-join key, so the planner cannot hash it
+    // and the predicate stays a full scan (measured SLOWER than matching
+    // all columns). That is why the key must be NON-NULL, and why adding a
+    // key alongside the all-columns match buys nothing.
+    //
+    // Key uniqueness is verified against the initial result at create time
+    // (see create_view); see NativeMaterializedView::key_columns().
+    const auto &keys = view.key_columns();
     std::string match;
-    for (size_t i = 0; i < schema.columns.size(); i++) {
-      if (i > 0) {
-        match += " AND ";
+    if (!keys.empty()) {
+      for (size_t i = 0; i < keys.size(); i++) {
+        if (i > 0) {
+          match += " AND ";
+        }
+        const std::string c = mv_quote(keys[i]);
+        match += "t." + c + " = s." + c;
       }
-      const std::string c = mv_quote(schema.columns[i].name);
-      match += "t." + c + " IS NOT DISTINCT FROM s." + c;
+    } else {
+      for (size_t i = 0; i < schema.columns.size(); i++) {
+        if (i > 0) {
+          match += " AND ";
+        }
+        const std::string c = mv_quote(schema.columns[i].name);
+        match += "t." + c + " IS NOT DISTINCT FROM s." + c;
+      }
     }
     std::string cols;
     for (size_t i = 0; i < schema.columns.size(); i++) {

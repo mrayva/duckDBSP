@@ -1695,6 +1695,63 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
 // Usage: SELECT * FROM dbsp_deps('view_name');
 // ============================================================================
 
+// dbsp_set_view_key('view', 'col1,col2') -- declare the view's unique,
+// non-null row key so delta application retracts by an equi-join on those
+// columns instead of comparing every column of every row. Verified against
+// the view's current rows; see CDCManager::set_view_key.
+struct SetViewKeyData : public TableFunctionData {
+  string view_name;
+  string key_csv;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> SetViewKeyBind(ClientContext &context,
+                                        TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types,
+                                        vector<Identifier> &names) {
+  auto data = make_uniq<SetViewKeyData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->key_csv = input.inputs[1].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void SetViewKeyFunc(ClientContext &context, TableFunctionInput &input,
+                    DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<SetViewKeyData>();
+  if (data.done) {
+    output.SetChildCardinality(0);
+    return;
+  }
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+
+  std::vector<std::string> cols;
+  std::string cur;
+  for (char c : data.key_csv) {
+    if (c == ',') {
+      if (!cur.empty()) {
+        cols.push_back(cur);
+      }
+      cur.clear();
+    } else if (c != ' ') {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) {
+    cols.push_back(cur);
+  }
+
+  if (!manager.set_view_key(data.view_name, cols)) {
+    throw InvalidInputException(manager.last_error());
+  }
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value(cols.empty() ? "key cleared" : "key set"));
+  data.done = true;
+}
+
 struct DepsBindData : public TableFunctionData {
   string view_name;
   vector<std::pair<string, string>>
@@ -2795,6 +2852,11 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction deps_func("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
                           DepsBind);
   loader.RegisterFunction(deps_func);
+
+  TableFunction set_view_key_func("dbsp_set_view_key",
+                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                  SetViewKeyFunc, SetViewKeyBind);
+  loader.RegisterFunction(set_view_key_func);
 
   TableFunction save_func("dbsp_save", {}, SaveFunc, SaveBind);
   save_func.varargs = LogicalType::VARCHAR;

@@ -1,5 +1,32 @@
 # Changelog
 
+## Perf: declared view keys — the delta DELETE stops scanning every column — 2026-09-12
+
+**Applying a one-row delta to a materialized view scanned the entire view
+across every one of its columns.** `mv_apply_delta` built its retract
+predicate as `t.c IS NOT DISTINCT FROM s.c` over EVERY column of the result
+schema, so the cost of an incremental commit was O(rows × columns) regardless
+of how small the delta was. Measured on a 1M-row view: ~0.5ms per column per
+commit, 113ms to retract ONE row from a 199-column view, and ~83% of that was
+execution (the remaining ~17% was re-parsing the very long statement).
+
+`dbsp_set_view_key(view, 'c1,c2')` declares the view's unique, non-null row
+key; the DELETE then matches those columns with plain `=`. Measured 1.45x on
+a full authority commit at 199 columns, and 17x on the DELETE alone.
+
+`IS NOT DISTINCT FROM` is not an equi-join key — the planner cannot hash it,
+so the predicate stays a full scan. Adding a key filter while KEEPING the
+all-columns match measured SLOWER than before. Hence equality, hence the
+non-null requirement.
+
+The key is verified when declared: uniqueness and non-nullness are checked
+against the `__mv_` backing table, and a key that fails is refused rather
+than silently retracting wrong rows. Undeclared views keep the all-columns
+path unchanged, so this is opt-in and backward compatible.
+
+45/45 ctest green.
+
+
 ## Quality round, fix 4 — the taint sees every uncommitted change, not only appends — 2026-09-04
 
 **Fix 3's taint probe was wrong for DELETE and UPDATE.** It asked
