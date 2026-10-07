@@ -211,7 +211,7 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
   db.exec("SELECT * FROM dbsp_sync('big')");
   db.exec("SELECT * FROM dbsp_auto_sync(true)");
   auto &mgr2 = db.manager();
-  const uint64_t cap_before = mgr2.captured_delta_syncs();
+  const uint64_t cap_before = mgr2.exact_delta_syncs();
   double cap_us = measure_us([&]() {
     for (int i = 0; i < 20; i++) {
       db.exec("BEGIN");
@@ -221,7 +221,7 @@ TEST_CASE("Benchmark: cascaded view sync cost", "[benchmark][cascade_bench]") {
     }
   });
   db.exec("SELECT * FROM dbsp_auto_sync(false)");
-  const uint64_t captured = mgr2.captured_delta_syncs() - cap_before;
+  const uint64_t captured = mgr2.exact_delta_syncs() - cap_before;
 
   // Floor: identical txn shape with auto-sync off (pure DuckDB cost)
   double floor_us = measure_us([&]() {

@@ -144,9 +144,9 @@ with tempfile.TemporaryDirectory() as tmp:
     conn.close()
 
     # Session 4: auto-sync SQL writes after a lazy restore. QueryBegin must
-    # materialize deferred baselines from PRE-write storage; the captured
-    # INSERT, captured UPDATE/DELETE (write capture), and the re-saved
-    # checkpoint with that captured history then reconcile incrementally.
+    # materialize deferred baselines from PRE-write storage; the trigger-fed
+    # INSERT and UPDATE/DELETE deltas, and the re-saved checkpoint carrying
+    # that history, then reconcile incrementally.
     conn = open_db(path)
     load_msg = conn.execute("SELECT * FROM dbsp_load()").fetchone()[0]
     assert "1 from checkpoint" in load_msg and "2 sources deferred" in load_msg, (

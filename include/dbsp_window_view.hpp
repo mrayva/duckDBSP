@@ -2,6 +2,7 @@
 
 #include "dbsp_checkpoint.hpp" // BlobWriter/BlobReader (circuit_state_kind overrides below)
 #include "dbsp_duckdb_types.hpp"
+#include "dbsp_window_rows.hpp" // packed per-partition row storage
 #include "duckdb/parser/expression/window_expression.hpp"
 #include <algorithm>
 #include <map>
@@ -31,67 +32,41 @@ private:
   std::string source_table_;
 
   // Storage: Partition Key -> Sorted Rows
-  // Partition Key is a vector of Values
+  // Partition Key is a vector of Values. Row payloads live in packed
+  // WindowRowStores (boxed only when the codec can't represent a value —
+  // see dbsp_window_rows.hpp); keys stay boxed: there are only as many as
+  // partitions, and they are neither the RAM nor the teardown cost.
   using PartitionKey = std::vector<duckdb::Value>;
+  using RowStore = windowrows::WindowRowStore;
+  using RowsView = windowrows::WindowRowsView;
 
-  struct RowComparator {
-    std::vector<NativeSortView::SortColumn> sort_columns;
-
-    bool operator()(const DuckDBRow &a, const DuckDBRow &b) const {
-      for (const auto &col : sort_columns) {
-        // Bounds check
-        if (col.column_idx >= a.columns.size() ||
-            col.column_idx >= b.columns.size())
-          continue;
-
-        const auto &val_a = a.columns[col.column_idx];
-        const auto &val_b = b.columns[col.column_idx];
-
-        bool a_null = val_a.IsNull();
-        bool b_null = val_b.IsNull();
-
-        if (a_null && b_null)
-          continue;
-        if (a_null && !b_null)
-          return col.nulls_first;
-        if (!a_null && b_null)
-          return !col.nulls_first;
-
-        if (val_a == val_b)
-          continue;
-
-        bool less = val_a < val_b;
-        if (col.ascending) {
-          return less;
-        } else {
-          return !less;
-        }
-      }
-      return false; // Equal
-    }
-  };
-
-  struct PartitionState {
-    // Kept sorted by `cmp` (the ORDER BY comparator). A vector (not a
-    // multiset) gives O(1) positional/random access so fast paths can
-    // re-render only the affected rows without copying the whole partition.
-    std::vector<DuckDBRow> sorted_rows;
-    RowComparator cmp;
-
-    PartitionState(const std::vector<NativeSortView::SortColumn> &c)
-        : cmp(RowComparator{c}) {}
-  };
-
-  std::map<PartitionKey, PartitionState> partitions_;
+  // Each store is kept sorted by the ORDER BY comparator (the store
+  // implements it for its binary searches; mutation order is maintained
+  // here). Positional slot access lets fast paths re-render only the
+  // affected rows without copying the whole partition.
+  std::map<PartitionKey, RowStore> partitions_;
   std::vector<NativeSortView::SortColumn> primary_sort_columns_;
   // Rendered output row per partition, index-aligned with the sorted
   // partition, so individual rows can be retracted/re-emitted (fast paths).
-  std::map<PartitionKey, std::vector<DuckDBRow>> partition_outputs_;
+  std::map<PartitionKey, RowStore> partition_outputs_;
 
-  // Output state
-  DuckDBZSet result_;
+  // Output state. result_ is LAZY: on the one production construction
+  // (embedded behind EmbeddedViewNode, the WINDOW plan shape) nothing ever
+  // reads get_result() — the node propagates get_delta() only — so
+  // apply_changes doesn't maintain it. Invariant: result_valid_ implies
+  // result_ == the multiset union of every partition's output cache;
+  // get_result() rebuilds from partition_outputs_ on demand (tests,
+  // scan()). Invalidation clears the zset so an unread result_ never
+  // holds RAM.
+  mutable DuckDBZSet result_;
+  mutable bool result_valid_ = true; // empty view: empty result is correct
   DuckDBZSet delta_;
   TableSchema result_schema_;
+
+  void invalidate_result() {
+    result_.clear();
+    result_valid_ = false;
+  }
 
   // Render the full output row (source columns + every window column) for one
   // ordered index. Ranking scalars (row_number/rank/dense_rank) are passed in
@@ -99,7 +74,7 @@ private:
   // the eligibility gate guarantees carry no ranking windows). peer_start /
   // peer_end are only read by RANGE/GROUPS frames and rank windows, so fast
   // paths may pass empty vectors.
-  DuckDBRow render_row(const std::vector<DuckDBRow> &rows, size_t row_idx,
+  DuckDBRow render_row(const RowsView &rows, size_t row_idx,
                        const std::vector<size_t> &peer_start,
                        const std::vector<size_t> &peer_end,
                        int64_t current_row_number, int64_t current_rank,
@@ -165,13 +140,33 @@ private:
         }
         out_row.columns.push_back(result);
       } else if (win.function == "NTH_VALUE") {
+        // Frame-relative (stock semantics): the nth row OF THE FRAME, not
+        // the partition — under the default frame (UNBOUNDED PRECEDING..
+        // CURRENT ROW) rows before the nth are NULL. Same ROWS-boundary
+        // math as LAST_VALUE above.
+        duckdb::Value result;
         int n = win.offset;
-        if (n > 0 && (size_t)(n - 1) < rows.size() && win.arg_column_idx >= 0 &&
-            (size_t)win.arg_column_idx < rows[n - 1].columns.size()) {
-          out_row.columns.push_back(rows[n - 1].columns[win.arg_column_idx]);
-        } else {
-          out_row.columns.push_back(duckdb::Value());
+        if (n > 0 && !rows.empty() && win.arg_column_idx >= 0) {
+          size_t frame_end_idx = row_idx; // default CURRENT_ROW
+          if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
+            frame_end_idx = rows.size() - 1;
+          else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
+            frame_end_idx =
+                std::min(row_idx + (size_t)win.end_offset, rows.size() - 1);
+          size_t frame_start = 0;
+          if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+            frame_start = row_idx;
+          else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+            frame_start = row_idx >= (size_t)win.start_offset
+                              ? row_idx - (size_t)win.start_offset
+                              : 0;
+          const size_t idx = frame_start + (size_t)(n - 1);
+          if (idx <= frame_end_idx &&
+              (size_t)win.arg_column_idx < rows[idx].columns.size()) {
+            result = rows[idx].columns[win.arg_column_idx];
+          }
         }
+        out_row.columns.push_back(result);
       } else if (win.function == "NTILE") {
         // Stock semantics (DuckDB's WindowNtileExecutor,
         // duckdb/src/function/window/window_rownumber_function.cpp): if
@@ -327,7 +322,7 @@ private:
 
   // Union of output-row indices dirtied by changes at `anchors`, per window
   // shape. Returns false if any window lacks a fast rule (caller full-renders).
-  bool affected_indices(const std::vector<DuckDBRow> &rows,
+  bool affected_indices(const RowsView &rows,
                         const std::vector<size_t> &anchors,
                         std::vector<size_t> &out) const {
     const size_t n = rows.size();
@@ -420,7 +415,7 @@ private:
   // Re-emit only `affected` output rows: retract the cached row, render the
   // new one, insert it, update the cache slot. Requires the cache to be
   // index-aligned with `rows` (caller guarantees size unchanged).
-  void emit_affected(const PartitionKey &key, const std::vector<DuckDBRow> &rows,
+  void emit_affected(const PartitionKey &key, const RowsView &rows,
                      std::vector<size_t> affected) {
     std::sort(affected.begin(), affected.end());
     affected.erase(std::unique(affected.begin(), affected.end()),
@@ -430,13 +425,12 @@ private:
     for (size_t idx : affected) {
       if (idx >= rows.size() || idx >= cache.size())
         continue;
-      delta_.insert(cache[idx], -1);
-      result_.insert(cache[idx], -1);
+      const DuckDBRow old = cache.row_at(idx); // hash-seeded decode
+      delta_.insert(old, -1);
       DuckDBRow nr = render_row(rows, idx, kNoPeers, kNoPeers,
                                (int64_t)idx + 1, 0, 0);
       delta_.insert(nr, 1);
-      result_.insert(nr, 1);
-      cache[idx] = nr;
+      cache.overwrite_at(idx, nr);
     }
   }
 
@@ -454,26 +448,42 @@ public:
   }
 
   // Implement required abstract methods
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_result() const override {
+    if (!result_valid_) {
+      result_.clear();
+      for (const auto &[key, cache] : partition_outputs_) {
+        (void)key;
+        for (size_t j = 0; j < cache.size(); j++) {
+          result_.insert(cache.row_at(j), 1);
+        }
+      }
+      result_valid_ = true;
+    }
+    return result_;
+  }
+  void set_result(const DuckDBZSet &result) override {
+    result_ = result;
+    result_valid_ = true;
+    version_++;
+  }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return result_schema_; }
 
   void drop_delta() override { delta_.clear(); }
 
   void account_state(StateBytes &out, StateAccounting &acct) const override {
-    NativeMaterializedView::account_state(out, acct); // result + delta
-    for (const auto &[key, part] : partitions_) {
+    // NOT the base impl: that calls get_result(), which would MATERIALIZE
+    // the lazy result_ during a RAM-accounting pass and pin it. Account
+    // only what is actually resident (result_ is empty whenever invalid).
+    out.result += acct.zset_bytes(result_);
+    out.other += acct.zset_bytes(delta_);
+    for (const auto &[key, store] : partitions_) {
       (void)key;
-      for (const auto &row : part.sorted_rows) {
-        out.window += acct.row_bytes(row);
-      }
+      out.window += store.account(acct);
     }
-    for (const auto &[key, rows] : partition_outputs_) {
+    for (const auto &[key, store] : partition_outputs_) {
       (void)key;
-      for (const auto &row : rows) {
-        out.window += acct.row_bytes(row);
-      }
+      out.window += store.account(acct);
     }
   }
   std::vector<std::string> source_tables() const override {
@@ -484,6 +494,7 @@ public:
     partitions_.clear();
     partition_outputs_.clear();
     result_.clear();
+    result_valid_ = true; // empty view: empty result is correct
     delta_.clear();
     version_ = 0;
   }
@@ -500,47 +511,40 @@ public:
 
   // serialize_circuit_node_state/restore_circuit_node_state carry exactly
   // what apply_changes' incremental fast path (the size-unchanged
-  // overwrite-in-place branch, ~line 589 below) and the structural
-  // full-render path (~line 617) each read to resume:
-  //   - partitions_: per-partition ORDERED source rows (PartitionState::
-  //     sorted_rows). Both paths key off `partitions_.find(key)` /
-  //     `it->second.sorted_rows` to know current partition membership and
-  //     order -- the fast path's overwrite-vs-structural classification
-  //     (pd.inserts.size() != pd.deletes.size(), then per-delete
-  //     lower_bound/upper_bound matching against `vec`) and the full
-  //     path's `partition_rows` renderer both operate directly on this.
-  //     PartitionState::cmp is NOT serialized: it is rebuilt from
-  //     primary_sort_columns_ (itself rebuilt from the view-definition
-  //     windows_[0].sort_columns at cold construction, which always runs
-  //     BEFORE restore_circuit_node_state per EmbeddedViewNode's
-  //     construction-then-restore contract), a config value, not data.
+  // overwrite-in-place branch) and the structural full-render path each
+  // read to resume:
+  //   - partitions_: per-partition ORDERED source rows (WindowRowStore).
+  //     Both paths key off `partitions_.find(key)` to know current
+  //     partition membership and order -- the fast path's
+  //     overwrite-vs-structural classification (pd.inserts.size() !=
+  //     pd.deletes.size(), then per-delete lower_bound/upper_bound
+  //     matching) and the full path's renderer both operate directly on
+  //     this. The store's ORDER BY comparator is NOT serialized: it is
+  //     rebuilt from primary_sort_columns_ (itself rebuilt from the
+  //     view-definition windows_[0].sort_columns at cold construction,
+  //     which always runs BEFORE restore_circuit_node_state per
+  //     EmbeddedViewNode's construction-then-restore contract), a config
+  //     value, not data.
   //   - partition_outputs_: the rendered-output cache, index-aligned with
-  //     each partition's sorted_rows. The fast path's gate
-  //     (`cache.size() == partition_rows.size()`) and emit_affected's
-  //     `cache[idx]` retraction-before-overwrite read this directly; the
+  //     each partition's ordered rows. The fast path's gate
+  //     (`cache.size() == store.size()`) and emit_affected's
+  //     `cache.row_at(idx)` retraction-before-overwrite read this; the
   //     full path's opening loop retracts every `cache` entry before
   //     re-rendering. Without this restored, the very first post-restore
   //     edit would retract nothing that was never there, producing
-  //     duplicate (stale + new) rows in both delta_ and result_ -- exactly
-  //     what the twin round-trip tests below would catch.
+  //     duplicate (stale + new) rows in delta_ (and any later
+  //     get_result()) -- exactly what the round-trip tests catch.
   // Excluded, and why:
-  //   - result_ (get_result()): NOT independently serialized. Nothing
-  //     reads it back on this class -- apply_changes only ever WRITES to
-  //     it (in lockstep with partition_outputs_: every render/retraction
-  //     applies the identical row+sign to both simultaneously), and
-  //     nothing external calls get_result()/set_result() on this instance
-  //     (it is privately owned by EmbeddedViewNode; unlike a top-level
-  //     view's own sink, whose integrated total IS restored at the outer
-  //     NativeMaterializedView::get_result()/set_result() level -- see
-  //     dbsp::SinkNode::state_kind()'s doc comment for that precedent --
-  //     nothing plays that role for an EMBEDDED view's own result_).
-  //     Rather than leave it silently empty forever (an unread-but-still-
-  //     wrong internal invariant) or pay bytes for fully redundant data,
-  //     restore reconstructs it for free from the just-restored
-  //     partition_outputs_: result_ is, by construction, always exactly
-  //     the multiset union of every partition's current cache (proven by
-  //     induction over apply_changes -- every mutation site touches both
-  //     together with the same row/sign, from the empty initial state).
+  //   - result_ (get_result()): NOT serialized and NOT reconstructed --
+  //     it is a LAZY cache (see the member comment): the one production
+  //     construction is embedded behind EmbeddedViewNode, which reads
+  //     get_delta() only (verified: no get_result()/set_result()/scan()
+  //     call reaches an embedded instance; CircuitWrappedView, the only
+  //     other wrapper that would forward get_result(), is never
+  //     constructed). restore marks it invalid; a reader (tests, scan())
+  //     rebuilds it from the restored partition_outputs_, which is by
+  //     definition exactly its content -- the multiset union of every
+  //     partition's current cache.
   //   - delta_/has_output_-equivalent: checkpoints are taken quiescent (no
   //     pending push), same convention every other checkpointed node
   //     already follows (SourceNode's pending_delta_, PlanRecursiveNode's
@@ -555,22 +559,63 @@ public:
   //     grepped every `.version()` call site; the only one reads a
   //     top-level view's own counter for introspection, never an inner
   //     wrapped view's.
+  // Two on-disk layouts behind one restore entry point:
+  //   PACKED (kWindowPackedMagic first): per store, raw slot lens + the
+  //     concatenated packed row bytes — save and restore are bulk byte
+  //     moves with zero Value construction on the partitions_ half (the
+  //     outputs half still decodes once per row to rebuild result_).
+  //     Written whenever every store is packed-or-empty.
+  //   LEGACY (first u64 is the partition count): boxed row-by-row, the
+  //     pre-packed format. Still written when any store fell back to boxed
+  //     (codec-unsupported types), still readable so pre-upgrade
+  //     checkpoints restore without a rebuild (rows are re-encoded into
+  //     packed stores as they are pushed). An OLD reader hitting a PACKED
+  //     blob throws on the magic-as-count and reports failure -> full
+  //     rebuild, the standard degradation path.
   void serialize_circuit_node_state(std::vector<uint8_t> &out) const override {
     BlobWriter w;
+    bool all_packed = true;
+    for (const auto &[key, store] : partitions_) {
+      (void)key;
+      all_packed = all_packed && store.packed_or_empty();
+    }
+    for (const auto &[key, store] : partition_outputs_) {
+      (void)key;
+      all_packed = all_packed && store.packed_or_empty();
+    }
+
+    if (all_packed) {
+      w.u64(windowrows::kWindowPackedMagic);
+      w.u64(partitions_.size());
+      for (const auto &[key, store] : partitions_) {
+        w.row(key);
+        w.u64(store.size());
+        store.serialize_packed(w);
+      }
+      w.u64(partition_outputs_.size());
+      for (const auto &[key, store] : partition_outputs_) {
+        w.row(key);
+        w.u64(store.size());
+        store.serialize_packed(w);
+      }
+      out = w.take();
+      return;
+    }
+
     w.u64(partitions_.size());
-    for (const auto &[key, pstate] : partitions_) {
+    for (const auto &[key, store] : partitions_) {
       w.row(key);
-      w.u64(pstate.sorted_rows.size());
-      for (const auto &row : pstate.sorted_rows) {
-        w.row(row.columns);
+      w.u64(store.size());
+      for (size_t j = 0; j < store.size(); j++) {
+        w.row(store.row_at(j).columns);
       }
     }
     w.u64(partition_outputs_.size());
-    for (const auto &[key, cache] : partition_outputs_) {
+    for (const auto &[key, store] : partition_outputs_) {
       w.row(key);
-      w.u64(cache.size());
-      for (const auto &row : cache) {
-        w.row(row.columns);
+      w.u64(store.size());
+      for (size_t j = 0; j < store.size(); j++) {
+        w.row(store.row_at(j).columns);
       }
     }
     out = w.take();
@@ -581,31 +626,52 @@ public:
       BlobReader r(data, len);
       partitions_.clear();
       partition_outputs_.clear();
-      result_.clear();
+      invalidate_result(); // lazy: get_result() rebuilds from the caches
 
-      const uint64_t n_parts = r.u64();
+      const uint64_t first = r.u64();
+      if (first == windowrows::kWindowPackedMagic) {
+        const uint64_t n_parts = r.u64();
+        for (uint64_t i = 0; i < n_parts; i++) {
+          PartitionKey key = r.row();
+          auto ins = partitions_.emplace(std::move(key),
+                                         RowStore(primary_sort_columns_));
+          const uint64_t n_rows = r.u64();
+          if (!ins.first->second.restore_packed(r, n_rows)) {
+            return false;
+          }
+        }
+        const uint64_t n_out = r.u64();
+        for (uint64_t i = 0; i < n_out; i++) {
+          PartitionKey key = r.row();
+          auto &cache = partition_outputs_[std::move(key)];
+          const uint64_t n_rows = r.u64();
+          if (!cache.restore_packed(r, n_rows)) {
+            return false;
+          }
+        }
+        delta_.clear();
+        return r.done();
+      }
+
+      const uint64_t n_parts = first; // legacy layout: this was the count
       for (uint64_t i = 0; i < n_parts; i++) {
         PartitionKey key = r.row();
-        auto ins =
-            partitions_.emplace(key, PartitionState(primary_sort_columns_));
-        auto &vec = ins.first->second.sorted_rows;
+        auto ins = partitions_.emplace(std::move(key),
+                                       RowStore(primary_sort_columns_));
+        auto &store = ins.first->second;
         const uint64_t n_rows = r.u64();
-        vec.reserve(n_rows);
         for (uint64_t j = 0; j < n_rows; j++) {
-          vec.push_back(r.hashed_row());
+          store.push_back(r.hashed_row());
         }
       }
 
       const uint64_t n_out = r.u64();
       for (uint64_t i = 0; i < n_out; i++) {
         PartitionKey key = r.row();
-        auto &cache = partition_outputs_[key];
+        auto &cache = partition_outputs_[std::move(key)];
         const uint64_t n_rows = r.u64();
-        cache.reserve(n_rows);
         for (uint64_t j = 0; j < n_rows; j++) {
-          DuckDBRow row = r.hashed_row();
-          result_.insert(row, 1); // reconstruct result_ -- see exclusion note above
-          cache.push_back(std::move(row));
+          cache.push_back(r.hashed_row());
         }
       }
 
@@ -621,6 +687,7 @@ public:
     delta_.clear();
     if (table_name != source_table_)
       return;
+    invalidate_result(); // lazy result_ -- see member comment
 
     // 1. Group the delta by partition into inserts / deletes.
     struct PartDelta {
@@ -650,7 +717,10 @@ public:
     // the vector (O(n)) and is marked structural -> full re-render.
     std::set<PartitionKey> affected_partitions;
     std::map<PartitionKey, size_t> size_before;
-    std::map<PartitionKey, std::vector<DuckDBRow>> anchors_by_part;
+    // Overwritten row positions per partition — valid because the
+    // non-structural path never shifts positions. Only read by the fast
+    // path, which is gated on !structural_change.
+    std::map<PartitionKey, std::vector<size_t>> anchors_by_part;
     std::map<PartitionKey, bool> structural_change;
 
     for (auto &kv : by_part) {
@@ -658,22 +728,21 @@ public:
       PartDelta &pd = kv.second;
       auto it = partitions_.find(key);
       if (it == partitions_.end())
-        it = partitions_.emplace(key, PartitionState(primary_sort_columns_))
-                 .first;
-      auto &vec = it->second.sorted_rows;
-      const auto &cmp = it->second.cmp;
-      size_before[key] = vec.size();
+        it = partitions_.emplace(key, RowStore(primary_sort_columns_)).first;
+      auto &store = it->second;
+      size_before[key] = store.size();
       affected_partitions.insert(key);
 
       bool structural = pd.inserts.size() != pd.deletes.size();
       std::vector<bool> ins_used(pd.inserts.size(), false);
-      std::vector<std::pair<size_t, size_t>> overwrites; // (vec_idx, ins_idx)
+      std::vector<std::pair<size_t, size_t>> overwrites; // (row_idx, ins_idx)
       if (!structural) {
         for (const auto &d : pd.deletes) {
           size_t m = pd.inserts.size();
           for (size_t j = 0; j < pd.inserts.size(); ++j)
-            if (!ins_used[j] && !cmp(d, pd.inserts[j]) &&
-                !cmp(pd.inserts[j], d)) { // equal sort key
+            if (!ins_used[j] &&
+                RowStore::cmp_sort_rows(d, pd.inserts[j],
+                                        primary_sort_columns_) == 0) {
               m = j;
               break;
             }
@@ -681,11 +750,11 @@ public:
             structural = true;
             break;
           }
-          auto lo = std::lower_bound(vec.begin(), vec.end(), d, cmp);
-          auto hi = std::upper_bound(vec.begin(), vec.end(), d, cmp);
-          auto match = hi;
-          for (auto k = lo; k != hi; ++k)
-            if (*k == d) {
+          const size_t lo = store.lower_bound(d);
+          const size_t hi = store.upper_bound(d);
+          size_t match = hi;
+          for (size_t k = lo; k < hi; ++k)
+            if (store.equal_at(k, d)) {
               match = k;
               break;
             }
@@ -694,35 +763,33 @@ public:
             break;
           }
           ins_used[m] = true;
-          overwrites.push_back({(size_t)(match - vec.begin()), m});
+          overwrites.push_back({match, m});
         }
       }
 
       if (!structural) {
         for (const auto &ow : overwrites) {
-          vec[ow.first] = pd.inserts[ow.second];
-          anchors_by_part[key].push_back(pd.inserts[ow.second]);
+          store.overwrite_at(ow.first, pd.inserts[ow.second]);
+          anchors_by_part[key].push_back(ow.first);
         }
         structural_change[key] = false;
       } else {
         for (const auto &d : pd.deletes) {
-          auto lo = std::lower_bound(vec.begin(), vec.end(), d, cmp);
-          auto hi = std::upper_bound(vec.begin(), vec.end(), d, cmp);
-          auto match = hi;
-          for (auto k = lo; k != hi; ++k)
-            if (*k == d) {
+          const size_t lo = store.lower_bound(d);
+          const size_t hi = store.upper_bound(d);
+          size_t match = hi;
+          for (size_t k = lo; k < hi; ++k)
+            if (store.equal_at(k, d)) {
               match = k;
               break;
             }
           if (match != hi)
-            vec.erase(match);
+            store.erase_at(match);
           else if (lo != hi)
-            vec.erase(lo);
+            store.erase_at(lo);
         }
         for (const auto &ins : pd.inserts) {
-          auto pos = std::lower_bound(vec.begin(), vec.end(), ins, cmp);
-          vec.insert(pos, ins);
-          anchors_by_part[key].push_back(ins);
+          store.insert_at(store.lower_bound(ins), ins);
         }
         structural_change[key] = true;
       }
@@ -734,10 +801,9 @@ public:
       auto it = partitions_.find(key);
 
       // Partition emptied: retract all cached output and drop it.
-      if (it == partitions_.end() || it->second.sorted_rows.empty()) {
-        for (const auto &row : cache) {
-          delta_.insert(row, -1);
-          result_.insert(row, -1);
+      if (it == partitions_.end() || it->second.empty()) {
+        for (size_t j = 0; j < cache.size(); j++) {
+          delta_.insert(cache.row_at(j), -1);
         }
         cache.clear();
         if (it != partitions_.end())
@@ -746,41 +812,29 @@ public:
         continue;
       }
 
-      // Persistent sorted vector — direct positional access, no copy.
-      const std::vector<DuckDBRow> &partition_rows = it->second.sorted_rows;
+      // Persistent sorted store — positional access; views memoize packed
+      // decodes so each touched row decodes at most once per pass.
+      RowStore &store = it->second;
 
       // FAST PATH: size unchanged (pure value updates) and cache index-aligned
       // — re-emit only the rows each window makes dirty. affected_indices
       // returns false if any window shape has no fast rule, in which case we
       // fall through to the full re-render below.
-      if (!structural_change[key] && cache.size() == partition_rows.size() &&
-          size_before[key] == partition_rows.size()) {
-        RowComparator cmp{primary_sort_columns_};
-        std::vector<size_t> anchors;
-        for (const auto &r : anchors_by_part[key]) {
-          auto lo = std::lower_bound(partition_rows.begin(),
-                                     partition_rows.end(), r, cmp);
-          auto hi = std::upper_bound(partition_rows.begin(),
-                                     partition_rows.end(), r, cmp);
-          size_t idx = (size_t)(lo - partition_rows.begin());
-          for (auto j = lo; j != hi; ++j)
-            if (*j == r) {
-              idx = (size_t)(j - partition_rows.begin());
-              break;
-            }
-          anchors.push_back(idx);
-        }
+      if (!structural_change[key] && cache.size() == store.size() &&
+          size_before[key] == store.size()) {
+        const RowsView sparse_rows(store); // sparse: O(affected) decodes
         std::vector<size_t> affected;
-        if (affected_indices(partition_rows, anchors, affected)) {
-          emit_affected(key, partition_rows, affected);
+        if (affected_indices(sparse_rows, anchors_by_part[key], affected)) {
+          emit_affected(key, sparse_rows, affected);
           continue;
         }
       }
 
+      const RowsView partition_rows(store, /*dense=*/true);
+
       // FULL PATH: retract all cached output, then re-render every row.
-      for (const auto &row : cache) {
-        delta_.insert(row, -1);
-        result_.insert(row, -1);
+      for (size_t j = 0; j < cache.size(); j++) {
+        delta_.insert(cache.row_at(j), -1);
       }
       cache.clear();
 
@@ -901,16 +955,32 @@ public:
             }
             out_row.columns.push_back(ff_result);
           } else if (win.function == "NTH_VALUE") {
+            // Frame-relative (stock semantics) — nth row OF THE FRAME;
+            // mirrors the render_row() copy of this branch above.
+            duckdb::Value result;
             int n = win.offset; // NTH_VALUE uses offset as N
-            if (n > 0 && (size_t)(n - 1) < partition_rows.size() &&
-                win.arg_column_idx >= 0 &&
-                (size_t)win.arg_column_idx <
-                    partition_rows[n - 1].columns.size()) {
-              out_row.columns.push_back(
-                  partition_rows[n - 1].columns[win.arg_column_idx]);
-            } else {
-              out_row.columns.push_back(duckdb::Value());
+            if (n > 0 && !partition_rows.empty() && win.arg_column_idx >= 0) {
+              size_t frame_end_idx = row_idx; // default CURRENT_ROW
+              if (win.end == duckdb::WindowBoundary::UNBOUNDED_FOLLOWING)
+                frame_end_idx = partition_rows.size() - 1;
+              else if (win.end == duckdb::WindowBoundary::EXPR_FOLLOWING_ROWS)
+                frame_end_idx = std::min(row_idx + (size_t)win.end_offset,
+                                         partition_rows.size() - 1);
+              size_t frame_start = 0;
+              if (win.start == duckdb::WindowBoundary::CURRENT_ROW_ROWS)
+                frame_start = row_idx;
+              else if (win.start == duckdb::WindowBoundary::EXPR_PRECEDING_ROWS)
+                frame_start = row_idx >= (size_t)win.start_offset
+                                  ? row_idx - (size_t)win.start_offset
+                                  : 0;
+              const size_t idx = frame_start + (size_t)(n - 1);
+              if (idx <= frame_end_idx &&
+                  (size_t)win.arg_column_idx <
+                      partition_rows[idx].columns.size()) {
+                result = partition_rows[idx].columns[win.arg_column_idx];
+              }
             }
+            out_row.columns.push_back(result);
           } else if (win.function == "NTILE") {
             // Same stock-matching algorithm as the render_row() copy of
             // this branch above -- see the comment there for the
@@ -1043,7 +1113,6 @@ public:
 
         // Emit
         delta_.insert(out_row, 1);
-        result_.insert(out_row, 1);
         cache.push_back(out_row);
       }
     }

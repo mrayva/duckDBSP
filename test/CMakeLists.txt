@@ -22,35 +22,21 @@ if(NOT TARGET duckdb_static)
     add_subdirectory(${DUCKDB_SOURCE_DIR} duckdb EXCLUDE_FROM_ALL)
 endif()
 
-# The duckdb/ submodule tracks current DuckDB main (see root CMakeLists.txt);
-# declared here too since CI configures this directory directly as its own
-# root (cmake -S test -B test/build_test), where the root option() never runs.
-option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
-
-# SaaS-fork engine hook consumer (see root CMakeLists.txt). Requires a
-# separately patched v1.5.4-era submodule — the current tip-tracking
-# submodule is unpatched, so this defaults OFF (hook test excluded; the
-# stock-mode capture stack does the work instead).
-# Deliberately NOT a global compile definition when ON: the hook-active
-# flag is process-sticky, so defining it everywhere would stop the plan-tee
-# and write-capture tests from exercising the legacy capture paths. Only
-# the dedicated consumer test builds with the define (see below); every
-# other binary keeps testing the stock-mode stack.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" OFF)
-
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_BINARY_DIR}
     ${DUCKDB_SOURCE_DIR}/src/include
     ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
+    # DuckDB 2.0: core headers (cast_helpers.hpp) include "fmt/format.h"
     ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
     ${DUCKDB_SOURCE_DIR}/third_party/catch
 )
 
-# Copy catch.hpp to test directory for includes
+# Keep the vendored test header in the build tree, not the source checkout.
 file(COPY ${DUCKDB_SOURCE_DIR}/third_party/catch/catch.hpp
-     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+     DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
 # Catch2 main
 add_library(catch2_main STATIC catch2_main.cpp)
@@ -62,9 +48,6 @@ function(add_dbsp_test TEST_NAME)
     target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
                           duckdb_generated_extension_loader
                           core_functions_extension parquet_extension)
-    if(DBSP_TIP_PORT)
-        target_compile_definitions(${TEST_TARGET} PRIVATE DBSP_TIP_PORT)
-    endif()
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_TARGET})
 endfunction()
 
@@ -86,16 +69,9 @@ add_dbsp_test(set_ops unit/test_set_ops.cpp)
 add_dbsp_test(distinct_on unit/test_distinct_on.cpp)
 add_dbsp_test(recursive unit/test_recursive.cpp)
 add_dbsp_test(auto_cdc unit/test_auto_cdc.cpp)
-if(NOT DBSP_TIP_PORT)
-    # The legacy write-capture unit directly inspects pre-tip parser AST
-    # fields. Tip builds use the tip-native classifier in DBSPContextState.
-    add_dbsp_test(write_capture unit/test_write_capture.cpp)
-endif()
 add_dbsp_test(row_hash unit/test_row_hash.cpp)
 add_dbsp_test(window_incremental unit/test_window_incremental.cpp)
-if(NOT DBSP_TIP_PORT)
-    add_dbsp_test(engine_hook unit/test_engine_hook.cpp)
-endif()
+add_dbsp_test(window_packed unit/test_window_packed.cpp)
 
 # Integration tests (require DuckDB)
 function(add_dbsp_integration_test TEST_NAME SOURCE)
@@ -110,23 +86,17 @@ function(add_dbsp_integration_test TEST_NAME SOURCE)
     target_link_libraries(${TEST_TARGET} catch2_main duckdb_static
                           duckdb_generated_extension_loader
                           core_functions_extension parquet_extension)
-    if(DBSP_TIP_PORT)
-        target_compile_definitions(${TEST_TARGET} PRIVATE DBSP_TIP_PORT)
-    endif()
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_TARGET})
 endfunction()
 
 add_dbsp_integration_test(extension_basic integration/test_extension_basic.cpp)
-if(DBSP_ENGINE_HOOK)
-    add_dbsp_integration_test(engine_hook_consumer integration/test_engine_hook_consumer.cpp)
-    target_compile_definitions(test_engine_hook_consumer PRIVATE DBSP_ENGINE_HOOK)
-endif()
 add_dbsp_integration_test(planner_frontend integration/test_planner_frontend.cpp)
 add_dbsp_integration_test(extension_cdc integration/test_extension_cdc.cpp)
 add_dbsp_integration_test(cascading_views integration/test_cascading_views.cpp)
 add_dbsp_integration_test(join_complex integration/test_join_complex.cpp)
 add_dbsp_integration_test(join_checkpoint integration/test_join_checkpoint.cpp)
 add_dbsp_integration_test(lazy_restore integration/test_lazy_restore.cpp)
+add_dbsp_integration_test(view_arr_sidecars integration/test_view_arr_sidecars.cpp)
 add_dbsp_integration_test(recursive_integration integration/test_recursive.cpp)
 add_dbsp_integration_test(recursive_deletion integration/test_recursive_deletion.cpp)
 add_dbsp_integration_test(optimization_integration integration/test_optimization_integration.cpp)
@@ -135,23 +105,18 @@ add_dbsp_integration_test(acid_compliance integration/test_acid_compliance.cpp)
 add_dbsp_integration_test(persistence integration/test_persistence.cpp)
 add_dbsp_integration_test(advanced_sql integration/test_advanced_sql.cpp)
 add_dbsp_integration_test(advanced_window integration/test_advanced_window.cpp)
-if(NOT DBSP_TIP_PORT)
-    # These cases assert the pre-tip parser-based write-capture counters.
-    # Tip builds use scan-and-diff for unsupported DML shapes.
-    add_dbsp_integration_test(auto_cdc_integration integration/test_auto_cdc.cpp)
-endif()
+add_dbsp_integration_test(auto_cdc_integration integration/test_auto_cdc.cpp)
 add_dbsp_integration_test(security_integration integration/test_security.cpp)
 add_dbsp_integration_test(distinct_ddl integration/test_distinct_ddl.cpp)
 add_dbsp_integration_test(set_ops_integration integration/test_set_ops.cpp)
 add_dbsp_integration_test(crash_recovery_phase1 integration/test_crash_recovery_phase1.cpp)
 add_dbsp_integration_test(crash_recovery_phase2 integration/test_crash_recovery_phase2.cpp)
 add_dbsp_integration_test(wal_recovery integration/test_wal.cpp)
-if(NOT DBSP_TIP_PORT)
-    add_dbsp_integration_test(plan_tee integration/test_plan_tee.cpp)
-endif()
-if(NOT DBSP_TIP_PORT)
-    add_dbsp_integration_test(engine_assumptions integration/test_engine_assumptions.cpp)
-endif()
+add_dbsp_integration_test(dml_shapes integration/test_dml_shapes.cpp)
+add_dbsp_integration_test(case_batch_eval integration/test_case_batch_eval.cpp)
+add_dbsp_integration_test(engine_assumptions integration/test_engine_assumptions.cpp)
+# Trigger delta source — the differential oracle for the one delta source.
+add_dbsp_integration_test(trigger_source unit/test_trigger_source.cpp)
 
 # Benchmarks (throughput printed manually: ./bench_planner_eval)
 add_executable(bench_planner_eval
@@ -163,9 +128,6 @@ add_executable(bench_planner_eval
 target_link_libraries(bench_planner_eval catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(bench_planner_eval PRIVATE DBSP_TIP_PORT)
-endif()
 # Correctness gate (in ctest): the [planner_eval]/[shard_bench] cases assert
 # result sizes, so an API drift that empties results (e.g. source-name
 # qualification: apply_changes routes only on an exact source_table_ match)
@@ -173,24 +135,6 @@ endif()
 # ~1s; throughput printing is untimed here and ignored.
 add_test(NAME planner_eval_smoke
          COMMAND bench_planner_eval "[planner_eval],[shard_bench]")
-
-# Write-capture perf gate (run manually: ./bench_write_capture). Asserts
-# manager.captured_delta_syncs() advances on UPDATE/DELETE/autocommit
-# INSERT — the legacy O(delta) captured-write fast path (dbsp_write_capture.
-# hpp), unavailable on tip (scan-and-diff takes over there instead, see
-# docs/TESTING.md). Not built under DBSP_TIP_PORT: its assertions can never
-# pass there by design, not because of a regression.
-if(NOT DBSP_TIP_PORT)
-    add_executable(bench_write_capture
-        benchmarks/bench_write_capture.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_extension.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_recovery.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_crash_marker.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../src/dbsp_wal_manager.cpp)
-    target_link_libraries(bench_write_capture catch2_main duckdb_static
-                          duckdb_generated_extension_loader
-                          core_functions_extension parquet_extension)
-endif()
 
 # Window-delta throughput gate (in ctest: window_bench asserts O(affected))
 add_executable(bench_window
@@ -202,9 +146,6 @@ add_executable(bench_window
 target_link_libraries(bench_window catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(bench_window PRIVATE DBSP_TIP_PORT)
-endif()
 add_test(NAME window_bench COMMAND bench_window "[window_bench]")
 
 # Data-plane micro-benchmarks (run manually: ./bench_dataplane)
@@ -217,9 +158,6 @@ add_executable(bench_dataplane
 target_link_libraries(bench_dataplane catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(bench_dataplane PRIVATE DBSP_TIP_PORT)
-endif()
 
 # Extended soak (not part of ctest; run manually, SOAK_ROUNDS env to size)
 add_executable(soak_differential
@@ -231,6 +169,3 @@ add_executable(soak_differential
 target_link_libraries(soak_differential catch2_main duckdb_static
                       duckdb_generated_extension_loader
                       core_functions_extension parquet_extension)
-if(DBSP_TIP_PORT)
-    target_compile_definitions(soak_differential PRIVATE DBSP_TIP_PORT)
-endif()

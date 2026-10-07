@@ -1,41 +1,32 @@
-// Per-connection hook state: auto-CDC transaction hooks + the O(Δ)
-// captured-delta fast paths (G2 inserts, write-capture updates/deletes).
+// Per-connection hook state for auto-CDC.
 //
-// INSERT (G2): explicit transactions expose their appended rows through
-// the transaction's LocalStorage while the transaction is alive (QueryEnd
-// fires with the transaction still open); pure-INSERT transactions on
-// tracked tables are captured row-by-row as they execute.
+// One delta source: the statement triggers generated on every tracked table
+// (dbsp_trigger_source.hpp). Their bodies call `dbsp_trigger_ingest`, which
+// buffers the exact old/new row images of the writing transaction here
+// (buffer_trigger_delta). TransactionCommit then applies the buffer through
+// the CDC core's one ingest path in a single propagation pass, and
+// TransactionRollback discards it.
 //
-// UPDATE/DELETE (write capture, docs/DESIGN_WRITE_CAPTURE.md): at
-// QueryBegin a whitelisted statement on a tracked table runs one
-// internal-connection SELECT that reads the old images and computes the
-// new ones (SET expressions projected, cast to column types), yielding a
-// signed delta — works for explicit transactions AND autocommit (the
-// capture needs no transaction internals; autocommit applies from the
-// mid-statement commit hook, where the fallback sync already runs).
+// This class owns the four things that cannot live in the trigger bodies:
 //
-// Autocommit INSERT ... VALUES (write capture too): the statement's own
-// VALUES list is evaluated via one internal SELECT with the INSERT's
-// to-column-type casts (full-cover column lists only — partial lists
-// involve defaults). Explicit-txn INSERTs stay on G2, which is exact.
+//   * QueryBegin — the trigger sweep (bring the catalog's triggers in line
+//     with the tracked-table set) and deferred-baseline materialization;
+//   * statement classification — which tracked tables a transaction wrote, so
+//     a commit that cannot be served by an exact delta scans only those;
+//   * TransactionCommit — the one place where running SQL is safe, so the
+//     buffered delta is applied here, never inside a trigger body;
+//   * the scan-and-diff fallback, which is the safety net whenever the
+//     buffered picture is or might be incomplete (mark_delta_unknown, a
+//     trigger install under the transaction, a write nothing accounted for).
 //
-// At commit a guard validates every captured table — commit-sequence
-// conflict check, signed COUNT(*), and rowid re-verification of written
-// rows — and the merged delta is applied in O(delta) via
-// apply_captured_delta. Anything else — autocommit INSERTs (LocalStorage
-// is gone at every hook), non-whitelisted writes (txn marked dirty),
-// guard mismatches (counted loudly) — falls back to the scan-and-diff
-// sync. Captured and scanned deltas are never mixed for one commit.
-// Correctness never depends on capture.
+// Correctness never depends on the trigger path having fired: every route out
+// of "I do not know what this transaction wrote" ends in a scan.
 
 #pragma once
 
 #include "dbsp_cdc.hpp"
 #include "dbsp_recovery.hpp"
-#include "dbsp_wal_manager.hpp"
-#ifndef DBSP_TIP_PORT
-#include "dbsp_write_capture.hpp"
-#endif
+#include "dbsp_trigger_source.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -45,123 +36,70 @@
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
-#ifdef DBSP_TIP_PORT
-#include "duckdb/parser/query_node/insert_query_node.hpp"
-#include "duckdb/parser/query_node/delete_query_node.hpp"
+// DuckDB 2.0: UpdateStatement only forward-declares its UpdateQueryNode
 #include "duckdb/parser/query_node/update_query_node.hpp"
-#endif
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/storage/data_table.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
-#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 
 #include <atomic>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace dbsp_native {
 
-// Engine-hook (SaaS fork) runtime flag. Set by register_engine_hook
-// (dbsp_engine_hook.hpp) when the patched engine's txn-modification callback
-// is registered. While true, the design-1/plan-tee capture stack stays
-// disarmed: the engine reports exact per-commit deltas, so predictive
-// capture would only duplicate the work its guards exist to distrust.
-inline std::atomic<bool> &engine_hook_flag() {
-  static std::atomic<bool> flag{false};
-  return flag;
+/// Tracks which DatabaseInstances have already run recovery, so it runs
+/// once per DATABASE rather than once per process.
+///
+/// Entries MUST be dropped when a database closes (dbsp_forget_recovery,
+/// called from the teardown hook): DuckDB reuses freed DatabaseInstance
+/// addresses, so a stale entry makes a BRAND-NEW database at the same
+/// address skip recovery entirely — no crash marker, no session registered.
+/// Measured: opening three databases, closing them, then opening a fourth
+/// left the fourth completely unprotected.
+inline std::set<const void *> &dbsp_recovered_dbs() {
+  static std::set<const void *> recovered;
+  return recovered;
 }
-inline bool engine_hook_active() {
-  return engine_hook_flag().load(std::memory_order_relaxed);
+
+inline std::mutex &dbsp_recovered_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+/// True if THIS call is the one that should run recovery for `db`.
+inline bool dbsp_claim_recovery(const void *db) {
+  std::lock_guard<std::mutex> guard(dbsp_recovered_mutex());
+  return dbsp_recovered_dbs().insert(db).second;
+}
+
+/// Let a future database at this address recover. Idempotent.
+inline void dbsp_forget_recovery(const void *db) {
+  std::lock_guard<std::mutex> guard(dbsp_recovered_mutex());
+  dbsp_recovered_dbs().erase(db);
 }
 
 class DBSPContextState : public duckdb::ClientContextState {
 public:
-  // ---- D2 plan-tee surface (dbsp_plan_tee.hpp) ----------------------
-  // The optimizer tee observes rows a DML plan actually processed:
-  // exact regardless of predicates, parameters, volatility, or prior
-  // transaction-local writes. Armed per statement by the optimizer
-  // extension; execution threads add rows; QueryEnd (explicit txn) or
-  // the autocommit commit hook consumes.
-  struct TeeCapture {
-    std::mutex mutex;
-    bool armed = false;
-    // an UPDATE ... FROM child emitting two different new images for one
-    // target row is ambiguous — the tee invalidates itself and the
-    // statement takes the scan path
-    bool invalid = false;
-    std::string table; // canonical key
-    DuckDBZSet delta;
-    // a USING/join-shaped DML child can emit one row per MATCH:
-    // dedupe so a twice-matched target row still counts once
-    std::unordered_set<int64_t> seen_rowids;
-  };
-
-  // Optimizer callback: is the in-flight statement already served by
-  // the design-1 capture? (then the tee would double-count)
-  bool current_stmt_captured() const { return stmt_.captured; }
-
-  void arm_tee(const std::string &table_key) {
-    if (engine_hook_active()) {
-      return; // engine reports exact deltas: the tee would double-count
-    }
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    tee_.armed = true;
-    tee_.table = table_key;
-  }
-
-  // Execution threads: one deleted row (old image), deduped by rowid
-  void tee_add_delete(int64_t rowid, DuckDBRow &&row) {
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    if (!tee_.armed || !tee_.seen_rowids.insert(rowid).second) {
-      return;
-    }
-    tee_.delta.insert(std::move(row), -1);
-  }
-
-  // Execution threads: one appended row (no rowid exists yet; duplicate
-  // rows are real duplicate inserts — no dedupe)
-  void tee_add_insert(DuckDBRow &&row) {
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    if (!tee_.armed) {
-      return;
-    }
-    tee_.delta.insert(std::move(row), 1);
-  }
-
-  // Execution threads: one updated row (old image, new image). A repeated
-  // rowid means the plan produced multiple new images for one target row
-  // (UPDATE ... FROM multi-match) — ambiguous, invalidate the tee.
-  void tee_add_update(int64_t rowid, DuckDBRow &&old_row,
-                      DuckDBRow &&new_row) {
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    if (!tee_.armed) {
-      return;
-    }
-    if (!tee_.seen_rowids.insert(rowid).second) {
-      tee_.invalid = true;
-      return;
-    }
-    tee_.delta.insert(std::move(old_row), -1);
-    tee_.delta.insert(std::move(new_row), 1);
-  }
-  // ---- end tee surface ----------------------------------------------
-
-  // ---- engine-hook surface (dbsp_engine_hook.hpp, SaaS fork) ---------
-  // Called from the engine's txn-modification callback, inside
-  // DuckTransaction::Commit. Buffer only — application happens in
+  // ---- trigger-source surface (dbsp_trigger_source.hpp) ---------------
+  // Called from a generated trigger body, on an execution thread, while the
+  // writing statement runs. Buffer only — application happens in
   // TransactionCommit, where running SQL is safe. The caller has already
   // filtered untracked tables.
-  void engine_buffer_delta(const std::string &table_key, DuckDBZSet &&delta) {
-    capture_.engine_fed = true;
+  void buffer_trigger_delta(const std::string &table_key, DuckDBZSet &&delta) {
+    std::lock_guard<std::mutex> guard(trigger_buffer_mutex_);
+    capture_.trigger_fed = true;
     if (delta.empty()) {
       return;
     }
-    auto &dst = capture_.engine_deltas[table_key];
+    auto &dst = capture_.trigger_deltas[table_key];
     if (dst.empty()) {
       dst = std::move(delta);
       return;
@@ -171,13 +109,26 @@ public:
     }
   }
 
-  // Conversion failed mid-buffer: the engine picture is incomplete, so the
-  // commit must reconcile by scan instead of applying a partial delta.
-  void engine_mark_unknown() {
-    capture_.engine_fed = true;
+  // The buffered picture is incomplete — a conversion failed, or a firing
+  // could not reach the buffer at all. The commit must reconcile by scan
+  // instead of applying a partial delta. Poison, never silence: this is the
+  // only route by which "there was nothing to buffer" and "I lost rows" stay
+  // distinguishable at commit.
+  void mark_delta_unknown() {
+    std::lock_guard<std::mutex> guard(trigger_buffer_mutex_);
+    capture_.trigger_fed = true;
     capture_.unknown_writes = true;
   }
-  // ---- end engine-hook surface ----------------------------------------
+  // ---- end trigger-source surface --------------------------------------
+
+  // dbsp_track added this key on this connection. DBSP's tracked-table set is
+  // NOT transactional, so a track issued inside a transaction that rolls back
+  // used to survive it: dbsp_tables() went on listing a table that never
+  // committed, and the trigger sweep would install bodies on whatever table
+  // later took that name. TransactionRollback drops the intent instead.
+  void note_table_tracked(const std::string &key) {
+    tracked_in_txn_.push_back(key);
+  }
 
   void QueryBegin(duckdb::ClientContext &context) override {
     if (internal_query_depth > 0) {
@@ -185,6 +136,39 @@ public:
     }
     maybe_run_recovery(context);
     auto &manager = get_cdc_manager(context);
+    // Trigger source: bring the catalog's DBSP triggers in line with the
+    // tracked-table set. This is the only sweep point, so it covers every way
+    // a table becomes tracked (dbsp_track, view-source auto-tracking, a
+    // checkpoint restore) without enumerating entry points. Cost in the steady
+    // state is one shared-lock size comparison per statement.
+    //
+    // The install commits on its own connection, i.e. AFTER this statement's
+    // transaction took its catalog snapshot — so the triggers cannot fire for
+    // THIS transaction. capture_.triggers_installed makes its commit
+    // reconcile by scan; every transaction after it sees the triggers.
+    //
+    // Both outcomes that are not UNCHANGED mean the same thing to this
+    // transaction: some tracked table's trigger bodies do not match its
+    // columns right now, so nothing they buffer can be trusted and the
+    // commit must reconcile by scan.
+    //
+    // CHANGED — the bodies were just regenerated on an internal connection,
+    // which commits AFTER this transaction took its catalog snapshot, so
+    // this transaction still runs against the old ones.
+    // DEFERRED — the user holds a transaction open, so the DDL could not run
+    // at all (an internal connection cannot see their uncommitted catalog
+    // changes; trying anyway made their own COMMIT fail and wedged the
+    // connection). The reconcile waits for the first statement after their
+    // transaction ends, and `recheck` stays armed until it succeeds.
+    //
+    // DETACH is the one statement the sweep must not run before: the gate
+    // reads catalog versions, which joins those catalogs to this transaction,
+    // and DETACH refuses to run against a catalog the transaction has touched.
+    if (!statement_detaches(context.GetCurrentQuery()) &&
+        install_pending_triggers(context, manager) !=
+            ReconcileResult::UNCHANGED) {
+      capture_.triggers_installed = true;
+    }
     // D3c: an out-of-band change invalidated a lazily-restored baseline —
     // reconciliation is impossible incrementally, so views rebuild from
     // committed storage at the next statement boundary (here). Runs even
@@ -211,6 +195,9 @@ public:
     // With auto-sync OFF this parse runs only while baselines are deferred
     // (D3c) — the write check below is the sole consumer.
     stmt_ = classify(context.GetCurrentQuery());
+    if (std::getenv("DBSP_DEBUG_SYNC")) {
+      last_query_dbg_ = context.GetCurrentQuery();
+    }
     // D3c: a write is about to execute. Deferred (lazy-restored) baselines
     // must materialize from PRE-write storage: this is the only moment the
     // scan is guaranteed to equal the restore-time content exactly. (The
@@ -230,37 +217,15 @@ public:
         }
       }
     }
-    clear_tee(); // new statement: any stale tee rows are dead
     if (!auto_sync) {
       stmt_ = {}; // hooks are inert without auto-sync
       return;
-    }
-    // Write capture must run BEFORE the statement executes: the capture
-    // SELECT reads committed (pre-statement) state.
-    // Autocommit INSERT_OK: the transaction dies before QueryEnd can read
-    // LocalStorage (G2 needs an explicit txn), but a plain VALUES list is
-    // right there in the statement — capture it the same way. Explicit-txn
-    // INSERTs stay on G2 (exact, and capturing both would double-count).
-    // Autocommit statements already run inside their own transaction here
-    // (probed empirically), so every capture buffers in capture_ and
-    // applies from the TransactionCommit hook.
-    if (!engine_hook_active() &&
-        (stmt_.kind == StmtClass::WRITE_KNOWN ||
-         (stmt_.kind == StmtClass::INSERT_OK &&
-          context.transaction.IsAutoCommit()))) {
-      try {
-        try_write_capture(context, manager);
-      } catch (...) {
-        // capture is an optimization only; the QueryEnd fold poisons
-      }
     }
     // Autocommit statements fold NOW: their commit hook fires mid-
     // statement when the catalog view is already unusable (resolve
     // fails), and their QueryEnd runs post-commit — this is the only
     // hook where scoping resolution works. Explicit-txn statements fold
-    // at QueryEnd instead, so the optimizer tee (which runs between
-    // these hooks) can mark the statement captured before the fold
-    // decides whether to poison the transaction.
+    // at QueryEnd instead.
     if (context.transaction.HasActiveTransaction() &&
         context.transaction.IsAutoCommit()) {
       fold_into_txn(context, stmt_);
@@ -273,9 +238,7 @@ public:
       return;
     }
     capture_ = {};
-    // Write-capture conflict guard: another connection's delta landing
-    // after this moves the seq and poisons this transaction's captures.
-    capture_.seq_snapshot = get_cdc_manager(context).commit_seq();
+    tracked_in_txn_.clear();
   }
 
   void QueryEnd(duckdb::ClientContext &context,
@@ -291,32 +254,23 @@ public:
       return; // failed statement changed nothing
     }
     // Autocommit: the mid-statement commit hook already consumed the
-    // statement (capture, tee, or scoped scan) and reset capture_ —
-    // folding here would re-count it against a finished transaction
-    // whose catalog view is gone (resolve fails, touched stays empty)
-    // and poison the NEXT statement's commit into a read-only skip.
+    // statement and reset capture_ — folding here would re-count it against
+    // a finished transaction whose catalog view is gone (resolve fails,
+    // touched stays empty) and poison the NEXT statement's commit into a
+    // read-only skip.
     if (!context.transaction.HasActiveTransaction() ||
         context.transaction.IsAutoCommit()) {
       return;
     }
 
     try {
-      // D2 tee first: exact rows the DML plan processed. Marks the
-      // statement captured so the fold below cannot poison it.
-      fold_tee_into_txn();
-      // Fold moved here from QueryBegin (the optimizer tee runs between
-      // the hooks); failed statements never fold — the transaction is
-      // invalidated anyway
       fold_into_txn(context, stmt_);
-      if (!engine_hook_active()) {
-        classify_and_capture(context); // G2 appends: engine hook covers these
-      }
     } catch (const std::exception &) {
-      // Capture is an optimization only: on any surprise, poison the
-      // transaction so commit falls back to scan-and-diff
-      capture_.dirty = true;
+      // Scoping is an optimization only: on any surprise, widen this
+      // transaction's commit to the full scan-and-diff.
+      capture_.unknown_writes = true;
     } catch (...) {
-      capture_.dirty = true;
+      capture_.unknown_writes = true;
     }
   }
 
@@ -328,8 +282,14 @@ public:
       return;
     }
 
+    tracked_in_txn_.clear(); // committed: the tracking intent stands
+
     auto &manager = get_cdc_manager(context);
     if (!manager.is_auto_sync_enabled()) {
+      // This commit reconciles nothing, so any untrusted baseline stays
+      // untrusted — which is what the per-table state already says. An
+      // explicit dbsp_sync(), or the first commit once auto-sync is back on,
+      // is what repairs it.
       capture_ = {};
       return;
     }
@@ -343,28 +303,91 @@ public:
     struct CheckpointGuard {
       CDCManager &m;
       duckdb::ClientContext &ctx;
-      ~CheckpointGuard() { m.maybe_save_checkpoint(ctx); }
+      ~CheckpointGuard() {
+        m.maybe_save_checkpoint(ctx);
+        // Trigger source housekeeping: the one row each trigger firing writes
+        // into its sink is write-only bookkeeping; drain it periodically so a
+        // long-lived process cannot grow the sink without bound. An atomic
+        // load below the threshold, and nothing else.
+        maybe_drain_trigger_sinks(ctx);
+      }
     } checkpoint_guard{manager, context};
 
-    try {
-      // Engine-hook fast path (SaaS fork): the engine reported this
-      // transaction's exact per-table images — facts need no guards.
-      // unknown_writes still forces a scan: DDL (ALTER rewrites, etc.)
-      // produces no tuple undo entries, so the engine deltas alone can be
-      // an incomplete picture of such a transaction.
-      if (capture_.engine_fed) {
-        const bool unknown = capture_.unknown_writes;
-        auto deltas = std::move(capture_.engine_deltas);
-        capture_ = {};
-        clear_tee();
-        std::vector<std::string> failed;
-        for (auto &[table, delta] : deltas) {
-          if (!manager.apply_captured_delta(table, delta, &context)) {
-            // untracked-by-now or deferred-baseline rebuild scheduled:
-            // reconcile that table by scan below
-            failed.push_back(table);
-          }
+    // THE seeding/reconcile debt, paid in one place. Every tracked table whose
+    // TrackedTable::Baseline is not SEEDED — a seeding scan the CDC core had
+    // to skip because this connection held a transaction open, or a baseline
+    // seeded while ANOTHER connection did — is scanned here, BY NAME. The
+    // state is per-INSTANCE and so is the sweep: whichever connection commits
+    // next pays, including a commit that touched nothing at all, which is the
+    // case the provisional reproduction needs (at connection A's own commit,
+    // A's transaction is still active, so the repair falls to a bare
+    // `SELECT 1` on connection B).
+    //
+    // A DESTRUCTOR because it must run on every path out of this function,
+    // including the read-only and nothing-written early returns. It runs AFTER
+    // the branches below, so a table that is still untrusted has had this
+    // commit's delta refused and scanned already and this scan cannot
+    // double-count. Declared after checkpoint_guard so it destructs FIRST: the
+    // piggybacked checkpoint save must see the repaired state.
+    //
+    // FORBIDDEN, on a measurement rather than an assumption. This runs from
+    // TransactionCommit, which fires AFTER Commit() has succeeded, so the rows
+    // this scan reads are committed — including the ones this very transaction
+    // just wrote. The open question was whether the ClientContext still
+    // reports an open user transaction here, which would make a Forbidden
+    // policy throw on exactly the commit that repairs the view. It does NOT:
+    // with this set to Forbidden, the strict-mode case commits an EXPLICIT
+    // transaction while a table is provisional-and-ready and passes, so
+    // user_transaction_open(context) is false by the time the hook runs.
+    // Forbidden and not whitelisted, because that is the honest state: if the
+    // engine ever starts reporting the transaction as open here,
+    // DBSP_STRICT_INTERNAL_QUERY=1 says so instead of a comment quietly going
+    // stale. Pinned by `cdc: a provisional baseline retires under the strict
+    // internal-query switch` in test/unit/test_trigger_source.cpp.
+    struct ReconcileGuard {
+      CDCManager &m;
+      duckdb::ClientContext &ctx;
+      ~ReconcileGuard() {
+        try {
+          m.reconcile_untrusted_baselines(
+              ctx, dbsp_native::InternalReadPolicy::Forbidden,
+              "untrusted baseline reconcile at commit");
+        } catch (const std::exception &ex) {
+          std::cerr << "DBSP baseline reconcile error: " << ex.what() << "\n";
+        } catch (...) {
+          std::cerr << "DBSP baseline reconcile unknown error\n";
         }
+      }
+    } reconcile_guard{manager, context};
+
+    try {
+      // Trigger-fed fast path: the bodies reported this transaction's exact
+      // per-table images — facts need no guards. unknown_writes still forces
+      // a scan: a firing that could not reach the buffer, or a conversion
+      // that failed, leaves an incomplete picture.
+      if (capture_.trigger_fed) {
+        // triggers_installed means the trigger bodies did not match their
+        // tables for the whole of this transaction: either a table became
+        // tracked under it, or a schema moved and regeneration was deferred.
+        // Whatever they buffered was produced by a body of the wrong shape, so
+        // it is DISCARDED rather than applied and then repaired — a
+        // wrong-width row applied to a baseline is a mess a later scan has to
+        // undo.
+        if (capture_.triggers_installed) {
+          capture_ = {};
+          manager.sync_all(context, &transaction);
+          return;
+        }
+        const bool unknown = capture_.unknown_writes;
+        auto deltas = std::move(capture_.trigger_deltas);
+        capture_ = {};
+        // ALL tables in ONE propagation pass — per-table applies kept only
+        // the last table's downstream deltas (single-generation buffers)
+        // and missed join both-shared corrections. Tables the manager
+        // could not serve (untracked-by-now or deferred-baseline rebuild
+        // scheduled) are reconciled by scan below.
+        std::vector<std::string> failed =
+            manager.apply_captured_deltas(deltas, &context);
         if (unknown) {
           manager.sync_all(context, &transaction);
         } else if (!failed.empty()) {
@@ -376,41 +399,6 @@ public:
         return;
       }
 
-      if (capture_.active && !capture_.dirty && !capture_.unknown_writes &&
-          apply_captured(context, manager)) {
-        capture_ = {};
-        return; // O(delta) fast path served this commit
-      }
-
-      // Autocommit D2 tee: execution finished before this hook fired, so
-      // the teed rows are the complete, exact delta — apply directly, no
-      // guard needed (they ARE what the statement did). Not gated on
-      // saw_statements: the QueryBegin fold already ran for autocommit.
-      {
-        bool teed = false;
-        std::string tee_table;
-        DuckDBZSet tee_delta;
-        {
-          std::lock_guard<std::mutex> guard(tee_.mutex);
-          if (tee_.armed && !tee_.invalid) {
-            teed = true;
-            tee_table = tee_.table;
-            tee_delta = std::move(tee_.delta);
-            tee_.armed = false;
-            tee_.delta = DuckDBZSet();
-            tee_.seen_rowids.clear();
-          }
-        }
-        if (teed) {
-          if (tee_delta.empty() ||
-              manager.apply_captured_delta(tee_table, tee_delta, &context)) {
-            capture_ = {};
-            return; // O(delta): the plan's own rows served this commit
-          }
-          // deferred-baseline rebuild scheduled: scan reconciles below
-        }
-      }
-
       // H1: scope the fallback sync to the tables this transaction wrote.
       // Autocommit commits fire mid-statement, before QueryEnd folded the
       // in-flight classification — fold it now.
@@ -419,12 +407,35 @@ public:
       }
       const bool know_all_writes =
           capture_.saw_statements && !capture_.unknown_writes;
+      const bool saw_statements = capture_.saw_statements;
       std::vector<std::string> touched(capture_.touched.begin(),
                                        capture_.touched.end());
       capture_ = {};
 
       if (know_all_writes && touched.empty()) {
         return; // read-only commit: nothing can have changed
+      }
+      // The triggers report EVERY write to a tracked table (the trigger_fed
+      // branch above), so a commit that reaches here with nothing fed and NO
+      // statement seen provably wrote nothing to a tracked table — fresh
+      // connections fire setup/teardown commits with exactly this signature,
+      // and the pre-H1 sync_all safety net turned each one into a full
+      // scan-diff of every tracked table. DDL cannot hide here (it is
+      // statement-shaped and folds as WRITE_UNKNOWN, so saw_statements is true
+      // and the sync below still runs). Gated on trigger_source_active(),
+      // which flips only once a trigger body has actually DELIVERED: until
+      // then the pessimistic net stands.
+      if (trigger_source_active() && !saw_statements &&
+          stmt_.kind == StmtClass::NONE) {
+        return;
+      }
+      if (std::getenv("DBSP_DEBUG_SYNC")) {
+        std::cerr << "[dbsp] commit fallback sync: know_all="
+                  << know_all_writes << " touched=" << touched.size()
+                  << " stmt_kind=" << static_cast<int>(stmt_.kind)
+                  << " thread=" << std::this_thread::get_id() << " ctx="
+                  << &context << " tracked=" << manager.tracked_table_total()
+                  << " last_q='" << last_query_dbg_.substr(0, 60) << "'\n";
       }
       // The transaction has already committed successfully at this point.
       // We can safely read the post-commit state and pass the transaction
@@ -435,8 +446,11 @@ public:
                                 touched.size() > 1,
                             &transaction);
       } else {
-        // Writes we could not attribute (Appender API, multi-statement,
-        // unparseable SQL): scan everything, as before H1
+        // Writes we could not attribute (multi-statement, unparseable SQL):
+        // nothing names a table, so nothing can be scoped. One of the three
+        // sync_all sites in this hook — the other two are the
+        // triggers-installed and unknown-writes branches above — plus the
+        // user-invoked one behind dbsp_sync().
         manager.sync_all(context, &transaction);
       }
     } catch (const std::exception &ex) {
@@ -451,8 +465,21 @@ public:
     if (internal_query_depth > 0) {
       return;
     }
-    capture_ = {}; // rolled back: captured rows never happened
-    clear_tee();
+    capture_ = {}; // rolled back: buffered rows never happened
+    // An untrusted baseline needs no special case here. It is per-TABLE state
+    // that this rollback does not touch, and the next commit on any connection
+    // scans it by name (CDCManager::reconcile_untrusted_baselines).
+    // The tracked-table set is process state, not transactional state — so a
+    // dbsp_track inside this transaction has to be undone by hand. Without
+    // this, a rolled-back CREATE TABLE u + dbsp_track('u') left u tracked
+    // forever against a table that does not exist.
+    if (!tracked_in_txn_.empty()) {
+      auto &manager = get_cdc_manager(context);
+      for (const auto &key : tracked_in_txn_) {
+        manager.untrack_table(key);
+      }
+      tracked_in_txn_.clear();
+    }
   }
 
   // One-time crash recovery, moved here from OnConnectionOpened: that
@@ -462,9 +489,11 @@ public:
   // recovery's own internal connections (internal_query_depth > 0) and
   // re-entrant queries never recurse.
   static void maybe_run_recovery(duckdb::ClientContext &context) {
-    static std::atomic<bool> recovery_started{false};
-    bool expected = false;
-    if (!recovery_started.compare_exchange_strong(expected, true)) {
+    // Once per DATABASE, not once per process. A process-wide latch meant
+    // only the first database opened ever ran recovery, so every later one
+    // got no crash marker and registered no session — leaving them
+    // unprotected and making the first close drop the shared lock.
+    if (!dbsp_claim_recovery(context.db.get())) {
       return;
     }
     auto &recovery_manager = get_recovery_manager();
@@ -490,77 +519,62 @@ public:
 
 private:
   struct TxnCapture {
-    bool active = false;
-    bool dirty = false;
     // H1 sync scoping: which tables this transaction wrote, and whether we
     // saw/classified every statement. Writes we could not attribute
     // (unparseable, multi-statement, unknown statement kinds) force a full
-    // sync; a transaction with zero seen statements (e.g. the Appender API
-    // bypasses query hooks entirely) also forces a full sync.
+    // sync; so does a transaction with zero seen statements that the trigger
+    // bodies have not vouched for.
     bool saw_statements = false;
     bool unknown_writes = false;
-    // any write statement folded this txn (tracked or not): subquery
-    // predicates and DELETE USING probes read committed state only, so
-    // they are safe solely before the transaction's first write
-    bool wrote_any = false;
     std::unordered_set<std::string> touched;
-    // per tracked table: captured append delta + local rows consumed so far
-    std::unordered_map<std::string, std::pair<DuckDBZSet, duckdb::idx_t>>
-        appends;
-    // Write capture (UPDATE/DELETE): signed deltas + the rowids the commit
-    // guard re-verifies against committed storage
-    struct WriteVerify {
-      int64_t rowid;
-      bool is_delete;         // guard expects the rowid to be gone
-      DuckDBRow expected_new; // UPDATE: guard expects exactly this row
-    };
-    std::unordered_map<std::string, DuckDBZSet> write_deltas;
-    std::unordered_map<std::string, std::vector<WriteVerify>> verifies;
-    uint64_t seq_snapshot = 0;
-    bool wrote_capture = false;
-    // Engine-hook (SaaS fork): exact per-table deltas the patched engine
-    // reported for this transaction (dbsp_engine_hook.hpp buffers them
-    // during DuckTransaction::Commit; TransactionCommit applies guard-free)
-    std::unordered_map<std::string, DuckDBZSet> engine_deltas;
-    bool engine_fed = false;
+    // Exact per-table images the trigger bodies reported for this transaction
+    // (buffer_trigger_delta); TransactionCommit applies them guard-free.
+    std::unordered_map<std::string, DuckDBZSet> trigger_deltas;
+    bool trigger_fed = false;
+    // Trigger source: this transaction had DBSP triggers installed under it
+    // (QueryBegin sweep). The install commits on its own connection AFTER
+    // this transaction took its catalog snapshot, so the triggers cannot fire
+    // for it — its picture is incomplete and commit must reconcile by scan.
+    bool triggers_installed = false;
   };
   TxnCapture capture_;
+  // Keys dbsp_track ADDED under the in-flight transaction (note_table_tracked)
+  std::vector<std::string> tracked_in_txn_;
+  // Trigger bodies run on execution threads, and an aggregate over a large
+  // transition table may be parallel, so more than one thread can be inside
+  // buffer_trigger_delta at once. Guards trigger_deltas only.
+  std::mutex trigger_buffer_mutex_;
 
   // Classification of one SQL statement (computed at QueryBegin)
   struct StmtClass {
     enum Kind {
       NONE,        // empty / not seen
       READ,        // changes nothing
-      INSERT_OK,   // plain INSERT: capturable append
+      INSERT_OK,   // plain INSERT with a known target table
       WRITE_KNOWN, // write with a known target table (DELETE/UPDATE/upsert)
       WRITE_UNKNOWN // anything else that might write anywhere
     };
     Kind kind = NONE;
     std::string table;   // INSERT_OK / WRITE_KNOWN target
-    std::string text;    // original statement (INSERT capture needs it)
-    bool captured = false; // WRITE_KNOWN served by write capture: not dirty
   };
   StmtClass stmt_;
-
-  // H2 guard cache: one internal connection + a prepared COUNT(*) per table
-  std::unique_ptr<duckdb::Connection> guard_con_;
-  std::unordered_map<std::string, duckdb::unique_ptr<duckdb::PreparedStatement>>
-      count_stmts_;
+  std::string last_query_dbg_; // DBSP_DEBUG_SYNC only: last classified query
 
   static std::string base_table_name(const duckdb::TableRef *ref) {
     if (ref && ref->type == duckdb::TableReferenceType::BASE_TABLE) {
       auto &base = ref->Cast<duckdb::BaseTableRef>();
-      const auto &name = base.GetQualifiedName();
-      return dotted_ref(name.Catalog().GetIdentifierName(),
-                        name.Schema().GetIdentifierName(),
-                        name.Name().GetIdentifierName());
+      // DuckDB 2.0: BaseTableRef holds one QualifiedName behind accessors
+      const auto &qn = base.GetQualifiedName();
+      return dotted_ref(qn.Catalog().GetIdentifierName(),
+                        qn.Schema().GetIdentifierName(),
+                        qn.Name().GetIdentifierName());
     }
     return {};
   }
 
   // Textual dotted reference from parsed statement parts (either or both
-  // qualifiers may be absent). Canonicalization happens at fold/capture
-  // time via resolve_table_entry — parse-time text is never used as a key.
+  // qualifiers may be absent). Canonicalization happens at fold time via
+  // resolve_table_entry — parse-time text is never used as a key.
   static std::string dotted_ref(const std::string &catalog,
                                 const std::string &schema,
                                 const std::string &table) {
@@ -579,7 +593,6 @@ private:
     if (query.empty()) {
       return out;
     }
-    out.text = query;
     // dbsp's own DDL: CREATE MATERIALIZED VIEW only READS tracked tables to
     // populate the new view — it never writes one. The custom syntax fails
     // core parsing, so without this carve-out it fell into "unparseable:
@@ -594,60 +607,25 @@ private:
           out.kind = StmtClass::READ;
           return out;
         }
+        // Plain reads skip the full parse: with auto-sync on, classify runs
+        // on EVERY statement, and constructing a Parser + ParseQuery for
+        // each SELECT taxed read-heavy workloads. Only unambiguous read
+        // heads short-circuit — "with" is excluded (data-modifying CTEs),
+        // "pragma" can write settings; everything else still parses.
+        const auto head_kw = [&head](const char *kw, size_t n) {
+          if (head.rfind(kw, 0) != 0) {
+            return false;
+          }
+          return head.size() == n ||
+                 !(std::isalnum(static_cast<unsigned char>(head[n])) ||
+                   head[n] == '_');
+        };
+        if (head_kw("select", 6) || head_kw("explain", 7)) {
+          out.kind = StmtClass::READ;
+          return out;
+        }
       }
     }
-#ifdef DBSP_TIP_PORT
-    duckdb::Parser parser;
-    try {
-      parser.ParseQuery(query);
-    } catch (...) {
-      out.kind = StmtClass::WRITE_UNKNOWN;
-      return out;
-    }
-    if (parser.statements.size() != 1) {
-      out.kind = parser.statements.empty() ? StmtClass::NONE
-                                           : StmtClass::WRITE_UNKNOWN;
-      return out;
-    }
-    auto &stmt = *parser.statements[0];
-    auto qualified_ref = [](const duckdb::QualifiedName &name) {
-      return dotted_ref(name.Catalog().GetIdentifierName(),
-                        name.Schema().GetIdentifierName(),
-                        name.Name().GetIdentifierName());
-    };
-    switch (stmt.type) {
-    case duckdb::StatementType::SELECT_STATEMENT:
-    case duckdb::StatementType::EXPLAIN_STATEMENT:
-    case duckdb::StatementType::PREPARE_STATEMENT:
-    case duckdb::StatementType::TRANSACTION_STATEMENT:
-      out.kind = StmtClass::READ;
-      return out;
-    case duckdb::StatementType::INSERT_STATEMENT: {
-      auto &insert = stmt.Cast<duckdb::InsertStatement>();
-      out.table = qualified_ref(insert.node->qualified_name);
-      out.kind = insert.node->on_conflict_info ? StmtClass::WRITE_KNOWN
-                                                : StmtClass::INSERT_OK;
-      return out;
-    }
-    case duckdb::StatementType::DELETE_STATEMENT: {
-      auto &del = stmt.Cast<duckdb::DeleteStatement>();
-      out.table = base_table_name(del.node->table.get());
-      out.kind = out.table.empty() ? StmtClass::WRITE_UNKNOWN
-                                   : StmtClass::WRITE_KNOWN;
-      return out;
-    }
-    case duckdb::StatementType::UPDATE_STATEMENT: {
-      auto &upd = stmt.Cast<duckdb::UpdateStatement>();
-      out.table = base_table_name(upd.node->table.get());
-      out.kind = out.table.empty() ? StmtClass::WRITE_UNKNOWN
-                                   : StmtClass::WRITE_KNOWN;
-      return out;
-    }
-    default:
-      out.kind = StmtClass::WRITE_UNKNOWN;
-      return out;
-    }
-#else
     duckdb::Parser parser;
     try {
       parser.ParseQuery(query);
@@ -670,21 +648,25 @@ private:
       return out;
     case duckdb::StatementType::INSERT_STATEMENT: {
       auto &insert = stmt.Cast<duckdb::InsertStatement>();
-      out.table = dotted_ref(insert.catalog, insert.schema, insert.table);
-      out.kind = insert.on_conflict_info ? StmtClass::WRITE_KNOWN
-                                         : StmtClass::INSERT_OK;
+      // DuckDB 2.0: the DML payload moved onto a QueryNode (InsertQueryNode)
+      const auto &qn = insert.node->qualified_name;
+      out.table = dotted_ref(qn.Catalog().GetIdentifierName(),
+                             qn.Schema().GetIdentifierName(),
+                             qn.Name().GetIdentifierName());
+      out.kind = insert.node->on_conflict_info ? StmtClass::WRITE_KNOWN
+                                               : StmtClass::INSERT_OK;
       return out;
     }
     case duckdb::StatementType::DELETE_STATEMENT: {
       auto &del = stmt.Cast<duckdb::DeleteStatement>();
-      out.table = base_table_name(del.table.get());
+      out.table = base_table_name(del.node->table.get());
       out.kind =
           out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
       return out;
     }
     case duckdb::StatementType::UPDATE_STATEMENT: {
       auto &upd = stmt.Cast<duckdb::UpdateStatement>();
-      out.table = base_table_name(upd.table.get());
+      out.table = base_table_name(upd.node->table.get());
       out.kind =
           out.table.empty() ? StmtClass::WRITE_UNKNOWN : StmtClass::WRITE_KNOWN;
       return out;
@@ -693,7 +675,6 @@ private:
       out.kind = StmtClass::WRITE_UNKNOWN;
       return out;
     }
-#endif
   }
 
   // Merge one statement's classification into the transaction's sync scope
@@ -702,9 +683,6 @@ private:
       return;
     }
     capture_.saw_statements = true;
-    if (c.kind != StmtClass::READ) {
-      capture_.wrote_any = true;
-    }
     switch (c.kind) {
     case StmtClass::READ:
       break;
@@ -718,538 +696,12 @@ private:
               canonical_table_key(*entry))) {
         capture_.touched.insert(canonical_table_key(*entry));
       }
-    }
-      if (c.kind == StmtClass::WRITE_KNOWN && !c.captured) {
-        capture_.dirty = true; // not capturable, but the target is known
-      }
       break;
+    }
     default:
-      capture_.dirty = true;
       capture_.unknown_writes = true;
       break;
     }
-  }
-
-  void classify_and_capture(duckdb::ClientContext &context) {
-    const StmtClass c = std::move(stmt_);
-    stmt_ = {};
-    if (c.kind != StmtClass::INSERT_OK) {
-      return; // scoping already folded at QueryBegin; only capture remains
-    }
-    auto &manager = get_cdc_manager(context);
-    auto entry = resolve_table_entry(context, c.table);
-    if (!entry) {
-      return; // unresolvable target cannot be tracked
-    }
-    const std::string key = canonical_table_key(*entry);
-    if (!manager.is_table_tracked(key)) {
-      return; // untracked target: irrelevant to views
-    }
-    capture_appended_rows(context, key);
-    capture_.active = true;
-  }
-
-  // Read the transaction-local rows appended to `table_name` since the
-  // last capture (LocalStorage keeps them until commit)
-  void capture_appended_rows(duckdb::ClientContext &context,
-                             const std::string &table_name) {
-    auto &meta = context.transaction.ActiveTransaction();
-    // table_name is a canonical key: resolve it to its entry and use the
-    // transaction of the table's own attached database (D2).
-    auto entry = resolve_table_entry(context, table_name);
-    if (!entry) {
-      return;
-    }
-    {
-      auto &attached = entry->ParentCatalog().GetAttached();
-      auto txn = meta.TryGetTransaction(attached);
-      if (!txn) {
-        return;
-      }
-      auto &dtxn = txn->Cast<duckdb::DuckTransaction>();
-      auto &ls = dtxn.GetLocalStorage();
-      auto &table = entry->GetStorage();
-      if (!ls.Find(table)) {
-        return; // no transaction-local rows for this table
-      }
-
-      auto &slot = capture_.appends[table_name];
-      const duckdb::idx_t total = ls.AddedRows(table);
-      if (total <= slot.second) {
-        return; // nothing new (e.g. INSERT ... SELECT with zero rows)
-      }
-
-      duckdb::vector<duckdb::StorageIndex> column_ids;
-      duckdb::vector<duckdb::LogicalType> types;
-      for (auto &col : entry->GetColumns().Physical()) {
-        column_ids.emplace_back(col.Physical().index);
-        types.push_back(col.Type());
-      }
-
-      duckdb::TableScanState scan_state;
-      scan_state.Initialize(column_ids);
-      ls.InitializeScan(table, scan_state.local_state, nullptr);
-      duckdb::DataChunk chunk;
-      chunk.Initialize(duckdb::Allocator::Get(context), types);
-
-      duckdb::idx_t seen = 0;
-      while (true) {
-        chunk.Reset();
-        ls.Scan(scan_state.local_state, column_ids, chunk);
-        const duckdb::idx_t n = chunk.size();
-        if (n == 0) {
-          break;
-        }
-        chunk.Flatten();
-        for (duckdb::idx_t i = 0; i < n; i++, seen++) {
-          if (seen < slot.second) {
-            continue; // already captured by an earlier statement
-          }
-          DuckDBRow row;
-          row.columns.reserve(types.size());
-          for (duckdb::idx_t c = 0; c < types.size(); c++) {
-            row.columns.push_back(chunk.GetValue(c, i));
-          }
-          slot.first.insert(std::move(row), 1);
-        }
-      }
-      slot.second = total;
-      return;
-    }
-  }
-
-  TeeCapture tee_;
-
-  void clear_tee() {
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    tee_.armed = false;
-    tee_.invalid = false;
-    tee_.table.clear();
-    tee_.delta = DuckDBZSet();
-    tee_.seen_rowids.clear();
-  }
-
-  // Explicit txn, QueryEnd of a successful teed statement: the teed rows
-  // are exact even for shapes design 1 declines (post-write subqueries,
-  // parameters, volatile predicates, same-table-twice) — merge them into
-  // the per-transaction buffer and mark the statement captured so the
-  // fold cannot poison the transaction.
-  void fold_tee_into_txn() {
-    std::lock_guard<std::mutex> guard(tee_.mutex);
-    if (!tee_.armed || tee_.invalid) {
-      tee_.armed = false;
-      tee_.invalid = false;
-      tee_.table.clear();
-      tee_.delta = DuckDBZSet();
-      tee_.seen_rowids.clear();
-      return; // invalid tee: the fold poisons normally, scan reconciles
-    }
-    stmt_.captured = true;
-    if (!tee_.delta.empty()) {
-      auto &slot = capture_.write_deltas[tee_.table];
-      for (const auto &[row, w] : tee_.delta) {
-        slot.insert(row, w);
-      }
-      capture_.wrote_capture = true;
-      capture_.active = true;
-    }
-    // later design-1 captures on this table must decline (they cannot
-    // see this transaction's uncommitted effects)
-    capture_.touched.insert(tee_.table);
-    tee_.armed = false;
-    tee_.invalid = false;
-    tee_.table.clear();
-    tee_.delta = DuckDBZSet();
-    tee_.seen_rowids.clear();
-  }
-
-  duckdb::Connection &guard_connection(duckdb::ClientContext &context) {
-    if (!guard_con_) {
-      guard_con_ = std::make_unique<duckdb::Connection>(
-          duckdb::DatabaseInstance::GetDatabase(context));
-    }
-    return *guard_con_;
-  }
-
-  // O(Δ) write capture (docs/DESIGN_WRITE_CAPTURE.md): runs BEFORE the
-  // UPDATE/DELETE executes. One internal SELECT captures the old images
-  // and, for UPDATE, computes the new images by projecting the SET
-  // expressions cast to their column types. Declining is always safe —
-  // the statement stays on the scan-and-diff path.
-  void try_write_capture(duckdb::ClientContext &context, CDCManager &manager) {
-#ifdef DBSP_TIP_PORT
-    (void)context;
-    (void)manager;
-    return;
-#else
-    if (!manager.write_capture_enabled()) {
-      return;
-    }
-    // Captures buffer per-transaction and apply at commit; without a
-    // transaction there is no commit hook to apply from (never observed —
-    // autocommit statements have their transaction by QueryBegin)
-    if (!context.transaction.HasActiveTransaction()) {
-      return;
-    }
-    if (capture_.dirty || capture_.unknown_writes) {
-      return; // this transaction already fell off the fast path
-    }
-    duckdb::Parser parser;
-    parser.ParseQuery(stmt_.text);
-    if (parser.statements.size() != 1) {
-      return;
-    }
-    auto &parsed = *parser.statements[0];
-    const bool is_insert =
-        parsed.type == duckdb::StatementType::INSERT_STATEMENT;
-    const bool is_upsert =
-        is_insert && parsed.Cast<duckdb::InsertStatement>().on_conflict_info;
-    if (parsed.type != duckdb::StatementType::UPDATE_STATEMENT &&
-        parsed.type != duckdb::StatementType::DELETE_STATEMENT && !is_insert) {
-      return;
-    }
-    if (is_insert && !is_upsert && !context.transaction.IsAutoCommit()) {
-      return; // explicit-txn INSERTs use the exact G2 LocalStorage scan
-    }
-
-    InternalQueryGuard guard;
-    auto &con = guard_connection(context);
-    auto &ictx = *con.context;
-    std::string key;
-    std::unique_ptr<WriteCapturePlan> plan;
-    ictx.RunFunctionInTransaction([&] {
-      auto entry = resolve_table_entry(ictx, stmt_.table);
-      if (!entry) {
-        return;
-      }
-      key = canonical_table_key(*entry);
-      if (!manager.is_table_tracked(key)) {
-        key.clear();
-        return;
-      }
-      // Subqueries and USING probes read committed state — only exact
-      // when this statement's view IS committed state
-      const bool clean_view =
-          context.transaction.IsAutoCommit() || !capture_.wrote_any;
-      plan = is_upsert ? plan_upsert_capture(ictx, parsed, *entry, key)
-             : is_insert
-                 ? plan_insert_capture(parsed, *entry)
-                 : plan_write_capture(ictx, parsed, *entry, key, clean_view);
-    });
-    if (key.empty() || !plan) {
-      return;
-    }
-    // The capture SELECT reads committed state: a target this transaction
-    // already wrote would be read stale — decline.
-    if (capture_.touched.count(key)) {
-      return;
-    }
-    // Volatile (or per-query-constant) functions would re-evaluate
-    // differently in the statement itself
-    auto logical = con.ExtractPlan(plan->capture_sql);
-    if (!logical || !bound_plan_consistent(*logical)) {
-      return;
-    }
-    auto res = con.Query(plan->capture_sql);
-    if (!res || res->HasError()) {
-      return;
-    }
-
-    const bool is_update = plan->kind == WriteCapturePlan::Kind::Update;
-    // physical column -> projection slot holding its new value
-    std::unordered_map<size_t, size_t> new_slots(plan->set_cols.begin(),
-                                                 plan->set_cols.end());
-    DuckDBZSet delta;
-    std::vector<TxnCapture::WriteVerify> verifies;
-    while (auto chunk = res->Fetch()) {
-      const duckdb::idx_t n = chunk->size();
-      if (n == 0) {
-        break;
-      }
-      for (duckdb::idx_t i = 0; i < n; i++) {
-        if (plan->kind == WriteCapturePlan::Kind::Insert) {
-          // projection IS the new row (no rowid — guard is seq + count)
-          DuckDBRow row;
-          row.columns.reserve(plan->n_cols);
-          for (size_t c = 0; c < plan->n_cols; c++) {
-            row.columns.push_back(chunk->GetValue(c, i));
-          }
-          delta.insert(std::move(row), 1);
-          continue;
-        }
-        if (plan->kind == WriteCapturePlan::Kind::Upsert) {
-          if (chunk->GetValue(0, i).IsNull()) {
-            // no conflict: insert-part row from the padded source image
-            DuckDBRow row;
-            row.columns.reserve(plan->n_cols);
-            for (size_t c = 0; c < plan->n_cols; c++) {
-              row.columns.push_back(
-                  chunk->GetValue(plan->insert_slot_base + c, i));
-            }
-            delta.insert(std::move(row), 1);
-            continue;
-          }
-          if (plan->set_cols.empty()) {
-            continue; // DO NOTHING: matched rows change nothing
-          }
-          TxnCapture::WriteVerify v;
-          v.rowid = chunk->GetValue(0, i).GetValue<int64_t>();
-          v.is_delete = false;
-          DuckDBRow old_row, new_row;
-          old_row.columns.reserve(plan->n_cols);
-          new_row.columns.reserve(plan->n_cols);
-          for (size_t c = 0; c < plan->n_cols; c++) {
-            auto slot = new_slots.find(c);
-            old_row.columns.push_back(chunk->GetValue(c + 1, i));
-            new_row.columns.push_back(chunk->GetValue(
-                slot == new_slots.end() ? c + 1 : slot->second, i));
-          }
-          v.expected_new = new_row;
-          delta.insert(std::move(new_row), 1);
-          delta.insert(std::move(old_row), -1);
-          verifies.push_back(std::move(v));
-          continue;
-        }
-        TxnCapture::WriteVerify v;
-        v.rowid = chunk->GetValue(0, i).GetValue<int64_t>();
-        v.is_delete = !is_update;
-        DuckDBRow old_row;
-        old_row.columns.reserve(plan->n_cols);
-        for (size_t c = 0; c < plan->n_cols; c++) {
-          old_row.columns.push_back(chunk->GetValue(c + 1, i));
-        }
-        if (is_update) {
-          DuckDBRow new_row;
-          new_row.columns.reserve(plan->n_cols);
-          for (size_t c = 0; c < plan->n_cols; c++) {
-            auto slot = new_slots.find(c);
-            new_row.columns.push_back(chunk->GetValue(
-                slot == new_slots.end() ? c + 1 : slot->second, i));
-          }
-          v.expected_new = new_row;
-          delta.insert(std::move(new_row), 1);
-        }
-        delta.insert(std::move(old_row), -1);
-        verifies.push_back(std::move(v));
-      }
-    }
-
-    auto &slot = capture_.write_deltas[key];
-    for (const auto &[row, w] : delta) {
-      slot.insert(row, w);
-    }
-    auto &vv = capture_.verifies[key];
-    vv.insert(vv.end(), std::make_move_iterator(verifies.begin()),
-              std::make_move_iterator(verifies.end()));
-    capture_.wrote_capture = true;
-    capture_.active = true;
-    stmt_.captured = true;
-#endif
-  }
-
-  // Commit guard part 3: re-read the captured rowids from committed
-  // storage — deleted rowids must be gone, updated rowids must hold
-  // exactly the predicted post-image. Rowid IN-lists prune, so this is
-  // O(Δ) regardless of table size.
-  bool verify_write_rows(duckdb::ClientContext &context,
-                         const std::string &table,
-                         const std::vector<TxnCapture::WriteVerify> &rows) {
-    if (rows.empty()) {
-      return true;
-    }
-    InternalQueryGuard guard;
-    auto &con = guard_connection(context);
-    const auto *schema = get_cdc_manager(context).get_table_schema(table);
-    if (!schema) {
-      return false;
-    }
-    std::string col_list;
-    for (const auto &col : schema->columns) {
-      std::string quoted = "\"";
-      for (char ch : col.name) {
-        if (ch == '"') {
-          quoted += "\"\"";
-        } else {
-          quoted += ch;
-        }
-      }
-      quoted += "\"";
-      col_list += ", " + quoted;
-    }
-    constexpr size_t kBatch = 512;
-    for (size_t start = 0; start < rows.size();) {
-      std::string del_ids, upd_ids;
-      std::unordered_map<int64_t, const DuckDBRow *> expected;
-      const size_t end = std::min(rows.size(), start + kBatch);
-      for (size_t i = start; i < end; i++) {
-        const auto &v = rows[i];
-        std::string &ids = v.is_delete ? del_ids : upd_ids;
-        if (!ids.empty()) {
-          ids += ",";
-        }
-        ids += std::to_string(v.rowid);
-        if (!v.is_delete) {
-          expected[v.rowid] = &v.expected_new;
-        }
-      }
-      start = end;
-      if (!del_ids.empty()) {
-        auto res = con.Query("SELECT COUNT(*) FROM " + quote_table_key(table) +
-                             " WHERE rowid IN (" + del_ids + ")");
-        if (!res || res->HasError()) {
-          return false;
-        }
-        auto chunk = res->Fetch();
-        if (!chunk || chunk->size() == 0 ||
-            chunk->GetValue(0, 0).GetValue<int64_t>() != 0) {
-          return false;
-        }
-      }
-      if (!upd_ids.empty()) {
-        auto res = con.Query("SELECT rowid" + col_list + " FROM " +
-                             quote_table_key(table) + " WHERE rowid IN (" +
-                             upd_ids + ")");
-        if (!res || res->HasError()) {
-          return false;
-        }
-        size_t seen = 0;
-        while (auto chunk = res->Fetch()) {
-          const duckdb::idx_t n = chunk->size();
-          if (n == 0) {
-            break;
-          }
-          for (duckdb::idx_t i = 0; i < n; i++, seen++) {
-            const int64_t rowid = chunk->GetValue(0, i).GetValue<int64_t>();
-            auto it = expected.find(rowid);
-            if (it == expected.end()) {
-              return false;
-            }
-            DuckDBRow got;
-            got.columns.reserve(it->second->columns.size());
-            for (size_t c = 0; c < it->second->columns.size(); c++) {
-              got.columns.push_back(chunk->GetValue(c + 1, i));
-            }
-            if (!(got == *it->second)) {
-              return false;
-            }
-          }
-        }
-        if (seen != expected.size()) {
-          return false;
-        }
-      }
-    }
-    return true;
-  }
-
-  // Validate every captured table against the committed COUNT(*) and, if
-  // all match, feed the captured deltas straight into propagation
-  // Guard COUNT(*) through a cached connection + prepared statements:
-  // parsing/binding/planning the count per commit was most of the fast
-  // path's cost (H2)
-  int64_t committed_count(duckdb::ClientContext &context,
-                          const std::string &table) {
-    InternalQueryGuard guard;
-    guard_connection(context);
-    auto it = count_stmts_.find(table);
-    if (it == count_stmts_.end()) {
-      auto prep =
-          guard_con_->Prepare("SELECT COUNT(*) FROM " + quote_table_key(table));
-      if (!prep || prep->HasError()) {
-        return -1;
-      }
-      it = count_stmts_.emplace(table, std::move(prep)).first;
-    }
-    auto res = it->second->Execute();
-    if (!res || res->HasError()) {
-      count_stmts_.erase(it); // schema may have changed: re-prepare next time
-      return -1;
-    }
-    auto chunk = res->Fetch();
-    if (!chunk || chunk->size() == 0) {
-      return -1;
-    }
-    return chunk->GetValue(0, 0).GetValue<int64_t>();
-  }
-
-  bool apply_captured(duckdb::ClientContext &context, CDCManager &manager) {
-    if (capture_.appends.empty() && capture_.write_deltas.empty()) {
-      return true; // clean read-only transaction: nothing to sync
-    }
-    const bool wrote = capture_.wrote_capture;
-    auto fail = [&]() {
-      if (wrote) {
-        manager.note_capture_guard_fallback();
-      }
-      return false;
-    };
-    // Guard 1: an interleaved commit invalidates committed-state captures
-    if (wrote && manager.commit_seq() != capture_.seq_snapshot) {
-      return fail();
-    }
-    // Merge appends + write deltas per table: one apply (and one
-    // propagation) per table keeps the commit a single consistent step
-    std::unordered_map<std::string, DuckDBZSet> merged;
-    for (const auto &[table, slot] : capture_.appends) {
-      auto &dst = merged[table];
-      for (const auto &[row, w] : slot.first) {
-        dst.insert(row, w);
-      }
-    }
-    for (const auto &[table, delta] : capture_.write_deltas) {
-      auto &dst = merged[table];
-      for (const auto &[row, w] : delta) {
-        dst.insert(row, w);
-      }
-    }
-    // Guard 2: committed COUNT(*) must equal baseline + captured weight
-    for (const auto &[table, delta] : merged) {
-      const int64_t actual = committed_count(context, table);
-      if (actual < 0) {
-        return fail();
-      }
-      int64_t captured = 0;
-      for (const auto &[row, w] : delta) {
-        captured += w;
-      }
-      const int64_t baseline = manager.tracked_total_weight(table);
-      if (baseline < 0 || baseline + captured != actual) {
-        return fail(); // something we did not see changed the table
-      }
-    }
-    // Guard 3: rowid re-verification of updated/deleted rows
-    for (const auto &[table, rows] : capture_.verifies) {
-      if (!verify_write_rows(context, table, rows)) {
-        return fail();
-      }
-    }
-    for (const auto &[table, delta] : merged) {
-      if (!manager.apply_captured_delta(table, delta, &context)) {
-        return false;
-      }
-      // The database remains the source of truth for recovery. WAL records
-      // the successfully applied logical delta for crash diagnostics and
-      // optional replay tooling; a logging failure never changes query
-      // correctness or causes the already-applied delta to be retried.
-      auto &wal = get_wal_manager();
-      if (wal.is_enabled()) {
-        for (const auto &[row, weight] : delta) {
-          if (weight > 0) {
-            for (int64_t i = 0; i < weight; i++) {
-              wal.log_insert(table, row);
-            }
-          } else {
-            for (int64_t i = 0; i > weight; i--) {
-              wal.log_delete(table, row);
-            }
-          }
-        }
-        if (!wal.flush()) {
-          std::cerr << "DBSP WAL flush failed: " << wal.last_error() << "\n";
-        }
-      }
-    }
-    return true;
   }
 };
 

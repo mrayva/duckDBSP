@@ -33,7 +33,11 @@ Never accumulate throwaway files. Rules:
    repo. Anything that must live in the repo temporarily is deleted in
    the same session.
 3. **ctest only from `test/build_test`** — running it elsewhere plants a
-   junk `Testing/` directory.
+   junk `Testing/` directory. *Exception:* when `test/build_test` has been
+   deleted to reclaim disk and another configured tree (e.g. `build/test`)
+   already holds binaries built from the SAME sources and CMake options,
+   run them from there rather than paying a 2.6GB rebuild — say so in the
+   report, and still delete whatever tree you created.
 4. **Sanitizer build dirs (`test/build_asan`, `test/build_tsan`) are
    disposable** — recreate on demand, delete when disk is tight; never
    treat their absence as breakage.

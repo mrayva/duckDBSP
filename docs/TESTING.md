@@ -8,55 +8,311 @@ engine never gets to grade its own homework.
 
 ## Running the suites
 
-The `duckdb/` submodule tracks current DuckDB main (bumped regularly), and
-`DBSP_TIP_PORT`/`DBSP_ENGINE_HOOK` default to the matching configuration
-(`ON`/`OFF`), so the plain default build already targets tip:
+ctest registers **46** entries. Two of them are bench binaries registered as
+smoke entries (`planner_eval_smoke`, `window_bench`). The engine behavior is
+stock in both build topologies. Standalone builds own the DuckDB
+submodule; when embedded by a parent DuckDB extension build,
+`-DDBSP_USE_PARENT_DUCKDB=ON` reuses its existing `duckdb_static` target
+instead of adding DuckDB a second time.
 
 ```bash
-cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
-cmake --build build -j8
-ctest --test-dir build --output-on-failure -j1 --timeout 120
-build/test/test_planner_frontend # the big differential suite on its own
+cd test/build_test
+cmake .. && make -j8
+ctest -j4                   # full suite
+ctest -j1 --timeout 600     # serial, timeboxed validation
+./test_planner_frontend     # the big differential suite on its own
 ```
 
-The validated baseline (last checked against DuckDB main @ `fabf1d60b`,
-2026-08-05) is **39/39 CTest binaries passing** (5.48M+ assertions) and
-**89/89 planner cases passing** in `test_planner_frontend`. Legacy tests
-that directly require the removed write-capture, optimizer plan-tee, or
-engine-hook APIs are excluded by default (not built — see the
-`if(NOT DBSP_TIP_PORT)` guards in `test/CMakeLists.txt`); this is an
-intentional compatibility boundary, not a silent pass. Two correlated
-scalar-subquery cases in `test_planner_frontend` are `#ifdef
-DBSP_TIP_PORT`-gated to assert a known, tracked decline instead of success
-— see TODO.md's "join projection maps" entry.
+On the 2026-10-06 DuckDB tip (`a770db1197`, `v2.1.0-dev84912`), the full
+serial CTest run passed all 46 entries in 133.91 seconds.
 
-Tip mode uses scan-and-diff for UPDATE/DELETE paths whose old write-capture
-API is unavailable. Holistic aggregate values remain in memory on tip while
-table, join, and top-K spill paths remain enabled and tested.
+The root build (`./build.sh`) also builds every test binary into `build/test`
+from the same sources and options, so `ctest` from `build/` is equivalent and
+saves a second ~2.6GB DuckDB build when disk is tight.
 
-### Legacy patched-engine build (unmaintained)
-
-Only relevant if you have your own patched, pre-tip DuckDB checkout for the
-SaaS-fork engine-hook consumer
-(`patches/v1.5.4-dbsp-txn-callback.patch`) — the submodule itself no longer
-supports this path, since the patch predates the DuckDB API moves tip mode
-exists to track:
+### `DBSP_TEST_VERIFY_VECTORS=1` — vector verification, suite-wide
 
 ```bash
-cmake -S . -B build-legacy \
-  -DDUCKDB_SOURCE_DIR=/path/to/patched/duckdb \
-  -DDBSP_TIP_PORT=OFF \
-  -DDBSP_ENGINE_HOOK=ON
-cmake --build build-legacy -j4
-ctest --test-dir build-legacy --output-on-failure
+ctest                                  # normal run
+DBSP_TEST_VERIFY_VECTORS=1 ctest       # same suite under VERIFY_VECTORS
 ```
 
-The tip port retains the circuit-state checkpoint format from upstream. The
-fork WAL improvement is available as an optional logical-delta journal; WAL
-serialization uses DuckDB's native value serializer and is flushed after
-successful captured-delta application. Recovery still treats committed
-DuckDB storage and circuit checkpoints as authoritative, rather than applying
-an independent sink snapshot on top of rebuilt state.
+With the variable set to anything but `""` or `0`, every test binary runs with
+DuckDB's `debug_verification_mode='verify_vectors'`. Under that mode
+`DataChunk::VerifyInternal` checks at every operator boundary that each child
+vector reports the same size as the chunk, and throws
+
+```
+DataChunk::Verify - size mismatch: vector N (VARCHAR) has size 0 but chunk has size 1
+```
+
+instead of quietly passing a malformed chunk along.
+
+This exists because of a real wrong-answer bug. On DuckDB 2.0 a Vector carries
+its own size and the deprecated `DataChunk::SetCardinality` no longer sizes the
+children, so every table function that ended a scan callback with it emitted
+chunks whose columns claimed to be empty — which made `IS NULL` false for every
+row in the planner frontend (CHANGELOG, "DuckDB 2.0 alpha issues"). One test
+armed the mode by hand and caught it; the other 48 sites were found by grep.
+The switch is the standing version of that: any new stale-size site is loud in
+whichever test first touches it.
+
+Mechanics (`test/verify_vectors.hpp`): the mode lives in
+`DBConfigOptions::global_verification_mode`, a process-wide static, so it is
+armed once before `main()` from `catch2_main.cpp` — which every test binary
+links, including the ones that open a raw `DuckDB db(nullptr)` and never build
+a `DuckDBTestHarness`. The harness re-arms on each database open, because the
+`read surface: chunks satisfy VERIFY_VECTORS` case in `test_extension_basic.cpp`
+arms the mode itself and resets it to `none` on the way out (that case is the
+regression pin for the original bug and is unchanged by the switch).
+
+There is deliberately **no ctest label** for this: an environment variable
+means CI runs the same suite twice with no second test registration. Both runs
+are expected green; a failure only under the switch is a real latent bug, not
+a test-harness artifact. `test/python/*.py` are not covered — they open their
+own connections and are not in ctest anyway.
+
+### `DBSP_STRICT_INTERNAL_QUERY=1` — the internal-connection law
+
+```bash
+ctest                                   # normal run
+DBSP_TEST_VERIFY_VECTORS=1 ctest        # same suite under VERIFY_VECTORS
+DBSP_STRICT_INTERNAL_QUERY=1 ctest      # same suite under the law
+```
+
+A third pass, run the same way and for the same reason as the one above: one
+environment variable, no second test registration, all three expected green.
+
+The law is *never read committed-only state on an internal connection while the
+user's transaction is open.* A helper that opens its own `duckdb::Connection`
+cannot see the caller's uncommitted rows, so what it reads is a different
+database from the one the caller is looking at. Three defects of that family
+have shipped and been fixed here — the sweep's DDL, the sweep's catalog-version
+read, and the seeding scan — and until this switch nothing asked the question of
+the fourth.
+
+Mechanics (`dbsp_trigger_capability.hpp`): every site that opens an internal
+connection for a read of a USER table or for DDL declares an explicit
+`InternalReadPolicy{Forbidden, AllowedInTxn}` and a site name. Under the switch
+a `Forbidden` call made while `user_transaction_open(context)` throws an
+`InternalException` naming the site.
+
+The two tables below list every declaration site (the `Forbidden` table has
+five rows; `AllowedInTxn` the rest) — do not trust a quoted count, recount from
+the tree with `grep -rn 'InternalReadPolicy::' include src` — plus **6 helpers** that take the CALLER's policy rather than
+deciding for themselves (`stream_table_rows`, `stream_table_serialized`,
+`live_watermark`, `sync_table_scan_and_consume`, `fold_fresh_baseline`,
+`reconcile_untrusted_baselines`), and `sync_tables` / `sync_all`, which default
+to `Forbidden` so the commit reconcile is strict unless a caller says
+otherwise.
+
+`Forbidden` — a call here inside an open user transaction is a bug:
+
+| Site | Why it must not run there |
+|---|---|
+| `sync_table_internal` (the seeding scan) | it ESTABLISHES a baseline; `seed_baseline` already refuses to reach it inside a transaction |
+| `sync_table_internal` (auto-spill probe) | a `COUNT(*)` over the USER's table on that same path, deciding whether the scan spills |
+| `sync_table_internal` (baseline fold) | the watermark must describe the state the seeding scan read |
+| the trigger sweep's DDL | the original defect of this family |
+| the untrusted-baseline reconcile, at commit and at read | measured, not assumed — see below |
+
+`AllowedInTxn` — every one for one of exactly two reasons:
+
+*DDL/DML over DBSP's OWN bookkeeping tables* (`_dbsp_views`, `_dbsp_ckpt*`,
+`__mv_*`, the trigger sinks), which never needs the user's uncommitted catalog:
+`save_view_definitions`, `create_view`'s `_dbsp_views` upsert,
+`initialize_persistence_table`, `erase_persisted_view_row`,
+`erase_persisted_checkpoint_rows`, `set_mv_tables` (mirror backfill),
+`maybe_drain_trigger_sinks`, and `save_checkpoint`'s bookkeeping DDL.
+
+*Reads that are RIGHT to see committed-only state*: the sweep's
+`duckdb_triggers()` presence read (a plain SELECT taking its own snapshot);
+`rebuild_all_views` and `materialize_deferred_locked`, which REFRESH a baseline
+that already exists rather than establishing one; `dbsp_sync()` / `dbsp_sync('t')`,
+where the caller asked for a reconcile against committed storage; and the
+watermarks in `save_checkpoint`, `checkpoint_valid` and `register_arrangements`,
+which describe committed storage and are compared against committed storage
+later, beside circuit state that is likewise committed-only.
+
+**What the switch cannot catch.** It fires on `user_transaction_open(context)`,
+and the engine clears the transaction context BEFORE running the commit
+callbacks (`duckdb/src/transaction/transaction_context.cpp:62`), so auto-commit is true
+inside every commit hook by construction. A violation made from a commit hook is
+therefore structurally invisible to this switch: it bites only on calls made
+DURING a statement. The `Forbidden` markings on the two provisional reconciles
+are still the honest state — they say what the site requires — but they are
+documentation there, not enforcement.
+
+It is OFF by default deliberately: such a call is a bug the commit reconcile
+usually papers over, and turning that paper-over into a crash in production
+would trade a wrong answer for an outage.
+
+`InternalQueryGuard` remains a context-free recursion guard.
+`InternalConnection` checks policy at construction and owns that guard through
+connection destruction. Shared helpers still forward explicit policy and site;
+every exception is documented at its call site.
+
+Proof it bites, run 2026-09-04: flipping the `duckdb_triggers()` whitelist to
+`Forbidden` turns the strict run red (`trigger_source` fails, 44/45) with
+
+```
+INTERNAL Error: DBSP internal-connection law: trigger sweep duckdb_triggers()
+read opened an internal connection while the user's transaction was open —
+what it reads cannot include that transaction's own rows
+```
+
+and restoring it returns the run to 45/45. Do that check again whenever a
+whitelist is added.
+
+### `trigger_source` — the delta source
+
+`test_trigger_source` (`test/unit/test_trigger_source.cpp`, registered as an
+integration test because it needs the extension) is the differential oracle for
+the one delta source: old images at −1, new at +1, insert-then-delete nets to
+zero, update chains collapse to first-old/last-new, rollback discards
+everything, multi-table transactions apply in one pass. Every case also
+cross-checks `dbsp_query` against plain SQL, because a source that is
+self-consistently wrong would pass a weight assertion.
+
+```bash
+cd test/build_test
+./test_trigger_source       # 35 cases, 1002 assertions
+```
+
+Beyond the oracle it pins the paths specific to this source: the C++
+`Appender`, `COPY FROM`, `INSERT ... SELECT` (self-referential, twice over, plus one matching no
+rows) and `TRUNCATE` — both asserted against PLAIN SQL rather than literals,
+so a view and a table that drifted together cannot pass — multi-chunk DML under
+`threads=8`, a user's own trigger coexisting on a tracked table, a double-count
+guard that asserts a **sum** rather than a row count, `ALTER TABLE ... ADD
+COLUMN` regenerating the bodies, `DROP TABLE` + recreate reinstalling them, DDL
+inside an explicit transaction (`ADD COLUMN` with and without a write in the
+same transaction, an `ALTER` that rolls back, `CREATE TABLE` + `dbsp_track`
+committed and rolled back), a tracked catalog still being `DETACH`able, and an
+empty install record re-using the bodies already in the catalog instead of
+re-issuing the DDL.
+
+It also pins what tracking a table COSTS it — the statements the engine refuses
+on a triggered table (`MERGE INTO`, `ON CONFLICT DO UPDATE`, `INSERT OR
+REPLACE`, `ALTER TABLE ... RENAME COLUMN`), and that tracking is REFUSED
+outright on a database below storage version v2.0.0, with an error naming the
+migration. Those are product constraints now, so they are asserted rather than
+discovered. See `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+One case is not about triggers at all but lives here because this is where the
+oracle is: `cdc: create_view seeds its source baseline, not an empty one`. The
+public `dbsp_track` leaves a baseline empty by design, so a view created
+straight afterwards used to be built over nothing unless an unrelated commit
+happened to scan-sync the table first — a permanently wrong answer with no
+error. Its five sections remove that accident (an earlier FAILED DBSP call
+does it) and assert the view matches SQL through two later edits, so a constant
+offset cannot hide. `test/python/test_create_view_seeding.py` is the
+file-backed sibling.
+
+Three more cases exist because the sweep runs concurrently — with the user, and
+with its own past. Bodies lost WITHOUT a fingerprint change (an
+in-transaction `DROP`+`CREATE` of the same shape, and a hand-dropped body) must
+come back on the next sweep; and a racing creator of `dbsp_trigger_sink`, held
+open on a second connection, must not fail the user's statement.
+
+### `dml_shapes` — shapes a delta source can get wrong
+
+`test_dml_shapes` (`test/integration/test_dml_shapes.cpp`, 10 cases) collects
+the DML shapes that defeated earlier delta sources: a table written twice in
+one transaction, a predicate reading transaction-local state, `UPDATE ... FROM`
+(including an ambiguous multi-match), a volatile SET expression, an
+indexed-column UPDATE the engine runs as delete+re-append, non-repeatable
+INSERT sources (table functions, `USING SAMPLE`, sequence DEFAULTs) and
+multi-statement DML in one string. Each checks the view against direct SQL AND
+asserts via counters that no scan ran — a fallback would still produce the
+right view, so the correctness check alone could not fail on a silent
+regression.
+
+### Python scripts (`test/python/`)
+
+`test/python/*.py` are standalone probe scripts, **not wired into ctest** —
+they only run when someone runs them. Each takes the extension path as its
+one argument and prints `PASS` (exit 0) or fails loudly:
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' --with pyarrow \
+  python test/python/test_ddl_syntax.py build/dbsp.duckdb_extension
+```
+
+The example wheel version must match the DuckDB build used for the extension.
+For a newer tip, use a Python wheel built from that same DuckDB commit; a
+version-mismatched wheel will reject the loadable extension.
+
+**Fetch every table function.** `con.execute("SELECT * FROM dbsp_track('t')")`
+without a `.fetchall()` does NOTHING: a table function that acts in its execute
+callback never runs if its result is not consumed. Measured — `dbsp_tables()`
+returns `[]` without the fetch and `[('…main.t', 2)]` with it. `dbsp_create_view`
+happens to act in BIND, so it works either way, which is exactly what makes the
+trap quiet: a script can look like it tracks and creates, and only the create
+actually happened. `test_create_view_seeding.py` was written that way and could
+not fail until it was corrected. Fetch, and assert on what the call was supposed
+to change.
+
+They exercise what only the loadable extension on a real Python client can
+reach: the SQL DDL front door (`test_ddl_syntax.py` — byte-exact stored SQL,
+`DROP MATERIALIZED VIEW` with `IF EXISTS` and `CASCADE`, and the same DDL again
+with `allow_parser_override_extension='DEFAULT'` so the older token path stays
+covered), `dbsp_mv_tables` semantics, window frames, self-joins. Close the connection in any script you
+add — an open DBSP connection at interpreter exit SIGSEGVs on the 2.0 alpha
+(CHANGELOG, "DuckDB 2.0 alpha issues").
+
+`test_trigger_source.py` is the one that has to run here rather than in ctest:
+it checks the delta source inside a wheel straight from PyPI, which is the
+whole claim of that source and something no in-tree binary can demonstrate. It
+also pins the sink bound (`DBSP_TRIGGER_SINK_DRAIN` lowered so 100 statements
+suffice) and that an attached catalog holding a triggered table still detaches.
+
+`test_reconcile_telemetry.py` pins the one failure a caller could not see: a
+reconcile scan that did not run. It reproduces round 5's scenario — a view
+created inside an open transaction, the source DROPped in that same
+transaction, and the COMMIT widening itself to pay a debt with a scan that
+cannot run — and asserts `dbsp_stats()` reports `reconcile_failures` and the
+message in `last_reconcile_error`. Note that `dbsp_stats()` has THREE columns
+(`metric`, `value`, `detail`); a helper that does `dict(fetchall())` on it will
+raise.
+
+`test_provisional_baseline.py` is the concurrency sibling: connection A holds
+`BEGIN; INSERT` on an UNTRACKED table while connection B tracks it and seeds
+from committed state. It asserts the reproduction heals (both backends, and
+with A ending in COMMIT and in ROLLBACK), that `provisional_tables` goes 1 then
+back to 0, and — the half that keeps the fix from being a tax — that a seeding
+with no other transaction open is never provisional and that six later edits
+then cost **0** scans and **6** exact deltas.
+
+The two-connection case `cdc: an unseeded baseline is never served to another
+connection` is order-INDEPENDENT: it arms the process-global trigger flag
+(`arm_trigger_source`) before its first section. That flag gates the commit
+path's cheap "no statements seen, so nothing was written" early return, and
+until it flips every unaccountable commit takes the pessimistic `sync_all` —
+which seeds a baseline by accident. Whichever section ran first in a process was
+therefore vacuous and passed with the apply-path gate deleted. Verified by
+deleting that gate and running each section alone under `-c`: four of the five
+now fail (the fifth's subject is the ROLLBACK rebuild, not the gate, and says
+so in place).
+
+`test_unseeded_read.py` pins the read surfaces against a baseline nothing has
+scanned. It needs two connections against one database, which is why it lives
+here: connection A holds `BEGIN; dbsp_create_view(...)` open, and `dbsp_query`
+/ `dbsp_changes` must throw on A and on B until that transaction ends. It runs
+both ways out of the window (COMMIT and ROLLBACK) and then compares the view
+against plain SQL through a later edit on each connection, so a baseline short
+by the deferred rows cannot hide as a constant offset.
+
+**Known reds, measured 2026-09-04 on `v2.0.0-alpha39998`:** none. All 30
+scripts exit 0. (`test_mv_tables.py` was the standing red until
+`dbsp_mv_tables(false)` was made sticky — see the CHANGELOG.)
+
+
+The exit-139 scripts were never an engine problem to live with: they left a
+DBSP connection open at interpreter exit, or exited while a detached teardown
+thread was still running. `close()` fixed two outright; two more needed
+`close()` plus a `dbsp_wait_teardown()` drain on a fresh connection, which is
+the pattern to copy. Close what you open.
 
 Benchmarks and the soak test build alongside but are not part of ctest:
 
@@ -136,7 +392,20 @@ bands — regressions here have reverted otherwise-working designs.
 - Randomized generators always include NULLs and duplicate values.
 - New state machinery ships with a property test against a plain
   in-memory oracle (see `test_zset.cpp`, `test_spill_store.cpp`).
-- Bench numbers quoted in commits come from `build` (release
+- Bench numbers quoted in commits come from `test/build_test` (release
   flags); sanitizer-build numbers are 20-30x slower and never quoted.
 
 For questions or issues, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+### Internal connection ownership
+
+`InternalConnection` in `dbsp_cdc.hpp` binds the recursion guard to the
+connection lifetime and checks the caller's explicit read policy before opening
+it. The guard survives connection destruction, including context teardown.
+Directly adjacent policy/guard/connection sites use this owner. Other legacy
+connection sites and policy/site forwarding remain; this is not blanket coverage
+of all internal connections. Checks preceding catch boundaries are retained.
+The strict switch still cannot detect a user transaction already cleared before
+the commit hook. The `[internal_connection]` canaries cover teardown suppression,
+construction-failure unwinding, and explicit allowed/forbidden transaction policy;
+run them both normally and with `DBSP_STRICT_INTERNAL_QUERY=1` in a fresh process.

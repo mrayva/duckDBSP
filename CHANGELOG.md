@@ -1,41 +1,1969 @@
 # Changelog
 
-## Sync with upstream fork + rebuild against current DuckDB tip - Aug 2026
+## Perf: declared view keys — the delta DELETE stops scanning every column — 2026-09-12
 
-- Merged 64 commits from the upstream fork (durability/autopersist,
-  per-view checkpoint validity, LEFT/RIGHT join and MIN/MAX/recursive-view
-  checkpoint state, flat/mmap restore layers, packed shared arrangements,
-  streaming CREATE mirror, signed linear UNION ALL recursion deltas) with
-  this fork's 4 DuckDB-tip-port commits, rebased on top so both lines of
-  work compose. 3 small conflicts (dbsp_context_state.hpp,
-  dbsp_parser_extension.hpp, dbsp_plan_translator.hpp) — all additive,
-  orthogonal changes on both sides.
-- Bumped the `duckdb/` submodule from a 7-week-stale pin to current
-  DuckDB main (`fabf1d60b`, 2026-08-05) and fixed the breaks that surfaced:
-  table function bind callbacks now take `vector<Identifier>&` for column
-  names (not `vector<string>&`, landed the same day upstream); DuckDB
-  dropped the distinct `BoundCastExpression` class in favor of a `__cast`
-  function expression; `FlatVector::Validity()` now returns
-  `const ValidityMask&` only; `Appender`'s constructor takes
-  `const Identifier&` for the table name.
-- **`DBSP_TIP_PORT` and `DBSP_ENGINE_HOOK` now default to `ON`/`OFF`**
-  (previously `OFF`/`ON`): with the submodule permanently tracking tip,
-  the old defaults — a pre-tip capture stack and a patched-engine hook
-  consumer — no longer compile against it. The zero-flag build (what CI
-  and `build.sh` actually run) now matches reality. `build.sh` also no
-  longer clones a hardcoded `v1.5.4` tag; it initializes the submodule,
-  and only applies the legacy engine-hook patch when `DBSP_ENGINE_HOOK=1`
-  is set against your own patched checkout.
-- Fixed 2 real test issues surfaced by the full tip rebuild: an N4
-  spilled-holistic-aggregate checkpoint test whose premise (spilling
-  under `dbsp_spill(true)`) can't hold on tip (holistic aggregate values
-  deliberately stay in-memory there), whose failure was also leaking
-  spill-mode into 3 later unrelated tests; and 2 correlated-scalar-
-  subquery tests that regressed because DuckDB's optimizer now sometimes
-  decorrelates into a JOIN carrying a projection map, which the planner
-  frontend's join visitor doesn't yet remap through (tracked in TODO.md).
-- Validated baseline: 39/39 CTest binaries passing (5.48M+ assertions),
-  89/89 planner differential cases, full soak and benchmark suite green.
+**Applying a one-row delta to a materialized view scanned the entire view
+across every one of its columns.** `mv_apply_delta` built its retract
+predicate as `t.c IS NOT DISTINCT FROM s.c` over EVERY column of the result
+schema, so the cost of an incremental commit was O(rows × columns) regardless
+of how small the delta was. Measured on a 1M-row view: ~0.5ms per column per
+commit, 113ms to retract ONE row from a 199-column view, and ~83% of that was
+execution (the remaining ~17% was re-parsing the very long statement).
+
+`dbsp_set_view_key(view, 'c1,c2')` declares the view's unique, non-null row
+key; the DELETE then matches those columns with plain `=`. Measured 1.45x on
+a full authority commit at 199 columns, and 17x on the DELETE alone.
+
+`IS NOT DISTINCT FROM` is not an equi-join key — the planner cannot hash it,
+so the predicate stays a full scan. Adding a key filter while KEEPING the
+all-columns match measured SLOWER than before. Hence equality, hence the
+non-null requirement.
+
+The key is verified when declared: uniqueness and non-nullness are checked
+against the `__mv_` backing table, and a key that fails is refused rather
+than silently retracting wrong rows. Undeclared views keep the all-columns
+path unchanged, so this is opt-in and backward compatible.
+
+45/45 ctest green.
+
+
+## Quality round, fix 4 — the taint sees every uncommitted change, not only appends — 2026-09-04
+
+**Fix 3's taint probe was wrong for DELETE and UPDATE.** It asked
+`LocalStorage::Find(table)`, which reports whether the transaction holds a
+transaction-local APPEND buffer for the table, and nothing else. A DELETE or an
+UPDATE of committed rows goes to the transaction's undo buffer and creates no
+local storage, so a transaction that deleted or updated rows of an untracked
+table and then tracked it read UNTAINTED — the case fix 3 was built to refuse
+fell open instead of into the fail-safe. Measured: A `BEGIN; DELETE FROM t WHERE
+id = 2` (or `UPDATE t SET v = 0.0 WHERE id = 2`), `dbsp_create_view` over `t`;
+B `dbsp_sync()`; A `COMMIT` → `dbsp_query` `13.0` against SQL `10.0`,
+permanently, both shapes.
+
+**The probe is now `DuckTransaction::ChangesMade()`** — any uncommitted change
+the transaction holds: appends, deletes, updates, catalog changes and sequence
+use alike. It is transaction-WIDE, and that is the conservative rule chosen on
+purpose. The engine keeps per-table records of uncommitted changes
+(`DeleteInfo`/`UpdateInfo`/`AppendInfo` carry the table) only inside the undo
+buffer, whose iteration and storage are private, and the per-table locks a
+write takes have no accessor, so nothing public answers "did THIS transaction
+change THIS table". The cost is availability only for the "write anything,
+then track a table, in one transaction" shape; a wrong answer is worse than a
+refusal. Never approximated from statement text.
+
+**One probe, not two.** The taint and the readiness watermark are now taken by
+one function from one `DuckTransaction` (`probe_deferring_transaction`), so
+they cannot disagree about which transaction they describe. Fix 3's two helpers
+did disagree in their fail-safes: the taint read TAINTED where the watermark
+read 0 = "cleared", so the taint was retired by the first scan and protected
+nothing. When the lookup cannot be made at all (the table's catalog is gone, or
+it has no DuckDB transaction manager — `require_trigger_capable_catalog` does
+not exclude the latter) the deferral is REFUSED with an error naming the
+remedy, rather than recorded with no watermark to ever retire it by;
+`track_table_internal` drops the half-tracked table and rethrows.
+
+**Two new pins** in `test/python/test_create_view_seeding.py`:
+`tainted_delete_third_party_scan` and `tainted_update_third_party_scan`, RED at
+the previous HEAD at `view [(13.0,)]` against SQL `[(10.0,)]` (B was served
+`13.0` in the window). `third_party_scan`, `untainted_third_party_scan`,
+`tainted_rollback` and the 110.0 availability pin are unchanged and green.
+
+**The read gate's DEFERRED message** branches on the taint: an untainted
+deferral says another connection's scan, or the deferring transaction's own
+COMMIT/ROLLBACK, can establish it; a tainted one keeps the "nothing else can
+report those changes" text. `ViewReadBlock` carries the blocking table's taint.
+
+**Documented, not fixed — a concurrent writer that never deferred anything.**
+The DEFERRED watermark covers only the transaction that deferred the seed, so a
+transaction on another connection that wrote the table while it was untracked
+is not waited for; the untainted rule consults no watermark at all. Both shapes
+measured (`13.0`/`17.0` and `10.0`/`14.0`, permanent) and written into
+`docs/DESIGN_TRIGGER_SOURCE.md` as OPEN, with the fix direction and its
+availability cost (an owner decision). The comment at `retire_scanned_baseline`
+that said the stored watermark "answers the same question" is corrected.
+
+Housekeeping: the stale "demotion above" sentence in the design doc, the fix-1
+entry's never-shipped "PROVISIONAL rather than SEEDED" line, and the
+`local_storage.hpp` include (out of order, and no longer needed — removed).
+
+## Quality round, fix 3 — whose rows are missing decides who may establish a baseline — 2026-09-04
+
+**The wrong answer from fix 2 is closed, and the availability pin stays green.**
+Owner ruling, implemented: a DEFERRED baseline is only dangerous when the
+deferring transaction was ALREADY holding uncommitted rows for the table at the
+moment it was tracked. Those rows reach a view no other way — the triggers do
+not exist yet, and `capture_.touched` cannot name a table that was untracked
+when the statement folded — so nothing but that transaction's own commit can
+establish the baseline. Rows written to an ALREADY-TRACKED table are accounted
+for either way, so any scan may establish it, and a second connection keeps
+reading correct answers during the window.
+
+`TrackedTable::pre_trigger_rows` is that bit, taken once, at the moment the
+table joins the tracked set, by asking the engine directly:
+`DuckTransaction::GetLocalStorage().Find(DataTable&)` — the caller's own
+transaction state, not committed storage, so the internal-connection law does
+not apply to it. Anything the probe cannot answer reads as TAINTED. *(Superseded
+by fix 4: `Find` reports appends only, so a pre-tracking DELETE or UPDATE read
+untainted; the probe is now `DuckTransaction::ChangesMade()`.)*
+
+`retire_scanned_baseline` then splits DEFERRED in two: untainted retires to
+SEEDED on any scan, exactly as before; tainted retires only on a scan taken
+once the deferring transaction is gone (`ready_watermark_cleared`), and until
+then the scan installs CONTENT and leaves the state DEFERRED. Reads are refused
+for that window, which is the accepted price for the rare
+write-then-track-in-one-transaction shape.
+
+The discriminator is "was the table TRACKED when the rows were written", not
+"were the triggers installed". A write to a tracked table whose triggers are not
+in yet is still named by `touched`. Measured while getting this wrong: probing
+local storage on every deferral (rather than only on the one that adds the
+table) taints `cross/a_writes_too`, whose write IS trigger-fed, and refuses a
+read the design pins as served.
+
+**The `triggers_installed` residual is closed, and it needed no new mechanism.**
+It is consulted only on the trigger-fed commit branch, so a write-then-track
+transaction reaches the fallback branch's read-only early return — but the
+reconcile sweep runs from a DESTRUCTOR and fires on every path out of the hook,
+including that one. With the taint keeping such a table out of SEEDED until its
+transaction ends, the sweep always finds it by name at that transaction's own
+commit. `test_auto_cdc`'s exact `scan_syncs` counters did not move, so no test
+expectation changed; the design doc describes the mechanism where it used to
+record a gap.
+
+**Three new pins**, all in `test/python/test_create_view_seeding.py`:
+`third_party_scan` (tainted: a third connection's `dbsp_sync()` must not
+establish; RED before this round at `view [(10.0,)]` against SQL `[(13.0,)]`),
+`untainted_third_party_scan` (untainted: it MUST establish, and B is served
+during the window), and `tainted_rollback` (the deferring transaction rolls
+back, the unreportable rows go with it, and the first read afterwards
+establishes at committed state). `docs/TESTING.md`'s known-red line is back to
+"none" — the quarantine fix 2 added is gone.
+
+The read gate's DEFERRED message now says the transaction may be on ANOTHER
+connection and why `dbsp_sync()` cannot help there.
+
+## Quality round, fix 2 — a third connection's scan could establish a baseline it could not see — 2026-09-04
+
+**Wrong answer, permanent, no error.** The in-window rule asked whether the
+CALLER holds a transaction open — but the rows a DEFERRED baseline is missing
+belong to whichever connection deferred it, not to the caller. So:
+
+```
+A: BEGIN; INSERT INTO t VALUES (2, 3.0);      -- t untracked, no triggers yet
+A: dbsp_create_view('mv', 'SELECT sum(v) FROM t')   -- t tracked, DEFERRED
+B: SELECT * FROM dbsp_sync()                  -- B holds no transaction
+A: COMMIT
+   dbsp_query('mv') -> 10.0      SELECT sum(v) FROM t -> 13.0     forever
+```
+
+B's scan reads committed state (10.0), passes the caller test, and marked the
+baseline SEEDED. A's own commit then found nothing owed: A's write was
+pre-trigger, and its table was untracked when the statement folded, so
+`capture_.touched` never named it. Measured RED before the fix, pinned as
+`third_party_scan` in `test/python/test_create_view_seeding.py`.
+
+**NOT FIXED — the fix is blocked on a ruling, and the defect is now written
+down.** Asking the readiness watermark for DEFERRED as well, and DEMOTING to
+PROVISIONAL when it has not cleared, closes it: measured green on this tree, and
+it needs no new machinery, because PROVISIONAL already means "a baseline exists,
+correct for committed storage, possibly short by an open transaction, re-scanned
+when the watermark clears". It is not landed because the read gate refuses a
+PROVISIONAL source on EVERY connection — `docs/DESIGN_TRIGGER_SOURCE.md` says so
+in as many words ("the gate does not distinguish the two, so it refuses both") —
+so the demotion turns four sections of `cdc: an unseeded baseline is never
+served to another connection` from SERVED-with-the-right-answer (110.0) into
+refusals, 8 assertions, plus the Python `cross/*` cases. That case pins
+availability during the window; `third_party_scan` pins correctness after it;
+the two cannot both hold until the gate can tell an ordinary autocommit reader
+from one inside the deferring transaction. No pinned expectation was changed.
+The reproduction ships, out of the default run (`DBSP_KNOWN_DEFECTS=1`), and the
+defect is recorded at `retire_scanned_baseline` and in the design doc.
+
+The previous round's `triggers_installed` residual is the SAME hole seen from
+the other side: what would make that flag's narrowness harmless is the
+invariant "a table written-and-then-tracked in one transaction is never SEEDED
+before that transaction ends", and that invariant is exactly what the demotion
+would establish. Written down in the design doc rather than left in a gitignored
+report.
+
+**Ordering, declared.** PROVISIONAL retirement moved from `sync_tables` (after
+`propagate_changes_multi`) into the scan, with the per-table lock released
+before propagation — so a reader can observe SEEDED slightly before the repair
+delta reaches the views. Same window DEFERRED already had.
+
+**Corrections to the fix-1 entry.** It described
+`mark_provisional_if_concurrent` being called from `retire_scanned_baseline`
+with an on-the-spot reference. That implementation was measured, rejected and
+never shipped: the probe counts the caller's OWN statement transaction as an
+older concurrent one (`lowest_active_start=36 mine=53`), which marked every
+reconciled table PROVISIONAL and refused reads of the view it had just repaired.
+The call has one site, `seed_baseline`. `CHANGELOG.md` and
+`docs/DESIGN_TRIGGER_SOURCE.md` now say what the code does. The commit hook's
+`sync_all` count was also still wrong in one comment
+(`dbsp_context_state.hpp`): there are three sites in the hook, plus the
+user-invoked one behind `dbsp_sync()`.
+
+**Minors.** `dbsp_sync()`'s owed-note no longer blames an open transaction
+unconditionally — a scan that did not RUN leaves the same debt, and the note
+names both causes and points at `reconcile_failures`. `mark_seeded`'s comment no
+longer names a parameter `finish_rebuild` does not have. Two
+residency-`deferred` leftovers renamed (`dbsp_cdc.hpp`'s `PendingViewCkpt`
+comment, `docs/ARCHITECTURE.md`).
+
+## Quality round, fix 1 — an in-window dbsp_sync() cannot pay the debt, and now says so — 2026-09-04
+
+**Third defect of the seeding family closed, and declared this time.** Old
+`finish_rebuild()` set the baseline seeded UNCONDITIONALLY, so `dbsp_sync()`
+called INSIDE the transaction that deferred a seeding scan retired the debt —
+from a scan that could not see that transaction's uncommitted rows. The next
+read was then served a baseline short by exactly them. The previous commit
+stopped that (a scan taken inside an open transaction no longer establishes)
+but did not say so, and left three artefacts behind. All three are fixed:
+
+- `dbsp_sync()` reported `Synced all tracked tables` for a call that
+  established nothing. It now appends what is still owed — `; 1 baseline(s)
+  still owed a seeding scan (db.main.t) — a scan taken while a transaction is
+  open cannot establish one; COMMIT or ROLLBACK, then sync or read again`.
+- The read refusal told the DEFERRED story for both states and advised
+  `dbsp_sync()`, which no longer works in-window. The text is branched:
+  UNSEEDED (a `dbsp_track()` left empty by design) says to run `dbsp_sync()`
+  with no transaction open; DEFERRED says only ending the transaction repairs
+  it, and why a sync cannot.
+- `sync_table`'s policy comment still called itself "the documented repair for
+  a baseline whose seeding was deferred inside a transaction". It is not, from
+  inside that transaction, and now says which case is which.
+
+Pinned by `in_window_sync` in `test/python/test_create_view_seeding.py`, which
+was RED on the missing status: `dbsp_sync() reported 'Synced all tracked
+tables' for a call that paid nothing`. The existing `repair == "sync"` arm runs
+AFTER the COMMIT and could not have caught it.
+
+**The readiness watermark never lowers.** Two connections can defer the SAME
+table. `mark_seed_deferred` overwrote the watermark, so an older transaction's
+lower one cleared while the newer transaction was still open, and the reconcile
+established the baseline without its rows. Measured RED before the fix:
+`view [(10.0,)] != SQL [(13.0,)]`, and it never healed — the write predated the
+triggers and so fed nothing. It now takes the maximum. Pinned by
+`watermark_never_lowers` in the same file.
+
+**One retirement rule, not two.** `retire_scanned_baseline` replaces the
+Deferred-side retirement (which was implicit in a `finish_rebuild` parameter)
+and the Provisional-side one (a loop in `sync_tables`). It runs after every
+successful scan, through the single funnel `sync_table_scan_and_consume`, and
+asks three questions in order: is anything owed; could THIS scan see everything
+(no user transaction open); has the transaction the state waits on ended. A NO
+to any of the first two leaves the state exactly where it was, so a failed or
+ineligible scan cannot drop a debt without paying it; a NO to the third leaves
+the state where it was (for DEFERRED the third question is asked only when the
+deferral is tainted — fix 3). An earlier version of this entry said a NO here
+demoted the baseline to PROVISIONAL: that was measured, rejected and never
+shipped — the fix-2 entry says why. `mark_provisional_if_concurrent` is NOT called
+from here and has one site, `seed_baseline`: it needs a reference start
+timestamp and a reconcile has no caller transaction to use, so a probed one
+counts the caller's own statement transaction — measured,
+`lowest_active_start=36 mine=53(probe)` on a bare `dbsp_sync()`, which marked
+the table PROVISIONAL and refused every read of the view it had just
+repaired.
+
+**`establishes` is mandatory.** `install_rebuild(bool)` no longer defaults to
+the unsafe value, and every call site states its reason: `true` only at the
+seeding scan, `false` at `rebuild_all_views` (a refresh) and at
+`materialize_deferred_locked` (restore-pending content, already SEEDED).
+`finish_rebuild()` lost the flag entirely — it installs content and never
+touches the trust state.
+
+**`TrackedTable::deferred_` is `restore_pending_`.** The D3c lazy-restore
+RESIDENCY flag shared a word with `Baseline::Deferred`, which is a TRUST state
+meaning the opposite thing (a scan is owed, where restore-pending means the
+content is trusted and merely not materialized). `is_deferred()` →
+`restore_pending()`, `mark_deferred()` → `mark_restore_pending()`,
+`deferred_weight/hash` → `restore_weight/hash`. The CDCManager-level D3c
+vocabulary (`deferred_tables_`, `materialize_all_deferred`, …) is unchanged: it
+names the subsystem, not the flag.
+
+**Rot.** `CDCManager::request_rebuild()` had zero callers once the rollback
+special case went; deleted.
+
+**Corrections to the previous entry.** "One full scan in the hook instead of
+four" was wrong: `TransactionCommit` still reaches `sync_all` from the same
+three places. What changed is that a seeding debt no longer forces the
+`unknown_writes` route. And the two DDL routes differ in a second respect on a
+qualified name — see the corrected paragraph below.
+
+## Quality round — one baseline state, one DDL parser — 2026-09-04
+
+Restructuring, not behaviour change: the suite passes unmodified in all three
+ctest modes and every seeding/DDL Python script still passes. Two defects the
+old shape was hiding are fixed on the way through, and both are named below.
+
+**One `TrackedTable::Baseline`, consulted at exactly two points.** "Is this
+table's baseline trustworthy right now?" was stored five ways — `deferred_`,
+`baseline_seeded_` and `provisional_watermark_` on the table, a sticky
+per-CONNECTION `unseeded_baseline_` on `DBSPContextState`, and a third
+`ViewReadBlock::Kind` re-derived at the read gate. They are now one enum,
+`{Unseeded, Deferred, Provisional, Seeded}`, owned by the per-instance table and
+asked by exactly two callers: the delta APPLY path
+(`apply_captured_deltas`, one `serves_exact_delta()` where three sequential
+refusals stood) and the READ path (`view_read_block`, which returns the worst
+state in the source tree instead of maintaining a parallel enum).
+
+The commit hook now does one thing: `reconcile_untrusted_baselines` scans every
+tracked table that is not `Seeded` and whose readiness watermark has cleared,
+BY NAME. That deletes the whole apparatus the per-connection flag needed,
+because that flag named no table and so could only ever be paid by a full
+`sync_all`:
+
+- `DBSPContextState::note_unseeded_baseline` and `unseeded_baseline_`;
+- the `TxnBookkeeping` `std::function` trampoline in `dbsp_cdc.hpp` and its
+  LOAD-time installation in `src/dbsp_extension.cpp` — a global installed at
+  extension load to route one boolean across an include edge;
+- the commit-time widening (`unknown_writes = true; saw_statements = true;` on
+  a transaction that may have seen no statements, set to defeat an early return
+  three branches below) and the `settle()` lambda that undid it;
+- `TransactionRollback`'s unseeded special case — a rollback owes nothing
+  special now: the table's own state stands and the next commit, or the next
+  read that is allowed to repair, scans it;
+- `ViewReadBlock::Kind`, and `baseline_seeded()` / `is_provisional()` /
+  `clear_provisional()`.
+
+`unknown_writes` survives only where it still means "a write we could not
+attribute". `TransactionCommit` still reaches `sync_all` from the same three
+places it always did (`triggers_installed`, `unknown_writes` on the trigger-fed
+path, `!know_all_writes` on the fallback path); what changed is that a seeding
+debt no longer FORCES the `unknown_writes` route, so those full scans are taken
+only when a write genuinely cannot be attributed to a table.
+
+**Defect fixed: a scan taken inside the deferring transaction retired the debt
+without paying it.** Crash recovery's `resync_tracked_tables` runs from
+`QueryBegin`, which can be inside the very transaction whose openness deferred
+a seeding scan. It set `baseline_seeded_` from a committed-only read, and with
+the debt now per-table that would have retired it — measured, `view 10.0` where
+SQL read `13.0`. `install_rebuild` / `finish_rebuild` now take `establishes`,
+and a scan run while a user transaction is open REFRESHES content without
+clearing a `Deferred` state. The old code survived this only because its
+connection flag was a second, redundant copy.
+
+**A `Deferred` baseline carries a readiness watermark**, taken the same way
+`Provisional` does and compared against the same
+`DuckTransactionManager::LowestActiveStart()`: the deferring transaction's own
+start + 1. Nothing scans an untrustworthy baseline before the transaction it is
+waiting on has ended, so the sweep can safely run on EVERY connection's commit,
+and the read path can run it too — which is what lets the first read after the
+window answer instead of refusing. `UNSEEDED` is deliberately not swept: the
+public `dbsp_track()` leaves a baseline empty by design and documents
+`dbsp_sync()` as the fill, and scanning it here would establish a baseline
+without `seed_baseline`'s concurrency check.
+
+New pin: `cdc: one baseline state drives both the apply path and the read path`
+flips the state once and asserts BOTH consultation points flip with it — a read
+refused and an exact delta refused while it is not `Seeded`, a read served and
+an exact delta applied with no scan once it is.
+
+**One DDL parser.** `include/dbsp_parser_extension.hpp` carried two: a
+token-text one (`ParseCreateMaterializedView` / `ParseDropMaterializedView` /
+`ParseRefreshMaterializedView`, three `ParserExtensionParseData` subclasses and
+the unused `MaterializedViewStatementType` enum) and the raw-text
+`dbsp_rewrite_mv_ddl` the `parser_override` uses. They accepted different DDL
+and reported different errors, which is a maintenance liability that had
+already produced one "indistinguishable from success" failure mode.
+
+The token entry point stays — it is genuinely reachable (`SET
+allow_parser_override_extension='DEFAULT'` after LOAD, and an embedding whose
+build lacks the setting) — but it now rejoins its tokens and hands the string to
+the SAME parser. `dbsp_parse_mv_ddl` produces one `MvDdl` struct;
+`dbsp_mv_ddl_call` formats it as SQL for the override; one
+`MaterializedViewParseData` carries it for the token path, and
+`MaterializedViewPlan` switches on `MvDdl::Kind` where a three-way
+`dynamic_cast` chain stood. The two routes now differ in exactly one respect,
+and it is inherent to the input: token slices rejoined with single spaces
+normalise the stored SQL, where the override sees the user's own bytes.
+
+`DROP` and `REFRESH` no longer require a REGISTRABLE view name — they only look
+a view up, and "does not exist" is a better answer for `REFRESH MATERIALIZED
+VIEW s2.qv` than a parse error about a name the caller was never going to
+register. `CREATE` is unchanged and still refuses one.
+
+Two things that paragraph would otherwise overclaim. First, the two routes
+differ in a second respect on a QUALIFIED name: the token path rejoins its
+slices with spaces, so `s2.qv` arrives as `s2 . qv` and is DECLINED with
+"trailing text after the REFRESH statement" — loud, where the old token parser
+took the whole tail as a name and reported "does not exist". Both refuse; only
+the message moved, and only on the route no ordinary user reaches. Second, the
+token path's `DROP` arm silently drops `IF EXISTS` (the plan hook's
+`drop_materialized_view` takes name and cascade only) — pre-existing, unchanged
+here, and stated so it stops being invisible.
+
+**Rot.** `apply_captured_delta` (singular) is deleted: zero callers, and its
+body was a verbatim copy of the plural's refusal ladder — the copy a state-model
+change has to keep in sync, and the one that was never run. History-narrating
+comments in the touched files now state the invariant instead, and
+`live_watermark`'s two stacked doc comments (the first superseded by the second
+and never removed) are one.
+
+## Fix round 1 — a provisional baseline is not readable either — 2026-09-04
+
+**The FIRST read after the deferring transaction's COMMIT returned a stale
+wrong answer, with no error.** The provisional repair runs from the commit
+hook, and a read's own commit hook fires AFTER the bind that served its rows —
+so with no statement in between, measured on both backends:
+
+```
+c1 COMMIT; FIRST read:  view=[(10.0,)]  sql=[(13.0,)]   WRONG
+           SECOND read: view=[(13.0,)]                  correct
+```
+
+`view_read_block` replaces `unseeded_source_of_view` and reports PROVISIONAL as
+well as UNSEEDED. A PROVISIONAL block is REPAIRABLE, so `EnsureViewReadable`
+tries the repair before refusing: when the reader holds no transaction of its
+own (every ordinary autocommit `SELECT * FROM dbsp_query(...)`) it runs
+`reconcile_ready_provisional` and answers correctly; when it cannot — the
+watermark has not cleared, or the reader is inside its own transaction — it
+refuses loudly. An UNSEEDED block is never repairable here (the missing rows are
+in another connection's uncommitted transaction) and always refuses.
+
+The test stepped over the window with `b.execute("SELECT 1")` before asserting,
+so it could not fail there. It now asserts on the FIRST read.
+
+**`LOAD` no longer downgrades an explicit `STRICT`.** `SET
+allow_parser_override_extension='STRICT'` followed by `LOAD` reported
+`FALLBACK` — measured. The value is read first and only `DEFAULT` is raised.
+
+**The internal-connection law now covers what the docs claimed.** Three helpers
+carried a policy while the docs said "every helper that opens an internal
+connection for a data read or DDL". Nine more sites carry it now: the watermark
+reads over USER tables (`live_watermark`, `fold_fresh_baseline`,
+`save_checkpoint`, `checkpoint_valid`, `register_arrangements` — the same
+committed-only-read-during-an-open-transaction shape) and every write to DBSP's
+own bookkeeping tables (`save_view_definitions`, `create_view`'s `_dbsp_views`
+upsert, `erase_persisted_view_row`, `erase_persisted_checkpoint_rows`).
+`docs/TESTING.md` now lists every site with its policy.
+
+**The strict run never reached the provisional scan.** `provisional_tables` was
+0 in every ctest case, so `reconcile_ready_provisional`'s own
+`sync_tables` was unexercised under `DBSP_STRICT_INTERNAL_QUERY=1`. A new case,
+`cdc: a provisional baseline retires under the strict internal-query switch`,
+goes provisional and commits an EXPLICIT transaction while the table is
+provisional-and-ready. It answers the open question by measurement: the
+ClientContext does NOT report the user's transaction as open inside
+`TransactionCommit` — the case passes with the policy set to `Forbidden`, so
+`Forbidden` is what the call site says. No whitelist, and the switch reports it
+if the engine ever changes that.
+
+**Byte-exactness failed silently for a dollar-quoted body containing `;`.**
+`dbsp_find_statement_end` knew `'`, `"` and comments but not `$$…$$`, so it
+stopped at the embedded `;`, declined, and fell back to token-normalised
+storage with nothing saying why (measured: `SELECT $$semi;colon$$ AS s , id
+FROM t`). The scanner now understands `$$…$$` and `$tag$…$tag$`, **and a
+decline on an otherwise-matching MATERIALIZED VIEW statement is now LOUD** —
+`dbsp_rewrite_mv_ddl` returns `NotOurs` / `Rewritten` / `Declined(reason)` and
+the override reports every `Declined` on stderr. A silent decline is how the
+`'''` escaping bug hid in the first place.
+
+**Minors.** View names are unquoted and validated in the scanner, so
+`"Quoted_Ok"` registers as `Quoted_Ok` and `"my view"` / `s1.qv` are refused
+with a reason naming what is wrong (before: the raw slice went through and the
+error read `Failed to create materialized view '"my view"'`).
+`last_reconcile_error`'s `value` column is NULL instead of repeating the
+`reconcile_failures` count. The override's `MATERIALIZED` sniff is an
+allocation-free case-insensitive scan instead of `StringUtil::Upper()` on every
+query string the database parses. `dbsp_view_state`'s "deliberately not gated"
+claim is reworded — it takes no view argument, so there is nothing for the gate
+to ask about. The design doc's lead said two open items while the body listed
+three.
+
+## The DDL is parsed from RAW TEXT, and DROP works again — 2026-09-04
+
+`CREATE` / `DROP` / `REFRESH MATERIALIZED VIEW` are now recognised in
+`ParserExtension::parser_override`, which receives the query TEXT and runs
+BEFORE the core PEG grammar. **The token-reconstruction path is no longer how
+these statements are normally parsed** — it survives only as the fallback for a
+database where parser overrides are switched off (see below).
+
+Two things follow:
+
+- **The stored SQL is byte-exact.** `dbsp_views()` returns the substring the
+  user typed after `AS`. Before, the hook received the tokenized tail from the
+  PEG failure point and rebuilt the statement by joining token slices with
+  single spaces: `SELECT t . "MixedCol" AS m , t . tag || '-' || ... FROM t`,
+  with every `--` and `/* */` comment gone. Now
+  `stored == SELECT_BODY.strip()` and both comments survive.
+- **`DROP MATERIALIZED VIEW [IF EXISTS] name [CASCADE]` is reachable again.**
+  DuckDB 2.0's grammar CLAIMS that statement
+  (`peg/grammar/statements/drop.gram:32`) and its transformer throws
+  `NotImplementedException: Cannot drop MATERIALIZED VIEW yet`
+  (`transform_drop.cpp:34`), so a hook that only sees PEG FAILURES never had
+  it. Running before the grammar takes it back. `dbsp_drop_view()` and
+  `dbsp_drop()` are unchanged and still work.
+
+**Deviation from the brief, stated:** the brief said to record that the
+token-reconstruction path is GONE. It was KEPT instead, and deliberately — it
+is the only thing standing between the DDL and a database where
+`allow_parser_override_extension` is `DEFAULT`, which is DuckDB's own default
+and a value a user or another extension can set at any time. Deleting it would
+have made `CREATE MATERIALIZED VIEW` breakable by a `SET`. It is no longer how
+these statements are normally parsed, and it is covered as a fallback by
+`test/python/test_ddl_syntax.py`.
+
+**Loading the extension now raises `allow_parser_override_extension` to
+`FALLBACK`, and never lowers it.** DuckDB's default is `DEFAULT`, which skips every
+`parser_override` callback, so without this the DDL above would never reach the
+extension. Stated plainly because it is a real side effect: the setting is
+global, so any OTHER parser-override extension in that database becomes active
+too. `FALLBACK` and never `STRICT`, so a query no override claims still reaches
+the core parser. The value is READ first and only `DEFAULT` is changed: an
+unconditional `SetOptionByName` silently downgraded a user's deliberate
+`STRICT` to `FALLBACK` (measured). A user who sets it back to `DEFAULT` keeps
+working DDL through the token path — same view, normalised stored text, no
+DROP.
+
+Two bugs surfaced by making the path reachable:
+
+- `dbsp_sql_literal` escaped `'` by appending `''` and then the character
+  again, producing `'''`. The malformed rewrite failed to parse, the override
+  declined, and the statement quietly fell back to the token path — the stored
+  SQL was still normalised and nothing said why.
+- `DROP ... CASCADE` dropped every dependent and left the named view behind:
+  `get_drop_order` returns the DEPENDENTS only, and the cascade branch had no
+  `drop_view` for the view itself. Measured on the first run of a path that had
+  never been reachable: `DROP MATERIALIZED VIEW a1 CASCADE` reported
+  "a1 (and 1 dependent views)" and `dbsp_views()` still listed a1.
+
+`DROP MATERIALIZED VIEW` also honours `IF EXISTS` now, which the old parse data
+carried and the plan function threw away.
+
+`test/python/test_ddl_syntax.py` covers all of it: byte-exact stored SQL with
+both comment styles, DROP with and without IF EXISTS, the refusal when a
+dependent exists, CASCADE taking both views, `dbsp_drop_view` still working,
+the multi-statement input still erroring loudly with nothing half-applied, and
+the token path still building a correct view with
+`allow_parser_override_extension='DEFAULT'`.
+
+## `dbsp_mv_tables(false)` actually stops mirroring — 2026-09-04
+
+`test/python/test_mv_tables.py` had a standing red on `disable must stop
+mirroring`: after `dbsp_mv_tables(false)`, an `UPDATE` still moved the
+`__mv_mv_agg` backing table (group 1 went `99700.0` → `100477.0` in lockstep
+with the view). The FUNCTION was wrong, not the test — `docs/API.md` says
+"Disabling stops mirroring and leaves the tables stale" and the comment over
+`MvTablesBind` says the same.
+
+Root cause, traced by instrumenting both toggles and both load paths on one
+manager:
+
+```
+[maybe_autoload -> load_from_duck_table]   enabled mv_tables, marked=7
+[set_mv_tables(false)]                     disabled
+[recovery load_views -> load_from_duck_table]  enabled mv_tables, marked=7
+```
+
+`load_from_duck_table` runs MORE THAN ONCE per manager — `maybe_autoload` fires
+it on the first DBSP call, and `DBSPRecoveryManager::load_views` fires it again
+from the crash-recovery pass — and its `__dbsp_mv_meta` block unconditionally
+re-enabled mirroring and re-marked every view table-backed. A disable landing
+between the two was silently undone.
+
+`mv_tables_user_disabled_` is now a separate sticky flag: only an explicit
+`dbsp_mv_tables(false)` sets it and only an explicit `dbsp_mv_tables(true)`
+clears it, and `load_from_duck_table` skips the whole meta block while it is
+set. It is deliberately NOT `mv_tables_enabled_`, which several internal error
+paths also clear on their own — those are failures, not user intent, and must
+not stop a later reattach from adopting its tables.
+
+All 30 `test/python/*.py` scripts now exit 0. There are no known reds.
+
+## `captured_delta_syncs` is now `exact_delta_syncs` — 2026-09-04
+
+**Renamed, not aliased.** The old name carried the vocabulary of the deleted
+capture stack — `TeeCapture`, `try_write_capture`, `apply_captured` — which has
+not existed since the trigger-only transition. What the counter means today is
+"a table delta applied EXACTLY, without a scan", and that is what it is called.
+
+The rename is safe because nothing outside the fork reads it. Grepped before
+touching it: NumPad's `calcengine/`, `api/` and `tests/` have **no** hits for
+`captured_delta_syncs`, and neither does the rest of that repo outside
+`docs/superpowers/` planning notes, which are history. NumPad reads
+`dbsp_stats()` at all in exactly zero places. Had there been a reader, the plan
+was an alias row and a deprecation note instead.
+
+The C++ accessor `CDCManager::captured_delta_syncs()` and the member are renamed
+with it; every fork test, benchmark and doc follows. Older entries in this file
+keep the old name — they record what was true when they were written.
+
+## The internal-connection law is enforceable — 2026-09-04
+
+*Never read committed-only state on an internal connection while the user's
+transaction is open.* Three defects of that family have shipped and been fixed
+here — the sweep's DDL, the sweep's catalog-version read, and the seeding scan —
+and nothing asked the question of the fourth: it was a rule in a comment.
+
+Every SITE that opens an internal `duckdb::Connection` to read a USER table or
+to run DDL now declares an explicit `InternalReadPolicy{Forbidden,
+AllowedInTxn}` and a site name — the streaming helpers, the watermark reads
+(`live_watermark`, `fold_fresh_baseline`, `save_checkpoint`,
+`checkpoint_valid`, `register_arrangements`), the sweep's DDL, and every write
+to DBSP's own bookkeeping tables. `docs/TESTING.md` lists them all. Under
+`DBSP_STRICT_INTERNAL_QUERY=1` a `Forbidden` call made while
+`user_transaction_open(context)` throws an `InternalException` naming the site.
+`ctest` now runs a THIRD way with it set, alongside `DBSP_TEST_VERIFY_VECTORS`;
+all three are green (45/45).
+
+An assertion inside `InternalQueryGuard` was rejected: 39 call sites, no
+`ClientContext` to ask, and legitimate exceptions that would false-positive.
+Each exception is whitelisted IN CODE at its call site with its reason — the
+sweep's `duckdb_triggers()` presence read (a plain SELECT taking its own
+snapshot), `rebuild_all_views` and `materialize_deferred_locked` (both reached
+from `QueryBegin`, both REFRESHING a baseline that already exists rather than
+establishing one), and user-invoked `dbsp_sync()` / `dbsp_sync('t')`, where
+committed storage is what the caller asked for. The seeding scan is `Forbidden`
+and means it: `seed_baseline` already refuses to reach it inside an open
+transaction, so a throw there says that refusal has been bypassed.
+
+Off by default deliberately. Such a call is a bug the commit reconcile usually
+papers over; turning that paper-over into a crash in production would trade a
+wrong answer for an outage.
+
+Proved to bite: flipping the `duckdb_triggers()` whitelist to `Forbidden` turns
+the strict run red — `trigger_source` fails, 44/45, with the law's own message —
+and restoring it returns 45/45.
+
+## A failed reconcile is visible from SQL — 2026-09-04
+
+`sync_table_scan_and_consume` reports failure by RETURNING `nullopt`, not by
+throwing, so nothing propagates out of the commit hook. A view left stale by a
+failed reconcile was announced on stderr and in `last_error_`, neither of which
+a host embedding the extension sees. `dbsp_stats()` now carries
+`reconcile_failures` (a count) and `last_reconcile_error` (the message).
+
+`dbsp_stats()` therefore has **three** columns: `metric`, `value` (BIGINT) and
+`detail` (VARCHAR, NULL on every numeric row) — a counter cannot carry the text
+and the text is the useful half. Consumers that unpacked two columns need
+updating; NumPad reads `dbsp_stats()` nowhere (grepped: `calcengine/`, `api/`,
+`tests/` — no hits).
+
+The scenario, from the transition's round 5: a view is created inside an open
+transaction (which defers the seeding scan and records the debt), the same
+transaction DROPs the source, and the COMMIT widens itself to pay the debt with
+a scan that cannot run. Before, `dbsp_stats()` returned seven two-column rows
+and said nothing:
+
+```
+[('captured_delta_syncs', 0), ('scan_syncs', 2), ('commit_seq', 1),
+ ('tracked_tables', 1), ('trigger_syncs', 0), ('trigger_rows', 0),
+ ('provisional_tables', 0)]
+```
+
+After: `reconcile_failures 1` and `last_reconcile_error` = `DBSP: reconcile scan
+did not run for 'memory.main.t'; its baseline is unchanged. Last error: … Table
+with name t does not exist!`. Pinned by
+`test/python/test_reconcile_telemetry.py` on both backends.
+
+## A baseline seeded beside an open transaction is PROVISIONAL — 2026-09-04
+
+The seeding scan reads COMMITTED storage. If another connection already holds a
+transaction that wrote the table while it was UNTRACKED, that write is invisible
+to the scan and fired no trigger — there were no triggers when the statement
+ran. Its commit reported nothing and the view stayed short forever:
+
+```
+after A commit:      view 10.0   sql 13.0
+after a later edit:  view 14.0   sql 17.0
+```
+
+Pre-existing, and not the cross-connection defect the apply-path gate closed:
+there the baseline was UNSEEDED, here it is seeded correctly and it is the other
+connection's PRE-TRACKING write that nobody accounted for.
+
+DuckDB's transaction manager publishes what is needed.
+`mark_provisional_if_concurrent` compares `DuckTransactionManager::
+LowestActiveStart()` — the smallest start timestamp among the database's active
+transactions — against the seeding transaction's own `start_time`. A lower value
+means a transaction OLDER than this one is open, so the table is marked
+PROVISIONAL with a watermark taken by starting a transaction on the spot and
+rolling it straight back: a start timestamp newer than every transaction alive
+then.
+
+While provisional, both apply paths refuse the table exactly as they refuse an
+unseeded one, so it rides the `failed` → scan-reconcile route on every
+connection's commit. Retirement is a sweep in the commit hook
+(`reconcile_ready_provisional`, ordered AFTER this commit's own deltas so it
+cannot double-count): once `LowestActiveStart()` has risen to the watermark,
+every transaction that existed at seed time has ended and one scan pays the
+debt. It has to be a sweep and not just the apply path — in the reproduction the
+connection that repairs the view writes NOTHING. At connection A's own commit
+A's transaction is still active, so the repair falls to the next statement on B,
+a bare `SELECT 1`.
+
+The lookup goes through the DATABASE MANAGER, not the ClientContext:
+`resolve_table_entry` needs the transaction's catalog snapshot, and inside the
+commit hook that snapshot is gone — it returned nullptr on all seven commits of
+the reproduction and the sweep never found its table.
+(`Catalog::GetCatalog(DatabaseInstance &, ...)` is declared in the 2.0 alpha
+header but never defined; it does not link.)
+
+Costs nothing when nothing else is open: `LowestActiveStart()` is the seeding
+transaction's own start, the table is never provisional, and the sweep's steady
+state is one atomic load per commit. `test/python/test_provisional_baseline.py`
+asserts six later edits cost **0** scans and **6** exact deltas in that case,
+and covers the reproduction and its ROLLBACK variant on both backends plus a
+NumPad-shaped reader control. New `dbsp_stats()` row `provisional_tables`
+reports the live count.
+
+Residual, stated rather than hidden: a transaction that BEGINS during the
+seeding statement is not covered by "older than mine" — its writes to a
+still-untriggered table are the trigger-install window, which the sweep already
+answers by marking that transaction's own commit untrusted. A catalog served by
+a non-DuckDB transaction manager has no watermark to take and is never marked,
+which is the behaviour before this gate.
+
+## A read surface refuses an unseeded baseline — 2026-09-04
+
+The apply-path gate below closed the case where a delta is applied onto a
+baseline nothing has scanned. It did not touch a plain read. While connection
+A held `BEGIN; dbsp_create_view('mv', 'SELECT sum(v) FROM t')` open, measured
+on `:memory:` and on a file, on A and on a second connection:
+
+```
+in-window A: dbsp_query('mv')   -> [(None,)]              plain SQL -> 10.0
+in-window B: dbsp_query('mv')   -> [(None,)]              plain SQL -> 10.0
+in-window B: dbsp_changes('mv') -> [(None,-1),(10.0,1)]   -- and query said NULL
+```
+
+`dbsp_query` and `dbsp_changes` now walk the view's sources transitively
+(`CDCManager::unseeded_source_of_view`) and throw when any tracked source has
+`baseline_seeded() == false`, naming the table and how to clear it.
+
+They REFUSE rather than reconcile. Reconciling here means scanning the table on
+an internal connection while the reader's own transaction is open — the exact
+read that produced the empty baseline in the first place — and on the deferring
+connection that transaction is open by construction. The debt is still paid
+where it can be: at the deferring transaction's COMMIT, by `dbsp_sync()`, or by
+a ROLLBACK's rebuild. `dbsp_view_state()` is not gated, and not as a
+judgement call: it takes no view argument, so there is no view for the gate to
+ask about. Its numbers are diagnostics anyway, and a diagnostic that refuses
+while the state is broken is useless exactly when it is needed.
+
+Pinned by `test/python/test_unseeded_read.py` (both backends, both connections,
+both ways out of the window, and exactness through a later edit on each
+connection so a constant offset cannot hide).
+
+## An unseeded baseline is never applied onto, on any connection — 2026-09-04
+
+**Third and last correction to deferred seeding.** The debt recorded by
+`seed_baseline` is per-CONNECTION; the baseline it refers to is per-INSTANCE.
+So while connection A held the transaction that deferred the seed, connection
+B's commits took the trigger-fed fast path and applied their exact deltas onto
+A's still-EMPTY baseline, and B read the deltas alone:
+
+```
+B write 1   view 1.0    sql 11.0
+B write 2   view 2.0    sql 12.0
+B write 3   view 3.0    sql 13.0     -- correct again at A's commit
+```
+
+Transient and self-healing, and still a view returning a wrong answer with no
+error, which is the one thing the design does not allow.
+
+The fix is on the APPLY path, where the per-instance signal already lived and
+was read by nobody but `create_view`: `apply_captured_delta` and
+`apply_captured_deltas` now refuse an exact delta onto a table whose
+`TrackedTable::baseline_seeded()` is false and hand it back to the commit,
+which reconciles that table by scan at that same commit — the mechanism the
+`failed` list was already built for. Any connection's commit does this, whether
+it is in autocommit or in an explicit transaction of its own; the scan runs at
+commit time and sees committed state.
+
+That is the APPLY path only: never applied onto, on any connection; a read
+during the deferral window can still observe the unseeded baseline until the
+deferring transaction ends. A PURE READ of the view — no write of its own, so
+no commit to trigger the gate — while connection A still holds `BEGIN;
+dbsp_create_view(...)` open returns the unseeded value (`NULL` vs SQL `10.0`)
+on connection A and on any other connection, and only heals when A's
+transaction ends. Not reachable from NumPad, which never creates a view inside
+an open transaction (measured: 25 seedings, all `user_txn_open=0`). Open item;
+see `docs/DESIGN_TRIGGER_SOURCE.md` Follow-ups.
+
+**And a failed reconcile no longer retires the debt in silence.** It was
+cleared at the top of `TransactionCommit`, before the scan that pays it, and
+that scan can fail — the source was dropped, a deferred materialization threw —
+without throwing, so one failure left the baseline empty for the life of the
+connection with nothing owed and nothing said. Now:
+
+- `sync_tables` (and `sync_all`) return whether every named table was really
+  scanned. A table that was skipped or whose scan failed is reported through
+  `record_error_best_effort` AND on stderr, naming the table and the underlying
+  error.
+- the parallel arm uses `future::get()` rather than `wait()`, so an exception
+  from the worker's lock acquisition can no longer vanish into the future's
+  destructor.
+- the commit clears the deferred-seeding flag only on a sync that reports
+  success.
+
+Still open, and NOT the same shape: a table tracked while ANOTHER connection
+holds a PRE-TRACKING write open is missed permanently (`10.0` against `13.0`).
+There the baseline is seeded correctly and it is the other connection's earlier
+write that nothing accounts for. Re-measured after this change and unchanged;
+recorded in `docs/DESIGN_TRIGGER_SOURCE.md` Follow-ups.
+
+Net over the whole transition: **−2,813 lines** across 45 files
+(`git diff --shortstat 7549a02..HEAD`: +3,397 / −6,210, taken with this commit
+itself in the range).
+
+Suite: `ctest` 45/45, `test_trigger_source` 33 cases / 915 assertions,
+`test_dml_shapes` 10 cases / 352 assertions.
+
+## A deferred baseline is reconciled on every commit path — 2026-09-04
+
+**Completes the entry below, which fixed the wrong answer on one commit path
+and left it on the others.** Deferred seeding recorded the table in the
+transaction's sync SCOPE. `TransactionCommit` has two branches, and the
+trigger-fed one — the one taken whenever the transaction also WROTE a tracked
+table — applies its buffered deltas and returns without ever reading that
+scope. So on those commits the reconcile was discarded in silence:
+
+```sql
+-- t tracked with an unseeded baseline, its triggers installed
+BEGIN; INSERT INTO t VALUES (2, 3.0);
+CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t; COMMIT;
+-- view 3.0, plain SQL 13.0; after the next edit 7.0 against 17.0
+```
+
+The repair is now a WIDENING (`unknown_writes`), which is the one flag both
+commit branches honour, and it is carried on connection state rather than on
+the transaction. That second half fixes the other hole: a commit with
+**auto-sync off** reconciles nothing, and it used to clear the deferred-seeding
+state anyway — so `dbsp_auto_sync(false); BEGIN; INSERT; dbsp_create_view;
+COMMIT` left the view on its empty baseline for the life of the connection
+(`4.0` against `17.0` once auto-sync came back on). The debt now survives every
+commit that does not pay it, and is settled by the first commit under auto-sync
+or by an explicit `dbsp_sync()`. `TxnBookkeeping` is down to the one callback
+this needs.
+
+Cost: a transaction that defers a seeding pays one full scan-and-diff at its
+commit instead of a scoped one. It is paid once per deferral, and a workload
+that never creates a view inside an open transaction never pays it.
+
+Also in this round:
+
+- **Better error for `CREATE TABLE` + `CREATE MATERIALIZED VIEW` in one
+  transaction.** It cannot work — the plan is extracted on an internal
+  connection that cannot see the uncommitted catalog — and failing is correct,
+  but the engine's `Table with name t does not exist! Did you mean "g1.t"?`
+  reads like a typo. When the name resolves on the CALLER's context, the error
+  now says the source table is not yet committed and to commit the
+  `CREATE TABLE` first. A genuinely missing table keeps the engine's message.
+- Two stale comments on `commit_seq_` corrected: it is the delta generation
+  stamped on each view's delta buffer (`view_delta_generation_`), not a guard
+  for the deleted write-capture stack, and one of them still pointed at
+  `docs/DESIGN_WRITE_CAPTURE.md`, which no longer exists.
+- `docs/DESIGN_TRIGGER_SOURCE.md` now says plainly that the
+  internal-connection law is enforced for SEEDING only — `rebuild_all_views`
+  and `materialize_all_deferred` still scan on internal connections from
+  `QueryBegin` — and records two follow-ups: a cross-connection hole where a
+  table tracked while another connection holds a write open is missed
+  permanently, and a concrete `DBSP_STRICT_INTERNAL_QUERY=1` proposal for
+  enforcing the law.
+
+The transition-wide `git diff --shortstat` is quoted in the newest entry at the
+top of this file.
+
+## Baselines are never seeded from a stale read — 2026-09-04
+
+**Fixes a second silent wrong answer, on an idiom NumPad's own code shape uses**
+(though NumPad turns out not to hit it — see below).
+
+```sql
+BEGIN; INSERT INTO t VALUES (2, 3.0);
+CREATE MATERIALIZED VIEW tv AS SELECT SUM(v) FROM t; COMMIT;
+```
+
+read `3.0` where plain SQL read `13.0`, and never healed — `7.0` against `17.0`
+after the next edit. Specific to a source FIRST TRACKED inside that transaction;
+a source tracked beforehand was always fine.
+
+Same law as the two rounds before it: **never read committed-only state on an
+internal connection while the user holds a transaction open.** Seeding a
+baseline scans through `stream_table_rows`, which opens its own connection and
+therefore cannot see the transaction's uncommitted rows.
+
+`CDCManager::seed_baseline` is now the single place a baseline is established,
+used by both `track_table_internal` and `create_view`. Inside a user
+transaction it does NOT scan: it leaves the baseline unseeded and asks the
+transaction to reconcile the table at commit, where the scan-and-diff delta
+(committed content − empty baseline) propagates into the view and makes it
+exact from that commit on. A ROLLBACK has no commit to do that, so it requests
+a view rebuild from committed storage instead. Views created in a rolled-back
+transaction still survive — DBSP view state has never been transactional — but
+they now READ CORRECTLY, which is the half that was broken.
+
+The CDC core reaches the per-connection state through two callbacks the
+extension installs at load (`dbsp_native::txn_bookkeeping()`), because
+`dbsp_context_state.hpp` includes `dbsp_cdc.hpp` and the edge must stay
+one-way.
+
+Also in this round:
+
+- `create_view` now CHECKS the seeding result. `sync_table_internal` swallows
+  its exceptions and returns false; ignoring that let a failed scan fall
+  through to the replay over the empty baseline — the very defect the seeding
+  exists to prevent. It now fails the create with `last_error_`.
+- The checkpoint-restore loop (`load_from_duck_table`) catches per view. Its
+  contract is "continue on individual failures", but `create_view` can now
+  THROW (a pre-v2.0.0 source, a failed seeding scan) and one such view aborted
+  the whole restore mid-loop, taking every later view with it.
+- `DBSP_DEBUG_SEED=1` prints one line per baseline seeding with
+  `user_txn_open=`, which is how a host can answer "am I exposed to this?"
+  rather than guess.
+
+**NumPad is not exposed** (measured, not assumed): attaching the wfp-review MV
+backend, three authority edits and `build_pending_views()` materialising 121
+views produced 25 seedings, all `user_txn_open=0`.
+
+## create_view seeds its source baselines — 2026-09-04
+
+**Fixes a silent wrong answer on the fork's public API** (pre-existing; not
+reachable from NumPad, which auto-tracks through `create_view` rather than
+calling `dbsp_track` first).
+
+`dbsp_track` followed by `dbsp_create_view` could build the view over an EMPTY
+baseline: wrong number, no error, no counter moving, and no self-healing —
+after one insert the view read 3.0 where SQL read 6.0, after another 7.0
+against 10.0, the same constant offset forever.
+
+The public `track_table` creates a `TrackedTable` with an empty baseline on
+purpose ("Initial table sync deferred... call dbsp_sync() after dbsp_track()")
+and `create_view`'s replay streams exactly that. It was never correct — it only
+LOOKED correct because an unrelated commit usually ran a scan-sync in between,
+namely the statement-less-commit safety net that runs while
+`trigger_source_active()` is still false. Any earlier FAILED DBSP call shifts
+the commit sequencing by one statement, so that scan lands before the table is
+tracked and nothing ever seeds it.
+
+`TrackedTable::baseline_seeded()` now records whether a baseline has ever been
+established from committed storage (set by `install_rebuild`, `finish_rebuild`
+and `mark_deferred`), and `create_view` seeds an unseeded source itself —
+the same guarantee `track_table_internal` already gave auto-tracked sources.
+An already-seeded baseline is untouched, so view creation pays no extra scan.
+
+Also: the storage-version precheck now runs in `track_table_internal`, so
+`dbsp_create_view` over a source in a pre-v2.0.0 database fails with the
+readable error BEFORE tracking it. Previously it succeeded, tracked the table,
+and then every statement on that connection — `COMMIT` and `ROLLBACK` included
+— threw from the sweep, with `DETACH` the only escape. The sweep's own check
+moved below the deferral, so an open user transaction defers instead of
+throwing. The two helpers moved to `include/dbsp_trigger_capability.hpp`; the
+CDC core must not depend on the trigger source.
+
+ctest 45/45 (61.0 s) and 45/45 under `DBSP_TEST_VERIFY_VECTORS=1` (55.3 s);
+`test_trigger_source` 27 cases / 575 assertions; 26 of 27 Python probes exit 0.
+
+## Trigger-fed deltas are the only delta source — 2026-09-03
+
+**BREAKING.** The predictive capture stack, the optimizer plan tee, the
+patched-engine hook consumer, the engine patch and the patched-wheel machinery
+are gone. Change capture is the statement triggers `dbsp_track` generates, and
+nothing else. The fork stops being a fork of DuckDB: stock engine, stock PyPI
+wheel, and a CI that can build against a public one.
+
+**What breaks**
+
+- `DBSP_DELTA_SOURCE` no longer exists. Setting it does nothing.
+- `dbsp_stats()` no longer reports `delta_source_mode` or
+  `capture_guard_fallbacks`. `captured_delta_syncs` stays and now counts
+  trigger-fed table deltas applied without a scan; `trigger_syncs` /
+  `trigger_rows` stay.
+- `CDCManager::write_capture_enabled()` / `set_write_capture_enabled()` and
+  `capture_guard_fallbacks()` / `note_capture_guard_fallback()` are removed.
+  The scan path is now reached with `dbsp_auto_sync(false)` + `dbsp_sync`.
+- The CMake option `DBSP_ENGINE_HOOK` is gone from both `CMakeLists.txt` files,
+  and `build.sh` has no patch step — it FAILS if `duckdb/` is dirty.
+- **Tracking a table costs it** (engine behaviour, pinned by tests): on a
+  triggered table the engine refuses `MERGE INTO`,
+  `INSERT ... ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`, and every
+  `ALTER TABLE` form except `ADD COLUMN`. The triggers and a
+  `dbsp_trigger_sink` table are user-visible catalog objects.
+- **Storage version.** `CREATE TRIGGER` requires storage version `v2.0.0` or
+  higher. A database written by DuckDB 1.5.4 is `v1.0.0+` and the install
+  throws on it. Migration: `ATTACH ... (STORAGE_VERSION 'v2.0.0')` +
+  `COPY FROM DATABASE`, then move the `.dbsp_spill/` sidecar directory
+  alongside the new file. Verified end to end — the views restore, the triggers
+  install, and edits are served by exact deltas.
+- A write matching **zero rows** now costs one scan of the statement's target
+  table: the bodies evaluate the ingest scalar once per transition-table row,
+  so a zero-row write evaluates it zero times and "fired, nothing changed" is
+  indistinguishable from "did not fire".
+
+**Deleted** (line counts as removed; the transition-wide `git diff --shortstat 7549a02..HEAD` is quoted in the newest entry at the top of this file)
+
+| File | Lines |
+|---|---:|
+| `include/dbsp_write_capture.hpp` | 656 |
+| `include/dbsp_plan_tee.hpp` | 506 |
+| `include/dbsp_engine_hook.hpp` | 202 |
+| `test/unit/test_write_capture.cpp` | 518 |
+| `test/unit/test_engine_hook.cpp` | 299 |
+| `test/integration/test_engine_hook_consumer.cpp` | 128 |
+| `test/benchmarks/bench_write_capture.cpp` | 114 |
+| `patches/v2.0.0-alpha39998-dbsp-txn-callback.patch` | 371 |
+| `patches/archive/v1.5.4-dbsp-txn-callback.patch` | 348 |
+| `scripts/build_engine_wheel.sh` | 146 |
+| `.github/workflows/engine-wheel.yml` | 113 |
+| `docs/DESIGN_ENGINE_HOOK.md` | 166 |
+| `docs/DESIGN_WRITE_CAPTURE.md` | 316 |
+| `docs/UPSTREAM_PROPOSAL.md` | 92 |
+
+`include/dbsp_context_state.hpp` went from 1,316 to 651 lines. The
+`ParserExtension` for `CREATE MATERIALIZED VIEW` stays — it is DDL, not
+capture. `duckdb/` was reverted to stock `a00803f7687ca3d7188d417216e288c5c4b22b58`.
+
+**Also fixed in the same pass**
+
+- The sweep's catalog-version gate joined every tracked catalog to the
+  statement's transaction, which made `DETACH` impossible on any catalog
+  holding a tracked table (`Cannot detach database b because the current
+  transaction has outstanding work on it`). The sweep now skips a `DETACH`
+  statement.
+- Trigger names carry a hash of the table key AND the column fingerprint, so a
+  process with an empty install record can see from `duckdb_triggers()` that
+  the right bodies are already installed. Before this, the first statement
+  after every reopen re-issued `CREATE OR REPLACE`, which marked that
+  transaction untrusted and made the first write after every reopen a full
+  scan-and-diff — and cost the delta-append sidecar save
+  (`test_delta_append_sidecars.py` went red: a dirty save rewrote the whole
+  base digest index instead of appending an O(changed-rows) delta). A
+  fingerprint change now also DROPS the old-fingerprint bodies by name;
+  `CREATE OR REPLACE` alone would have left them delivering wrong-width rows.
+- `dbsp_track` inside a transaction that ROLLS BACK no longer keeps its
+  tracking intent. The tracked-table set is process state, not transactional
+  state, so `TransactionRollback` drops it by hand; `dbsp_tables()` used to go
+  on listing a table that never committed.
+- `TriggerInstallState::firings_since_drain` and `request_trigger_recheck()`
+  are removed — a process-global mutex and map insert on every trigger firing,
+  for a counter nothing read, and a caller-free function.
+
+**Test suite**
+
+- ctest: **45 entries, 45/45 green**, 72.5 s plain and 54.9 s under
+  `DBSP_TEST_VERIFY_VECTORS=1`. (Was 48 with the hook build: −`engine_hook`,
+  −`engine_hook_consumer`, −`write_capture`; `plan_tee` was renamed.)
+- `test_trigger_source`: **25 cases, 495 assertions**.
+- `test_plan_tee.cpp` → `test_dml_shapes.cpp` (**10 cases, 352 assertions**):
+  the same DML shapes, now asserted through the trigger path.
+- `test_auto_cdc.cpp` kept every case whose subject was the answer rather than
+  the mechanism, renamed off the capture vocabulary. Deleted with reasons: the
+  two upsert cases (the engine now refuses upserts on a tracked table — the
+  refusal is pinned instead), the commit-guard counter case (the guard is
+  gone), and the forced-scan differential (its kill switch is gone; the scan
+  arm is now `dbsp_auto_sync(false)` + `dbsp_sync`).
+- `test_engine_assumptions.cpp` kept only the autocommit hook-ordering canary.
+  The five plan-shape canaries went with the plan tee they existed for.
+
+## DuckDB 2.0 alpha issues
+
+Open problems in the pinned engine (v2.0.0-alpha39998, `a00803f7`) that the
+fork works around or lives with. Re-check each on an engine bump.
+
+### SIGSEGV when a DBSP-carrying instance is destroyed at interpreter exit
+
+**Symptom.** Roughly 2 runs in 5, a Python script that loads the extension,
+creates views, and exits WITHOUT closing its connection prints all its
+output and then dies with `SIGSEGV` (exit 139). The 1.5.4 build under
+`duckdb==1.5.4` does not do this (0/5).
+
+**Repro** (2 of 5 runs, and 2 of 8 on a repeat):
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' python \
+  test/python/test_self_join_case.py build/dbsp.duckdb_extension
+# prints the full "ok:" list and "PASS", then exits 139
+```
+
+`test/python/test_nth_value_frames.py` reproduces it too. Both scripts leave
+their `duckdb.connect()` handle open at exit.
+
+**Diagnosis.** The macOS crash report is `EXC_BAD_ACCESS` /
+`KERN_INVALID_ADDRESS at 0x278`, and the faulting stack is a *binder* stack,
+not a teardown stack:
+
+```
+duckdb::DuckDBKeywordHelper::KeywordCategoryType(...)
+duckdb::KeywordHelper::RequiresQuotes(...)
+duckdb::BoundAggregateExpression::ToString() const
+duckdb::BaseSelectBinder::BindAggregate(...)
+...
+duckdb::Binder::Bind(duckdb::SelectStatement&)
+```
+
+`DuckDBKeywordHelper::Instance()`
+(`src/parser/peg/keyword_helper/duckdb_keyword_helper.cpp:9`) is a
+function-local `static`, i.e. destroyed during static destruction at exit.
+New in 2.0, the BINDER depends on it: `BoundAggregateExpression::ToString()`
+quotes identifiers via `KeywordHelper::RequiresQuotes`, which calls
+`Instance()`. DBSP's teardown destroys the instance's views and runs SQL
+while doing so, so an exit-time destruction can bind a statement *after*
+that singleton is gone and dereference it.
+
+**Workaround / mitigation.** Close the connection explicitly. Patching
+`circ.close()` / `stock.close()` in before the final `print` makes the same
+script pass 8/8. The C++ suite is unaffected (Catch2 destroys each
+`DuckDBTestHarness` well before static destruction), and so is
+`verify_extension.sh`.
+
+**Not fixed here.** A real fix means DBSP teardown must not bind SQL during
+static destruction, which is a design change to the CDC shutdown path — out
+of scope for the migration. Upstream could also make the keyword helper a
+leaked/never-destroyed singleton.
+
+**Also reproduces in the built shell** (found while verifying the hook-ON
+binary): `build/duckdb/duckdb -unsigned -c "LOAD ...; <DBSP writes>"` exits
+139 roughly 1 run in 5, after printing every result correctly. Under `lldb`
+the fault is `EXC_BAD_ACCESS` on a *background* thread inside
+`duckdb::ShellPostBind` — the CLI's own planner extension, racing DBSP's
+detached teardown thread. Same family, same non-fix; it is a shutdown race,
+not a wrong answer, and it is independent of `DBSP_ENGINE_HOOK` (a plain
+`-c` with no DBSP writes never reproduced it in 5 runs).
+
+### `DROP MATERIALIZED VIEW` never reaches the extension
+
+DuckDB's own parser claims the statement and throws
+`NotImplementedException` before any parser extension is consulted, so the
+extension's `ParseDropMaterializedView` is dead code. Use the scalar
+`dbsp_drop_view('name')` / `dbsp_drop_view_cascade('name')`. **Not new in
+2.0** — measured identically on 1.5.4, which throws `Cannot drop this type
+yet` where 2.0 throws `Cannot drop MATERIALIZED VIEW yet`. Full entry, with
+the measurement and the `parser_override` route out:
+"`DROP MATERIALIZED VIEW` does not reach the extension (and never did)"
+below. Pinned by `test/python/test_ddl_syntax.py`.
+
+## Trigger-fed delta source behind `DBSP_DELTA_SOURCE` - Sep 2026
+
+- A third delta source, and the only one that runs on a **stock** engine.
+  DuckDB 2.0's statement-level `AFTER` triggers with transition tables are
+  expanded in the binder, so a trigger sees every write the binder sees — which
+  in 2.0 includes the Appender (`Appender::FlushInternal` now runs an
+  `INSERT ... SELECT`). `dbsp_track(t)` generates three triggers whose bodies
+  call a new vectorised, volatile scalar `dbsp_trigger_ingest(key, weight,
+  cols...)`; that scalar writes the row images into the **same** per-transaction
+  buffer the engine hook fills, so `TransactionCommit` applies both by one path
+  and `dbsp_cdc.hpp` is untouched.
+- `DBSP_DELTA_SOURCE` = `trigger` | `hook` | `capture`, read once at load; unset
+  keeps today's behaviour. An environment variable rather than a `SET`, because
+  a host that cannot run SQL before it opens the database still has to be able
+  to choose — and the mode has to be fixed before the hook registers and before
+  the first table is tracked. `dbsp_stats()` reports it as `delta_source_mode`
+  (0 default / 1 hook / 2 capture / 3 trigger) next to `trigger_syncs` and
+  `trigger_rows`, so it is verifiable from the host; `DBSP_TIMING=1` prints
+  `[dbsp-timing] trigger_ingest`.
+- In trigger mode the engine hook does not register and the capture stack
+  disarms, so no row is delivered twice. Pinned by a test that inserts once and
+  asserts a **sum**, not a row count — a doubled delivery is invisible to a row
+  count.
+- Tracking a table in this mode COSTS that table several statements, all of
+  them engine behaviour and all pinned by tests: `MERGE INTO`
+  (`bind_merge_into.cpp:226-233`), `INSERT ... ON CONFLICT DO UPDATE` and
+  `INSERT OR REPLACE` ("not yet supported with REFERENCING NEW TABLE AS
+  triggers"), and every `ALTER TABLE` form except `ADD COLUMN` (dependency
+  error). All of them work normally in default and capture mode.
+- New suite `trigger_source` (`test/unit/test_trigger_source.cpp`). (Counts as
+  of this entry are superseded by the trigger-only entry below.)
+- Two of those tests failed at first for one reason, worth recording again: the
+  per-database install record was keyed on the raw `DatabaseInstance` address,
+  and DuckDB reuses freed addresses, so consecutive harnesses in one process
+  inherited a stale "already installed" list and ran with **no triggers at
+  all**. A close-time prune did not fix it (the teardown hook returns early in
+  tests). It now holds a weak reference and compares.
+- Keeping the generated bodies in step with their tables took two goes. A body
+  encodes its column list literally, and neither `ALTER TABLE ... ADD COLUMN`
+  nor `DROP TABLE` + recreate moves the tracked-table count, so a count-only
+  sweep left stale bodies producing wrong answers with no scan behind them.
+  Keying on a live column fingerprint fixed the autocommit case; DDL inside an
+  explicit transaction still failed, because the sweep read the caller's
+  catalog but ran its `CREATE OR REPLACE TRIGGER` on an internal connection
+  that cannot see uncommitted catalog changes — which threw out of the user's
+  own COMMIT, and wedged a connection that had created and tracked a table in
+  one transaction (every later statement, including `ROLLBACK` and `SELECT 1`,
+  raised until it was closed). The sweep is now gated on
+  `Catalog::GetCatalogVersion` (which also exposes a transaction's own
+  uncommitted changes), runs no DDL at all while a user transaction is open —
+  that transaction's commit reconciles by scan instead — and clears its
+  recheck flag only on a reconcile that succeeded.
+- The sink drain was gated on the MODE, while the sink is filled by persisted
+  trigger bodies that keep running in every mode: a database tracked once in
+  trigger mode grew its `dbsp_trigger_sink` without bound on a later
+  non-trigger build. The drain now discovers sinks from `duckdb_triggers()`
+  and runs regardless of mode; `DBSP_TRIGGER_SINK_DRAIN` sets the interval.
+- Design, coverage table, standing costs and the deletion plan for the capture
+  stack + the engine patch: `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+## `DBSP_TEST_VERIFY_VECTORS=1`: vector verification, suite-wide - Sep 2026
+
+- Follow-up to "`x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0"
+  below. That bug was a chunk handed to the engine with stale child-vector
+  sizes, and exactly ONE test caught it — the one that armed
+  `SET GLOBAL debug_verification_mode='verify_vectors'` by hand. The other 48
+  sites with the same defect were found by grep, not by tests. This makes the
+  check standing: with `DBSP_TEST_VERIFY_VECTORS` set to anything but `""` or
+  `0`, every test binary in the suite runs under `verify_vectors`, so a new
+  stale-size site throws `"DataChunk::Verify - size mismatch"` in whichever
+  test first touches it.
+- Implementation (`test/verify_vectors.hpp` new, +89 test lines): the mode
+  lives in `DBConfigOptions::global_verification_mode`, a PROCESS-wide static
+  (`duckdb/src/main/config.cpp:28`), so `test/catch2_main.cpp` — which every
+  test binary links — arms it once before `main()`. That is what covers the
+  binaries that never construct a `DuckDBTestHarness` and open a raw
+  `DuckDB db(nullptr)` instead (all the unit tests, both crash-recovery
+  integration tests, `bench_window`). Assigning the static is what the SQL
+  setting itself does (`DebugVerificationModeSetting::SetGlobal`,
+  `custom_settings.cpp:436`), and unlike `SET GLOBAL` it needs no Connection.
+  `DuckDBTestHarness` re-arms on each database open, because the
+  `read surface: chunks satisfy VERIFY_VECTORS` case arms the mode itself and
+  its `VerifyModeGuard` resets it to `none` on the way out; that case is the
+  regression pin for the original bug and is unchanged.
+- No ctest label and no second test registration: CI runs the same suite twice,
+  `ctest` and `DBSP_TEST_VERIFY_VECTORS=1 ctest`. `test/python/*.py` are not
+  covered — they open their own connections and are not in ctest.
+- **Result of the first suite-wide run: 47/47 green, no new failures.** No
+  latent stale-size site remains — the 2.0 migration sweep had already
+  converted all 50 (`src/dbsp_extension.cpp`, `include/dbsp_plan_translator.hpp`,
+  and the one justified `SetCardinalityUnsafe` at
+  `include/dbsp_plan_tee.hpp:129`). Nothing was fixed here because nothing was
+  broken; the value is the standing gate. No new DuckDB 2.0 alpha issues
+  surfaced either.
+- The switch was proved to bite rather than assumed to, by mutation: reverting
+  `src/dbsp_extension.cpp:167` (`dbsp_track`) to the deprecated
+  `SetCardinality(1)` turns `test_extension_basic` from 10/10 green into 9/9
+  test cases failing under the switch, against 1 failing case without it (the
+  hand-armed pin). A `PROBE` build of `catch2_main.cpp` confirmed the
+  before-`main()` arm in `test_zset`, a binary with no harness: mode 1 (`NONE`)
+  unset and with `=0`, mode 2 (`VERIFY_VECTORS`) with `=1`. Both temporary
+  changes were reverted.
+- Suite timings on the release tree (`ctest -j4`, 47 entries): 67.1s plain,
+  70.2s under the switch.
+
+## Engine-hook patch rebased onto v2.0.0-alpha39998 - Sep 2026
+
+The fork's whole reason to exist is one engine patch: a transaction-commit
+callback that hands DBSP the exact rows a committing transaction changed,
+instead of DBSP re-scanning tables to work it out. That patch is now rebased
+from 1.5.4 onto the pinned alpha, as
+`patches/v2.0.0-alpha39998-dbsp-txn-callback.patch` (the 1.5.4 original is
+kept at `patches/archive/`).
+
+- **Hook points are unchanged.** `UndoBuffer::Commit`,
+  `UndoBuffer::IterateEntries` and `DuckTransaction::Commit` all still exist
+  with the same signatures, and the callback still fires between
+  `undo_buffer.Commit(...)` and the WAL flush. Four of the patch's six hunks
+  rejected on CONTEXT drift alone and were re-cut by hand: 2.0 added
+  `class CommitDropState;` to the header's forward declarations and rewrote
+  the doc comment above `UndoBuffer::Commit`, and in `duck_transaction.cpp`
+  it added five includes above the first hunk's anchor and now follows
+  `undo_buffer.Commit(...)` with a
+  `Settings::Get<DebugForceCommitFailureSetting>` check rather than the old
+  commented-out `DebugForceAbortCommit`. Both `undo_buffer.cpp` hunks —
+  including the 200-line `StreamModifications` body — applied as-is (one at
+  an offset), despite the file shrinking 428 -> 217 lines as 2.0 moved the
+  commit logic out to `commit_state.cpp`.
+- **`StreamModifications` needed two real adaptations to 2.0 layouts.**
+  1. The undo entries now carry the *catalog entry*, not the storage table:
+     `AppendInfo::table`, `DeleteInfo::table` and `UpdateInfo::table` are all
+     `DuckTableEntry *` (`transaction/append_info.hpp:17`,
+     `delete_info.hpp:18`, `update_info.hpp:31`). The storage is reached via
+     `GetStorage()` — the same idiom the engine's own `UndoBuffer::
+     GetProperties` and `IndexDataRemover::PushDelete` use. The per-table map
+     is still keyed on the `DataTable *`, so the grouping is unchanged.
+  2. A `Vector` now carries its own size, so the borrowed-buffer constructor
+     takes a count: `Vector(LogicalType, data_ptr_t, idx_t)`
+     (`common/types/vector.hpp:49`). The row-id vector handed to
+     `DataTable::Fetch` is built with the batch count.
+  Everything else survived: `DeleteInfo::base_row` is still an absolute row
+  id, `is_consecutive`/`GetRows()` are unchanged, `UpdateInfo` still exposes
+  `row_group_start`, `vector_index`, `N` and `GetTuples()`, and
+  `DataTable::Fetch`/`FetchCommitted`/`GetTypes`/`GetDataTableInfo` keep
+  their signatures.
+- **The SetCardinality law is satisfied without new code.** 2.0's
+  `RowGroupCollection::Fetch` sets the child cardinality itself
+  (`row_group_collection.cpp:519,591`), so the chunks `StreamModifications`
+  appends to its `ColumnDataCollection`s are correctly sized. The patch
+  contains no `SetCardinality` call.
+- **Semantics re-verified, not assumed.** Old images carry weight -1, new
+  images +1; a row updated then deleted in one transaction appears once, in
+  `old_rows`, with its pre-transaction image; a row inserted then deleted
+  appears nowhere. All eleven differential cases in
+  `test/unit/test_engine_hook.cpp` and all four in
+  `test/integration/test_engine_hook_consumer.cpp` pass (151 assertions), and
+  a deliberate mutation (fetching delete pre-images from the committed reader
+  instead of the transaction's snapshot) turns three of them red — the tests
+  bite.
+- **Full hook-ON ctest is green: 47/47** (the 45 hook-OFF binaries plus
+  `engine_hook` and `engine_hook_consumer`).
+- One test-side 2.0 fix: `DataTableInfo::GetTableName()` now returns an
+  `Identifier`, whose conversion to `string` is deliberately explicit
+  (`common/identifier.hpp:61`), so the test reads it via
+  `GetIdentifierName()`.
+
+**`captured_delta_syncs` is not a hook-vs-capture discriminator.** Verifying
+"the hook actually fires" by expecting that counter to stay 0 is wrong: the
+multi-table engine-hook commit path increments it too, by design and since
+`b689912`. In a hook-ON shell every tracked commit is served by the hook and
+the counter equals `commit_seq`. There is currently NO metric on
+`dbsp_stats()` that distinguishes the two paths —
+`dbsp_native::engine_hook_stats()` counts `tables_ingested`/`rows_ingested`
+but is not exposed. Proving the hook fires today means either the C++
+differential suites or a debugger breakpoint on
+`UndoBuffer::StreamModifications`.
+
+## `DROP MATERIALIZED VIEW` does not reach the extension (and never did), and a DDL test that finds it - Sep 2026
+
+`include/dbsp_parser_extension.hpp` is the extension's SQL front door, and
+NumPad's only route into it (`calcengine/engine/mvcompile` rewrites
+`CREATE VIEW` into `CREATE MATERIALIZED VIEW`). It was rewritten for 2.0's PEG
+parser — the old hook was handed the raw statement text, the new one is handed
+a token stream, so the extension now *reconstructs* the statement by joining
+token slices with single spaces — and nothing tested it.
+`test/python/test_ddl_syntax.py` now does.
+
+**What it found: `DROP MATERIALIZED VIEW` does not reach the extension — and
+never did.** DuckDB 2.0 added the statement to its OWN grammar
+(`src/parser/peg/grammar/statements/drop.gram:32`,
+`MaterializedViewEntry <- 'MATERIALIZED' 'VIEW'`), so the PEG parse
+SUCCEEDS and the core transformer throws before any parser extension is
+consulted:
+
+```cpp
+// src/parser/peg/transformer/transform_drop.cpp:34
+CatalogType PEGTransformerFactory::TransformMaterializedViewEntry(PEGTransformer &) {
+	throw NotImplementedException("Cannot drop MATERIALIZED VIEW yet");
+}
+```
+
+The parser extension only fires on a PEG *failure*, so
+`ParseDropMaterializedView` and the `drop_materialized_view` table function
+behind it are unreachable on 2.0 — including the `IF EXISTS` form.
+
+**This is NOT new in 2.0.** An earlier revision of this entry said "on 1.5.4
+both worked"; that was assumed, not measured, and it is wrong. Measured on
+the 1.5.4 stack (`build_v1.5.4/dbsp.duckdb_extension` under `duckdb==1.5.4`,
+engine `v1.5.4` / `08e34c447b`), after a successful
+`CREATE MATERIALIZED VIEW v`:
+
+```
+DROP MATERIALIZED VIEW v           -> NotImplementedException: Not implemented Error: Cannot drop this type yet
+DROP MATERIALIZED VIEW IF EXISTS v -> NotImplementedException: Not implemented Error: Cannot drop this type yet
+SELECT dbsp_drop_view('v')         -> [('Dropped',)]
+```
+
+So DuckDB has owned this statement since at least 1.5.4 and the function form
+has always been the only working route — `docs/API.md` has said exactly that
+since 2026-07-05. What 2.0 changed is the mechanism (its own grammar rather
+than an unhandled catalog type) and the message. `CREATE` and `REFRESH` are
+unaffected: 2.0's grammar does not claim those, so they still fall through to
+the extension.
+
+It was a live break for callers all the same:
+`calcengine/session/mv_reattach.py:166` issued
+`DROP MATERIALIZED VIEW IF EXISTS <name>` and now calls
+`dbsp_drop_view(name)` (NumPad commit `f2572bcd`); `dbsp_drop_view_cascade`
+is the cascade form. The test pins the failure deliberately — it asserts the
+`NotImplementedException` and fails the moment the behaviour changes, so
+whoever is here next re-points the callers. `ParserExtension::parser_override`
+(`duckdb/src/parser/parser.cpp:246-276`, opt-in via
+`allow_parser_override_extension`) is how the extension could reclaim the
+statement: it receives the RAW query text and runs before the PEG grammar.
+
+**What else the test pins** (all green, and reconstructed statements are
+compared against the same SQL run natively): a quoted mixed-case identifier,
+a string literal holding an escaped quote and runs of two spaces (the
+single-space join must not reach inside a token), `t.col` references
+rebuilt as `t . col`, negative literals across the `-` / `1` and `-` / `10`
+token splits,
+`--` and block comments inside the SELECT, `||` concatenation, that the view
+keeps tracking writes afterwards, that `REFRESH` reports incremental
+maintenance, that the view survives the failed `DROP`, and that a
+multi-statement input (`CREATE MATERIALIZED VIEW ...; INSERT ...`) errors
+loudly with neither statement half-applied. A mutation that upper-cases the
+rebuilt token text turns the suite red.
+
+## `x IS [NOT] NULL` silently evaluated to false on DuckDB 2.0 - Sep 2026
+
+- Found while getting the C++ suite green against the v2.0.0-alpha39998
+  engine. Any planner-frontend view whose plan contained an `IS NULL` or
+  `IS NOT NULL` — directly, or via the `NOT IN` / `NOT EXISTS`
+  decorrelation that emits one — returned an EMPTY result with no error.
+  Ten test cases across `planner_frontend` and `recursive_integration`
+  were red; the same shapes are correct on 1.5.4.
+- Root cause is a DuckDB 2.0 API-semantics change, not an alpha bug. A
+  `Vector` now carries its own size, and `DataChunk::SetCardinality` is
+  deprecated: it sets ONLY the chunk's logical count and deliberately
+  leaves every child vector at the size `Reset()` gave it (0). Most
+  executors take the count passed down the `Execute` call, so they were
+  unaffected — but `VectorOperations::IsNull`/`IsNotNull` read the *input
+  vector's* own size (`common/vector_operations/null_operations.cpp:17`,
+  `auto count = input.size();`), so they looped zero times and left the
+  boolean result buffer zeroed, i.e. `false` for every row, for both
+  polarities.
+- Fix: `RowExprEval::eval` and `BatchEvaluator::fill` (both in
+  `include/dbsp_plan_translator.hpp`) now call
+  `DataChunk::SetChildCardinality`, which stamps each child vector's size
+  via `FlatVector::SetSize` without touching the data just written.
+- The SAME defect was live at all 48 table-function output sites in
+  `src/dbsp_extension.cpp` and at `include/dbsp_plan_tee.hpp:129`; they are
+  converted in the same sweep. An earlier revision of this entry claimed
+  they were "unaffected ... DuckDB's own pipeline normalises those". That
+  claim was wrong and was based on one passing query. What actually
+  happens: every chunk those functions emitted violated the engine's own
+  invariant, and `SET GLOBAL debug_verification_mode='verify_vectors'`
+  proves it — `PipelineExecutor::FetchFromSource` throws
+  `"DataChunk::Verify - size mismatch: vector 0 (VARCHAR) has size 0 but
+  chunk has size 1"` on the FIRST `dbsp_` call. It was silent by default
+  only because `global_verification_mode` is `NONE`
+  (`duckdb/src/main/config.cpp:28`), and it produced no wrong answers in
+  the shapes reachable through `dbsp_query` only because operators above
+  the scan re-stamp sizes (`ExpressionExecutor::Execute` does
+  `result.SetChildCardinality(input->size())`,
+  `expression_executor.cpp:93`). That is luck, not a guarantee — some
+  shapes self-heal and others would not. DuckDB's own table functions were
+  all migrated (`arrow.cpp:208`, `range.cpp:381`, `repeat.cpp:46`,
+  `repeat_row.cpp:50`, `direct_file_reader.cpp:179`).
+- Regression tests: `test/integration/test_extension_basic.cpp` —
+  `read surface: chunks satisfy VERIFY_VECTORS` (runs the whole read
+  surface under `verify_vectors`; throws on the pre-fix binary) and
+  `read surface: IS [NOT] NULL over dbsp_query matches SQL`.
+- Law: on DuckDB 2.0, a hand-filled DataChunk — one handed to an
+  `ExpressionExecutor`, or one returned from a table function — must set
+  the CHILD cardinality. `SetCardinality` compiles with only a deprecation
+  warning and fails silently-wrong. Run the suite under
+  `debug_verification_mode='verify_vectors'` after any engine bump; it is
+  the only thing that makes this class of bug loud.
+
+## Planner follow-up: shapes that decline on 2.0, and paths that went dead - Sep 2026
+
+Accepted declines for this phase (a decline is never a wrong answer, and
+NumPad emits none of these). Each is pinned by a test that asserts the
+specific decline text, so accepting one later is a visible change.
+
+- `quantile_cont` / `quantile_disc`: 2.0 keeps the fraction as a second
+  aggregate child instead of erasing it into `QuantileBindData`, so the
+  translator's `children.size() == 1` gate rejects it.
+- `mode`: 2.0's binder resolves it to `arg_max`, unknown to the
+  aggregate-name switch.
+- Correlated SCALAR subquery: 2.0 decorrelates it into materialized delim
+  CTEs plus a plain `LogicalComparisonJoin` of `JoinType::SINGLE` that also
+  carries a `left/right_projection_map`. Mapping `SINGLE => LEFT` (as the
+  DELIM path does) is necessary but not sufficient — the projection-map
+  decline sits behind it. Correlated EXISTS / NOT EXISTS / IN are
+  unaffected: they decorrelate to MARK joins without projection maps.
+
+**Coverage lost, and not yet replaced.** 2.0's rewrite means several
+translator paths are no longer reached by the suite, so they are now
+untested rather than known-good. Whoever takes the follow-up should decide
+whether to keep or delete them:
+
+- `Walker::visit_delim_join` and its `SINGLE`/`MARK`/`INNER`/`LEFT` cases,
+  plus the `delim_columns_stack` bookkeeping — 2.0 emits materialized delim
+  CTEs, not `LOGICAL_DELIM_JOIN`, so this whole path is dead for freshly
+  bound plans.
+- `Walker::visit_delim_get` (`PlanOpSpec::Kind::DELIM_REF`), reachable only
+  from the above.
+- The DELIM path's `!cond.IsComparison()` guard added in Task 4.
+- The non-empty `LogicalInsert::column_index_map` branch in
+  `include/dbsp_plan_tee.hpp` (2.0 populates the map only when
+  deserializing a pre-2.0 plan).
+
+## INSERT defaults now resolve below the tee (DuckDB 2.0) - Sep 2026
+
+- Through 1.5.4 a partial INSERT column list left the mapping on
+  `LogicalInsert::column_index_map` and the PHYSICAL planner injected the
+  defaults projection ABOVE the plan tee, so the tee had to decline (it
+  would have evaluated `nextval` twice) and the commit paid a full scan.
+- DuckDB 2.0 resolves the column list and the DEFAULT expressions in the
+  BINDER, into a logical projection BELOW the insert
+  (`Binder::ResolveInputProjection`, `bind_insert.cpp:99`), and leaves
+  `column_index_map` empty on every freshly bound plan — the physical path
+  now calls that map "Deprecated: only populated by older versions"
+  (`execution/physical_plan/plan_insert.cpp:122`).
+- Consequence: partial-column INSERTs with defaults are now teed, stay
+  O(delta), and the sequence still advances exactly once. No extension
+  code change was needed; the canary
+  (`test/integration/test_engine_assumptions.cpp`) and the `plan_tee`
+  expectation were re-pinned to the new behaviour, and the tee's stale
+  comment was corrected.
+
+## View-sourced arrangement sidecars: reattach skips the __mv_ backfill scan - Aug 2026
+
+- Shared arrangements sourced on a VIEW (the probe-target side of a join)
+  used to rebuild by scanning the view's `__mv_` backing table (or its
+  decoded result) on every reattach — ~3.4s of `arr_backfill` at 60emp.
+  They now get durable `sharr_*.flat` sidecars like table-sourced ones.
+- Correctness design (extended comment at `save_checkpoint`'s sidecar
+  loop): a view has no independently verifiable content watermark, so the
+  sidecar's identity is the CHECKPOINT that wrote the view's blobs — a
+  random per-save id persisted as the `_dbsp_ckpt` kind='saveid' row in
+  the same transaction. Adoption (register-time, cold defer branch)
+  requires the source view to be pending (stash accepted: SQL fingerprint
+  match + stale-closure clean) AND the file stamp to equal the loaded
+  checkpoint's save-id. Since the id changes every save, clean files are
+  re-stamped in place (`restamp_flat_index_file`, ~24-byte header patch)
+  instead of skipped; changed arrangements delta-append (chained to the
+  un-restamped base identity) or re-fold, exactly like the table path.
+  Pending views' arrangements restamp (content unchanged by definition)
+  or are skipped when never filled — never clobbered, mirroring the
+  pending-preserve semantics for their checkpoint bytes.
+- Observability: `g_view_arr_sidecar_adopts` / `g_view_arr_sidecar_restamps`
+  / `g_arr_backfills` counters (g_* test convention).
+- Tests: `test/integration/test_view_arr_sidecars.cpp` — adopt without a
+  backfill scan + probe/write-path parity, pending-save restamp cycle,
+  stale-closure decline, stale-stamp (older save's file) rejection.
+
+## CASE + later column refs silently wrong (BatchEvaluator stale reference) - Aug 2026
+
+- Reported by NumPad's MV compiler as "a CASE expression across a table
+  LEFT-JOINed twice into the same view is silently wrong/NULL in the
+  circuit". Root cause is not self-join-specific: DuckDB's CASE executor
+  has all-one-branch fast paths that return by making the result vector a
+  REFERENCE to an input chunk column, and `BatchEvaluator` reused each
+  expression's result vector across `execute()` calls. A later batch that
+  took the mixed-branch path (`FillSwitch`) wrote the CASE results through
+  the stale pointer straight into the shared input chunk, corrupting the
+  branch's source column for every expression evaluated AFTER the CASE in
+  that batch — any plain reference to that column then returned the CASE's
+  value. Triggering sequence: one batch where every row takes the same
+  branch (e.g. LEFT-JOIN NULL pads, or a commit of same-sign rows), then a
+  mixed-branch batch. The self-join shape merely produced that sequence
+  during CREATE.
+- Fix: each `BatchEvaluator` slot now owns a `VectorCache`, and
+  `execute()` resets the slot's result vector from its cache before every
+  evaluation — a result can never retain a reference into the shared
+  chunk across calls, so no executor fast path can write through one.
+  Covers every `BatchEvaluator` consumer (MAP_EXPR/FILTER_MAP projections
+  and filters, join keys, aggregates); `RowExprEval` already built a
+  fresh result vector per call.
+- Regression tests: `test/integration/test_case_batch_eval.cpp` (ctest
+  `case_batch_eval`: the original self-join shape + the staged-commit
+  no-join shape) and `test/python/test_self_join_case.py` (differential
+  against stock DuckDB, incl. incremental follow-up commits).
+
+## Reattach realize: batched parallel fetch/decode/backfill - Aug 2026
+
+- Profiled the wfp 60emp reattach (bench_mv_authority, DBSP_TIMING):
+  the first edit's `propagate_changes` pre-pass realizes every pending
+  view in the dependent closure (141 views), and its `blob_decode` total
+  (7.9s of an 18.4s reattach) split as 1.3s per-view `_dbsp_ckpt` fetch
+  queries + 3.2s node-state decode + ~0s sink decode + 3.4s of
+  view-sourced shared-arrangement backfill scans NESTED inside the
+  realize timer (`arr_backfill` under `blob_decode` — the two headline
+  timers partially double-counted).
+- The pre-pass now walks the dependency closure first and realizes the
+  worklist as one batch (`realize_pending_views_locked`): per-view blob
+  fetch, decode (`decode_pending_stash`, extracted pure per-view helper),
+  and own-arrangement backfill run on up to 8 worker threads inside the
+  pre-pass's exclusive `view_mutex_` hold — workers touch only
+  per-view-disjoint state (each shared arrangement has exactly one source
+  view, so no two workers share one); all `pending_restore_` map mutation
+  and error escalation stays on the locking thread in a sequential
+  resolve, mirroring the level-step loop's publish discipline.
+- An IN-list batch fetch was tried and REJECTED by measurement: a
+  110-name `IN` scan of `_dbsp_ckpt` cost 2.0s where 141 per-view
+  `name =` probes cost 1.3s total (equality pushdown prunes row groups
+  before the blob column is touched; `IN` does not) — the per-view probe
+  stays, parallelized across workers.
+- Measured (60emp wfp, same machine/day): reattach 19.3s → 13.6s; cold
+  attach and steady edits unchanged. Failure behavior preserved per view
+  (fetch failure and decode failure each schedule the same full-rebuild
+  escape hatch as the sequential path).
+
+## Lazy-restore "failed to decode" flake: root-caused + fixed - Aug 2026
+
+- The intermittent "lazy-restore stash for view '...' failed to decode;
+  scheduling full rebuild" report is root-caused and now deterministic:
+  under Phase 3 (disk-backed/mv) lazy blobs a reopened view's stash holds
+  EMPTY placeholder blobs (the real bytes stay in `_dbsp_ckpt`, fetched at
+  realize time), and `save_checkpoint`'s verbatim re-save of a
+  still-pending view wrote those placeholders back — 0-byte node/sink rows
+  replaced the only copy of the real bytes. The next realize (same session
+  or any later one; watermarks still match) failed to decode and took the
+  full-rebuild escape hatch. Flaky in the app because it needed a view
+  still pending at a `dbsp_save()` and touched afterwards; correct results
+  either way (the rebuild replays committed storage), but a silent
+  full-rebuild cost.
+- Fix: a same-catalog save preserves a still-pending lazy view's existing
+  `_dbsp_ckpt` rows in place (`DELETE ... WHERE name NOT IN (pending)`
+  instead of `CREATE OR REPLACE TABLE`); a cross-catalog save fetches the
+  real bytes first, the way realize does. Non-lazy (in-RAM) stashes keep
+  the true verbatim re-save.
+- Every realize failure mode the F9 diagnostics distinguish is now pinned
+  by a deterministic test: the organic placeholder-clobber repro, a
+  `checkpointable()` flip (forced via the test-only `DBSP_TEST_CKPT_FLIP`
+  env var), a missing node blob, a rejected (corrupt) node blob, and a
+  sink-blob decode throw — each fails cleanly, schedules the rebuild
+  escape hatch, and the rebuilt view matches a continuously-live twin.
+- New `g_lazy_realize_failures` counter makes the failure site observable:
+  `record_error_best_effort` can never set `last_error_` from the realize
+  path (its callers hold `struct_mutex_` shared, so the try-lock always
+  fails and the message reaches stderr only).
+
+## Cold-attach replay: chunk-grouped join-index integration - Aug 2026
+
+- Attach profiling (create_translate / create_replay / create_replay_split
+  timers, new): a wfp cold attach is ~95% materialize, and within that
+  translate totals 0.1s while initial replay is 100% circuit apply —
+  scan/boxing and the streaming mirror are both negligible. The single
+  concentrated hotspot (~25% of the sampled window) was
+  PlanJoinNode::integrate_packed's per-row linear bucket scan: fat buckets
+  (low-cardinality keys, degenerate cross-join single bucket) made replay
+  O(rows x bucket).
+- integrate_packed now groups each delta by encoded key and merges per
+  bucket once per call: a position map over the existing bucket (weight
+  updates in place, appends deferred, zero-weight compaction at the end),
+  with the old linear merge kept for small buckets (<=16 entries).
+  Measured: materialize 49.75s -> 42.22s, attach 52.5s -> 45.1s at wfp
+  120. The remaining replay cost is spread circuit compute (window
+  apply, expression eval, join residue) with no concentrated hotspot at
+  10s-sample granularity.
+
+## Mirror-apply statement overhead + realize diagnostics (F9) - Aug 2026
+
+- mv_after_propagate keeps one persistent mirror connection with per-view
+  TEMP stage tables and cached statement STRINGS: a commit now runs
+  truncate + DELETE + INSERT (+ appender) per touched view and ONE batched
+  meta upsert per pass, instead of CREATE TEMP/DROP + built-fresh
+  statements + CREATE-IF-NOT-EXISTS + meta INSERT per view. Measured
+  (DBSP_TIMING, wfp 120): mv_apply_delta was 1.49ms mean x ~40 views =
+  ~42% of a steady edit; cached path measured 1.01ms mean (-32%).
+- Two traps found while shipping this, both reproduced then fixed:
+  - duckdb::PreparedStatement bakes data-dependent optimizations into the
+    plan: a DELETE ... USING stage prepared while the stage was EMPTY has
+    the join pruned at prepare time and silently deletes nothing forever
+    (mirror corruption: retractions stop landing). The cache therefore
+    holds statement strings, never PreparedStatements, so every execute
+    re-plans against current data.
+  - A Connection member on the manager is an instance-lifetime CYCLE
+    (Connection holds a strong DatabaseInstance ref; the instance owns the
+    manager) — DB shutdown never starts and a same-file reopen blocks
+    forever (reproduced as a suite hang). save_checkpoint releases the
+    mirror connection (every close path saves; autopersists rebuild the
+    cache lazily on the next commit).
+- restore_circuit_state / realize_pending_view now log WHICH failure mode
+  fired (checkpointable() flip, missing node blob / plan-shape drift, node
+  blob rejection, sink blob decode) for the still-unreproduced flaky
+  "lazy-restore stash failed to decode" report; mv_apply_delta gained a
+  DBSP_TIMING scope.
+
+## AggState POD/collecting split + weighted value counts (F8) - Aug 2026
+
+- AggState now keeps only the scalar accumulators inline (~48B: count,
+  isum, dsum, hsum); the collecting containers (value counts, DISTINCT
+  weights, ordered entries, MODE counts, spill handle) moved behind one
+  pointer allocated on first use. A SUM/COUNT-only aggregate previously
+  carried ~144B of empty container headers per group.
+- The MIN/MAX/MEDIAN/QUANTILE/MAD/FIRST multiset became a value->count map:
+  a weight-w row is one map node instead of w duplicate tree nodes.
+  Quantiles walk ranks weighted (total_of/ranks_of); MAD expands counts
+  only into its transient double vector. The N4 spill threshold now gates
+  on DISTINCT values (map nodes ARE the RAM footprint in this layout).
+- Checkpoint wire format unchanged: counts expand to unit values on
+  serialize and fold back on restore — old and new checkpoints stay
+  mutually readable.
+- account_state reports real per-group state (key + POD + every container
+  node) instead of a flat 96B/group estimate that undercounted
+  MIN/MAX-heavy groups 4-8x and fed the spill-mode decisions.
+- Aggregate bench throughput unchanged (~11.4ms/100k rows); the wins are
+  resident bytes per group and weighted-row/duplicate-heavy shapes.
+
+## Join probe decode micro-costs (F4/F5) - Aug 2026
+
+- decode_row rewritten: decode_values() reads straight from a byte pointer
+  into an exactly-reserved vector<Value> and the row adopts it via one
+  assign() — replacing a COW-checked ColumnVec::push_back per value, and
+  (mapped flat paths) an arena->std::string copy per bucket row.
+- All hot probe paths (SharedArrangement::probe_packed / probe_spilled /
+  probe_projected, PlanJoinNode::probe_packed / probe_local_spill) now
+  hash-seed decoded rows via hash_row_fast before they become scratch-map
+  keys — the lazy per-Value ColumnVec::hash path they previously hit on
+  first map contact is the expensive one its own docs warn about. Scratch
+  maps are reserved to the bucket size.
+- Measured (bench_planner_eval join delta, 100k probes vs 100k-row packed
+  index): 103.2ms -> 89.9ms median (~13%; 0.97 -> 1.11M rows/s).
+- NOT taken: F4's full vector-of-pairs probe scratch. The map is required
+  for projection collapse, and the non-projected paths share their return
+  type with the zero-copy live-index branch of probe_side — five consumer
+  loops would fork over a residual node-alloc-per-row cost. Revisit only
+  if a profile shows the scratch-map allocs dominating.
+
+## Lazy result_ on NativeSortView / NativeDistinctOnView - Aug 2026
+
+- Same write-only finding (and same fix) as the window view: both are
+  constructed only embedded behind EmbeddedViewNode, which propagates
+  get_delta() only, and the presentation-root ordered read path
+  (PlannedCircuitView::scan -> ordered_view_->scan) iterates sorted_rows_,
+  never result_. Their result_ Z-sets are now lazy caches rebuilt on
+  get_result(); apply_changes invalidates and clears. For a sort view with
+  a projection this removes a full UNSHARED second copy of every row; for
+  distinct-on it removes one zset entry per partition plus the per-edit
+  first-row maintenance ops.
+- Both gained direct-member account_state overrides: the base impl calls
+  get_result() (would materialize the lazy zset during RAM accounting),
+  and neither view previously accounted its real backing structure at all
+  (sorted_rows_ / partition multisets were invisible whenever their
+  payloads weren't shared with result_) — they are now counted under
+  StateBytes::other.
+- NativeLimitView deliberately unchanged: its result_ is the diff base for
+  delta computation (delta_ = new_result + (-result_)) — load-bearing, and
+  bounded at offset+limit rows anyway.
+
+## Lazy result_ on NativeWindowView - Aug 2026
+
+- The embedded window view's result_ Z-set was write-only in production:
+  EmbeddedViewNode (the only prod wrapper — verified, CircuitWrappedView is
+  never constructed) propagates get_delta() only, yet every edit paid two
+  hash-map ops per affected row to maintain result_, restore decoded every
+  cached output row to reconstruct it, and teardown destroyed a full boxed
+  copy of the view's output. result_ is now a lazy cache: apply_changes
+  invalidates (and clears, so an unread result_ holds no RAM); get_result()
+  rebuilds from partition_outputs_ on demand (tests, scan()). account_state
+  no longer routes through get_result() — the base impl would materialize
+  the lazy zset during a RAM-accounting pass.
+- Measured at 200k rows (with packed rows below, vs the boxed pre-packed
+  baseline): teardown 18.6ms -> 1.2ms, checkpoint restore 51ms -> 3.3ms
+  (both now bulk byte copies + empty result), serialize 17.0ms -> 7.7ms.
+  Fast path unchanged (~5-7us, flat across partition sizes).
+
+## Packed window partition rows - Aug 2026
+
+- NativeWindowView partition state (ordered source rows + rendered-output
+  cache) moved off boxed vector<DuckDBRow> onto WindowRowStore
+  (dbsp_window_rows.hpp): one packed byte arena + positional slot directory
+  per store, reusing the join-index row codec. Binary searches compare sort
+  columns straight from packed bytes (typed fast lanes, NaN follows DuckDB
+  total order); render paths memoize decodes via WindowRowsView (sparse for
+  O(affected) fast paths, dense for full re-renders); overwrites append with
+  ratio-gated arena compaction. Rows the codec can't represent flip that
+  store to boxed transparently — correctness never depends on coverage.
+- Measured at 200k rows (500 partitions x 400, LAG): accounted window state
+  62.4MB -> 20.5MB, checkpoint serialize 17.0ms -> 6.4ms, restore 51ms ->
+  42ms, teardown 18.6ms -> 11.8ms (residual teardown/restore = the boxed
+  result_ Z-set, shared with every view type). Single-update fast path
+  stays flat and within noise of boxed (6.2us @1k, 4.5us @100k vs 8.5/4.1).
+- Window checkpoint blobs now write a packed layout (in-blob
+  kWindowPackedMagic; slot lens + concatenated row bytes, bulk copy both
+  directions). Legacy row-by-row blobs restore unchanged (re-encoded on
+  push); a store on the boxed fallback still writes the legacy layout. An
+  old reader hitting a packed blob fails restore -> rebuild-by-replay, the
+  standard degradation.
+
+## Checkpoint-watermark cache + serialize scratch reuse - Aug 2026
+
+- save_checkpoint skips the O(rows) COUNT+bit_xor(hash) scan for tracked
+  tables whose content is unchanged since their last scan. TrackedTable
+  re-dirties on every mutation (insert/remove/update/apply_delta/
+  begin_rebuild); wm_begin_scan()'s exchange means a write racing the scan
+  re-dirties for the NEXT save, so a stale cache can only produce a
+  load-side watermark mismatch (safe rebuild), never a wrong adopt.
+  Benefits long-session periodic autopersists (typical: 1-3 of 25 tables
+  dirty per interval); a session's FIRST save still scans everything, so
+  single-save closes are unchanged.
+- serialize_row is a template over any indexable Value container;
+  BlobWriter::row serializes straight from ColumnVec into member scratch
+  buffers (was: a vector<Value> copy + two heap allocations per row).
+  Measured neutral on ckpt_serialize at wfp scale — the remaining 5-6s is
+  not per-row allocation; profiling it is an open item.
+
+## Hot-path micro-costs + mapped-index serialize fix - Aug 2026
+
+- FlatWeightMap::clear() releases its slot vector + open-addressing index
+  when capacity exceeds 64k entries (was: capacity retained forever, so
+  every node's transient output buffer pinned its PEAK delta footprint —
+  one initial-population fan left ~40B/slot resident per node for the
+  view's lifetime). Small maps keep capacity; steady 1-cell edits still
+  never realloc. Note the old trim_outputs comment's "11.4GB reclaimed"
+  was the row PAYLOADS (Slot destructors); the backing arrays were not
+  reclaimed until this change.
+- Fix (latent data-loss class): PlanJoinNode::probe_packed and its
+  serialize_state write_pindex read the flat index through the
+  mapped-aware accessors (dir_size/dir_at/bucket_at/arena_data) instead
+  of the owned vectors, which are EMPTY for an mmap-adopted sidecar —
+  a mapped join index would have probed nothing and checkpointed as an
+  empty index. Not reachable today (join flats are only built from owned
+  reads) but one adopt-path change away from silent data loss.
+- classify() short-circuits unambiguous SELECT/EXPLAIN heads before
+  constructing a Parser: with auto-sync on, every statement paid a full
+  ParseQuery — read-heavy workloads parsed each SELECT twice. "WITH"
+  deliberately still parses (data-modifying CTEs); PRAGMA still parses.
+- integrate_packed's per-row std::getenv("DBSP_PACKED_DEBUG") is a
+  static; SharedArrangement::apply hoists its two encode scratch strings
+  out of the per-row loop (2 malloc/free per delta row); DbspScopeTimer
+  skips the clock read and drops the detail string in its ctor when
+  timing is off (call sites build "name rows=N" strings per view per
+  commit purely for the timer).
+
+## First-edit page-in + bulk-ingest: measured, bounded, documented - Aug 2026
+
+- 144M first-edit-after-reopen (176s one-time, cold page cache):
+  MADV_WILLNEED prefetch at adopt was tried and REVERTED with data —
+  macOS executes it aggressively enough that every attach paid ~10s and
+  steady edits regressed 7s -> 15s (prefetch competing with the very
+  faults it should soften). The one-time cold cost stands as the better
+  trade: attach 0.7-0.8s, steady edits ~7s, saves 0.2s at 144M.
+- Bulk single-statement UPDATE (360k rows, 10.2s at 18M): engine-visible
+  stages account for ~1.25s (apply 0.75s, circuit 0.5s); an
+  `engine_ingest` timer now instruments the hook's boxing for when that
+  path delivers. Non-product shape; further chasing parked.
+
+## Streaming construction: 144M create measured complete - Aug 2026
+
+- With streaming scans/backfills (no build maps), the 144M leafjoin
+  create COMPLETES in 10min13s with a 4.4GB end footprint (the 22GB
+  transient peak is DuckDB's own uncapped buffer pool on the create
+  connection). Reopen attach 0.7-2s; dirty save 0.19-0.39s; clean save
+  0.17s. Known one-time cost: the first edit after the first reopen
+  pages in ~11GB of mapped indexes (~3min); subsequent edits ~6s at
+  144M. Prior attempts died at 9h/39GB (map era) and 22GB-climbing
+  (fold era).
+
+## Memory-mapped shared-arrangement arenas - Aug 2026
+
+- FlatPackedIndex gains a MAPPED mode behind read accessors
+  (dir_at/bucket_at/arena_data): the v2 sidecar file (sections 8-byte
+  aligned; v1 rejected — one backfill on first reopen after upgrade)
+  mmaps read-only and the arena-class bytes become reclaimable page
+  cache instead of process-resident vectors. Move-only (owns fd +
+  mapping); build paths keep owned vectors.
+- Wiring: create writes the v2 sidecar at backfill completion
+  (commit-stable inside CREATE VIEW) and re-points `flat` at the
+  mapping — the FIRST SAVE then skips the arrangement entirely; reopen
+  adopt maps instead of copying.
+- Measured 18M create end: footprint 4513 (pre-fold) / 2708 (folded) ->
+  1581MB mapped; accounted arrangement state 1475 -> 179MB; first save
+  11.7s -> 0.0s; reopen attach 0.12s with parity exact through
+  create-edit-save-reopen-edit. Battery PASS, ctest 44/44.
+
+## Tier-2 formats on the create path - Aug 2026
+
+- Checkpointable-mode create held its working state in mutable maps until
+  the first save folded them: 39GB footprint at 144M (measured, killed).
+  Baselines now fold+self-adopt into the mmap'd digest sidecar right
+  after their commit-stable initial scan (fold_fresh_baseline), and
+  shared arrangements fold their bucket maps into the flat arena at
+  backfill completion (compact_to_flat) — the same two-layer shape a
+  sidecar adopt produces, built locally.
+- Interplay: enable_spill migrates the merged flat+overlay view (K2 live
+  migration previously walked only the maps); the sidecar save writes a
+  base file for locally folded flats (the old skip assumed flat implies
+  file) and records any full write as a delta-chain base.
+- Measured 18M create end: footprint 4513 -> 2708MB (-40%), parity exact,
+  save 3.1s (folds no longer in it). Projected 144M: ~39GB -> ~14-16GB;
+  remaining resident class is the arrangement arena (~12GB at 144M) —
+  next increment if needed: write+mmap its sidecar at compact time.
+
+## NTH_VALUE frame-relative + recursive-step shape guard - Aug 2026
+
+- NTH_VALUE: both render call sites (dbsp_window_view.hpp) indexed the
+  nth row of the whole PARTITION, ignoring frame bounds — wrong for the
+  default frame (rows before the nth must be NULL) and for explicit ROWS
+  frames. Now frame-relative (same boundary math as LAST_VALUE); the
+  deliberately narrow bare_constant_int gate is lifted (constant_int,
+  cast-tolerant) per the recorded plan "fix render first, then widen".
+  Regression: test/python/test_nth_value_frames.py (default frame,
+  sliding ROWS frame, unbounded frame, through inserts and a delete, vs
+  stock DuckDB truth); integration test updated from "stays gated" to
+  "accepted and frame-relative".
+- Recursive steps containing row-collapsing operators (DISTINCT /
+  GROUP BY / window / non-UNION-ALL set ops) were ACCEPTED and silently
+  wrong on every execution path (the fixpoint iterates frontiers, not
+  SQL's per-iteration working table). The planner frontend now rejects
+  them loudly at CREATE (reusing scan_step_linearity); LIMIT is already
+  a stock parse error inside recursion. Hosts no longer need their own
+  guard (NuEPM's assert_step_linear stays as defense in depth).
+  Regression: test/python/test_recursive_step_guard.py (linear recursion
+  still works incrementally; DISTINCT/GROUP BY/LIMIT steps reject).
+
+## Statement-less commits stop triggering full scans (engine-hook mode) - Aug 2026
+
+- Fresh connections fire implicit setup/teardown commits that never ran a
+  classified statement (stmt NONE, nothing captured). The pre-H1 safety
+  net treated them as "writes we could not attribute" and ran sync_all —
+  a full scan-diff of every tracked table, 1-2x nondeterministically per
+  session (thread/WAL timing). With the engine hook proven live
+  (first-delivery latch), such a commit provably wrote nothing: every
+  tuple write is delivered by the patched engine's commit callback, and
+  DDL is statement-shaped (classifies WRITE_UNKNOWN, still syncs). The
+  fallback now returns early in that exact signature; stock builds keep
+  the pessimistic net (Appender writes are invisible without the patch).
+- Residual (documented): strays BEFORE the first tracked-table delivery
+  (e.g. during initial model create, where inserts precede tracking)
+  still scan — one-time create-phase cost; adopted state survives them
+  via the empty-diff rebuild discard.
+- Diagnostics: DBSP_DEBUG_SYNC now attributes fallback syncs (thread,
+  context, tracked-table count, last classified query) and save_index
+  branch decisions.
+
+## Delta-append sidecars: dirty save O(changed rows) - Aug 2026
+
+- A dirty dbsp_save folded and rewrote every durable sidecar wholesale —
+  the baseline digest index (fold+sort+write of all entries) and each
+  shared-arrangement fingerprint file (fold_packed of flat+overlay).
+  Measured at 18M rows: 7.1-7.8s dirty, 3.4s "clean" (the skip only held
+  until the first dirty save). Now 0.03s for both:
+  - Digest index: with an adopted base and a small overlay (<10% of the
+    base), save writes ONLY the overlay as `.idx.d` (sorted, watermark-
+    stamped, chained to the base by its watermark + entry count + live
+    log size). Adopt loads base mmap + delta into the overlay. A big
+    overlay compacts: full fold, delta deleted, and the just-written
+    file is SELF-ADOPTED (fresh mmap, cleared overlay) so later saves
+    skip or write small deltas.
+  - Arrangement sidecars: replacement buckets for the keys touched since
+    adopt (`fold_packed_touched`, O(touched)) written as `<sharr>.d`,
+    chained to the base by the register-time watermark; the loader diffs
+    them back into the packed overlay. Non-adopted (backfill-built)
+    arrangements keep the full fold.
+  - Clean-skip fixed both places: every successful save records the
+    watermark it saved under; a same-watermark save writes nothing.
+- `end_rebuild` with an EMPTY diff now discards the rebuild instead of
+  swapping: a no-change sync is a no-op on state. The swap used to
+  rewrite the log and silently destroy the adopted flat layer, the
+  saved-watermark skip, and any delta chain — triggered nondeterministically
+  by unattributable commits (stmt-less, e.g. WAL-checkpoint timing)
+  falling back to sync_all. OPEN follow-up: root-cause that stray
+  commit classification; its full scan cost remains.
+- Regression: test/python/test_delta_append_sidecars.py (bases untouched
+  by dirty save, delta files appear, delta-chain reopen exact, clean-save
+  writes nothing, compaction folds and reopens exact).
+
+## Notify rows cast to tracked schema types - Aug 2026
+
+- `dbsp_notify_insert/delete` passed raw argument Values into the delta:
+  a literal like `5000.0` parses as DECIMAL(5,1), not the column's
+  DOUBLE. Packed arrangements/join indexes encode by schema type and
+  threw "unencodable row" (test_checkpoint_restore /
+  test_quack_checkpoint); even boxed, a differently-typed row would not
+  cancel its baseline twin. Notify rows are now cast to the tracked
+  table's column types (`CDCManager::tracked_column_types` + notify-side
+  `CastNotifyRow`); arity mismatches and failed casts throw. Untracked
+  tables pass through unchanged.
+
+## Multi-table commit = one circuit pass - Aug 2026
+
+- A transaction writing several tracked tables used to propagate once per
+  table at COMMIT. Each pass rewrote every downstream view's
+  single-generation dbsp_changes buffer — a view reading BOTH tables kept
+  only the last table's effects for dbsp_changes consumers — and a join
+  both of whose sides changed in one commit missed its −Δl⋈Δr
+  both-shared correction. All three commit paths now collect every
+  table's delta first and run ONE propagation pass:
+  - engine-hook fast path: `CDCManager::apply_captured_deltas` (new)
+    applies every baseline then propagates once; failed tables still fall
+    to the scan path per table.
+  - write-capture fast path (`apply_captured`): merged per-table deltas
+    go through the same `apply_captured_deltas`.
+  - scan fallback (`sync_tables`): scans/consumes every table first, then
+    one `propagate_changes_multi` pass.
+- `propagate_changes_multi(sources)` generalizes `propagate_changes` (now
+  a delegating wrapper): pending map seeded with all sources, arrangements
+  updated for each source before any view steps, levels built over the
+  union topo order (`DependencyGraph::topological_order(vector)` — new
+  overload). One commit_seq_ bump per pass, so every stepped view shares
+  the pass's delta generation.
+- Regression: test/python/test_multi_table_commit.py (two-table commit;
+  per-source views, a both-tables view, both-sides join insert, shared
+  generation stamp).
 
 ## Bounded-RAM Phase 2d increment 2: packed shared arrangements - Aug 2026
 

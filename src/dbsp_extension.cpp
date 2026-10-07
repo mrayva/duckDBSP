@@ -32,6 +32,35 @@
 //   -- View dependencies
 //   SELECT * FROM dbsp_deps('view_name');
 //   SELECT dbsp_drop_cascade('view_name'); -- Drop view and dependents
+//
+// ---------------------------------------------------------------------------
+// Table-function output chunks: ALWAYS finish a scan callback with
+// output.SetChildCardinality(n), never SetCardinality(n).
+//
+// On DuckDB 2.0 a Vector carries its own size. DataChunk::SetCardinality is
+// deprecated and sets ONLY the chunk's logical count -- it deliberately leaves
+// every child vector at the size Reset() gave it (0), and
+// StandardVectorBuffer::SetValue does not grow it either
+// (duckdb/src/common/vector/flat_vector.cpp:279). The result is a chunk whose
+// size() says n while every column says 0. That is an invariant violation the
+// engine checks for: with debug_verification_mode='verify_vectors',
+// PipelineExecutor::FetchFromSource throws
+//   "DataChunk::Verify - size mismatch: vector 0 (VARCHAR) has size 0 but
+//    chunk has size 1"
+// on the first DBSP table function called. It is silent by default only
+// because global_verification_mode is NONE (duckdb/src/main/config.cpp:28).
+// Operators above the scan mostly self-heal (ExpressionExecutor::Execute
+// restamps a result from input->size(), expression_executor.cpp:93), which is
+// why this produced no wrong answers in practice -- but it is the same
+// mechanism that made every `x IS [NOT] NULL` false in the planner frontend
+// (see CHANGELOG), and DuckDB's own table functions were all migrated to
+// SetChildCardinality (arrow.cpp:208, range.cpp:381, repeat.cpp:46,
+// repeat_row.cpp:50, direct_file_reader.cpp:179).
+//
+// The rule is uniform, including the "emit nothing" n == 0 early returns:
+// SetCardinalityUnsafe(0) would be correct only for as long as nothing above
+// it writes a row, and that is not a property worth re-deriving per site.
+// ---------------------------------------------------------------------------
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
@@ -49,11 +78,10 @@
 #include "dbsp_context_state.hpp"
 #include "dbsp_instance_registry.hpp"
 #include "dbsp_parser_extension.hpp"
-#include "dbsp_engine_hook.hpp"
-#ifndef DBSP_TIP_PORT
-#include "dbsp_plan_tee.hpp"
-#endif
 #include "dbsp_recovery.hpp"
+
+#include "duckdb/main/settings.hpp"
+#include "dbsp_trigger_source.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 
@@ -111,7 +139,7 @@ unique_ptr<FunctionData> TrackBind(ClientContext &context,
   data->table_name = input.inputs[0].GetValue<string>();
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -124,7 +152,37 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  // Which key this call would ADD, read before the call because track_table is
+  // idempotent. A rollback must only drop tracking intent that this
+  // transaction actually created (see DBSPContextState::TransactionRollback).
+  //
+  // Resolved explicitly rather than through CanonicalTableRef: that helper
+  // passes an UNRESOLVABLE reference through unchanged, and a raw parse-time
+  // string is never a tracked key — the rollback's untrack_table would then be
+  // a silent no-op against a name nothing holds. No resolution, no
+  // bookkeeping; track_table below reports the "not found" error itself.
+  string newly_tracked;
+  if (auto entry = dbsp_native::resolve_table_entry(context, data.table_name)) {
+    const string key = dbsp_native::canonical_table_key(*entry);
+    // Storage-version precheck, BEFORE the table joins the tracked set. The
+    // triggers are installed by a LATER statement's sweep, so without this a
+    // dbsp_track on a pre-v2.0.0 database SUCCEEDED and every statement after
+    // it — reads included — threw the engine's CREATE TRIGGER refusal, with
+    // the table left tracked and the connection effectively wedged.
+    dbsp_native::require_trigger_capable_catalog(context, key);
+    if (!manager.is_table_tracked(key)) {
+      newly_tracked = key;
+    }
+  }
   bool ok = manager.track_table(context, data.table_name);
+
+  if (ok && !newly_tracked.empty()) {
+    auto state = context.registered_state->Get<dbsp_native::DBSPContextState>(
+        "dbsp_cdc_state");
+    if (state) {
+      state->note_table_tracked(newly_tracked);
+    }
+  }
 
   if (!ok) {
     std::string formatted_error = manager.last_error();
@@ -137,7 +195,7 @@ void TrackFunc(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException(formatted_error);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto schema = manager.get_table_schema(data.table_name);
   string cols =
       schema ? std::to_string(schema->columns.size()) + " columns" : "";
@@ -193,7 +251,7 @@ unique_ptr<FunctionData> CreateViewBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -265,7 +323,7 @@ void CreateViewFunc(ClientContext &context, TableFunctionInput &input,
     result = "Created " + type + " view: " + data.view_name;
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(result));
   data.done = true;
 }
@@ -294,26 +352,44 @@ unique_ptr<FunctionData> NotifyBind(ClientContext &context,
         "dbsp_notify_insert/delete(table, val1, val2, ...)");
   }
 
-  data->table_name = CanonicalTableRef(
-      context, input.inputs[0].GetValue<string>());
+  data->table_name = input.inputs[0].GetValue<string>();
 
-  // Manual notifications arrive through ANY arguments, so their runtime
-  // types are often wider than the tracked table (e.g. DOUBLE for a
-  // DECIMAL column). Normalize them to the table schema before hashing and
-  // propagating; CDC rows must have the same logical types as scanned rows.
-  const auto *schema =
-      dbsp_native::get_cdc_manager(context).get_table_schema(data->table_name);
+  // Convert values to DuckDBRow
   for (idx_t i = 1; i < input.inputs.size(); i++) {
-    auto value = input.inputs[i];
-    if (schema && i - 1 < schema->columns.size()) {
-      value = value.DefaultCastAs(schema->columns[i - 1].type);
-    }
-    data->row.columns.push_back(std::move(value));
+    data->row.columns.push_back(input.inputs[i]);
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
+}
+
+// Cast a notify row to the tracked table's schema types. Literal arguments
+// keep their parsed types (5000.0 is DECIMAL(5,1), not DOUBLE) and every
+// downstream consumer — packed arrangements/join indexes above all — expects
+// schema-typed rows; a differently-typed row also would not cancel its
+// baseline twin. Untracked tables pass through (on_insert/on_delete no-op).
+// A failed cast or arity mismatch throws (loud beats a silently wrong delta).
+static dbsp_native::DuckDBRow CastNotifyRow(dbsp_native::CDCManager &manager,
+                                            const string &canonical_name,
+                                            const dbsp_native::DuckDBRow &row) {
+  auto types = manager.tracked_column_types(canonical_name);
+  if (types.empty()) {
+    return row;
+  }
+  if (types.size() != row.columns.size()) {
+    throw InvalidInputException(
+        "dbsp_notify: table %s has %llu columns, got %llu values",
+        canonical_name, (unsigned long long)types.size(),
+        (unsigned long long)row.columns.size());
+  }
+  dbsp_native::DuckDBRow cast = row;
+  for (idx_t i = 0; i < types.size(); i++) {
+    if (cast.columns[i].type() != types[i]) {
+      cast.columns[i] = cast.columns[i].DefaultCastAs(types[i]);
+    }
+  }
+  return cast;
 }
 
 void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
@@ -324,10 +400,11 @@ void NotifyInsertFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_insert(CanonicalTableRef(context, data.table_name), data.row,
+  const string canonical = CanonicalTableRef(context, data.table_name);
+  manager.on_insert(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value("Notified insert into " + data.table_name));
   data.done = true;
 }
@@ -340,10 +417,11 @@ void NotifyDeleteFunc(ClientContext &context, TableFunctionInput &input,
     return;
 
   auto &manager = dbsp_native::get_cdc_manager(context);
-  manager.on_delete(CanonicalTableRef(context, data.table_name), data.row,
+  const string canonical = CanonicalTableRef(context, data.table_name);
+  manager.on_delete(canonical, CastNotifyRow(manager, canonical, data.row),
                     &context);
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value("Notified delete from " + data.table_name));
   data.done = true;
 }
@@ -374,7 +452,7 @@ unique_ptr<FunctionData> SyncBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -388,18 +466,167 @@ void SyncFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
 
+  // What `dbsp_sync()` could NOT do, said out loud.
+  //
+  // A sync run INSIDE a transaction cannot establish a baseline: its scan
+  // opens its own connection and cannot see that transaction's uncommitted
+  // rows, so a view built on what it read would be short by exactly them.
+  // CDCManager::retire_scanned_baseline refuses to establish there — and a
+  // call that refuses must not report the same "Synced" as one that worked,
+  // or the caller reads the success and then reads a refusal.
+  //
+  // A scan that did not RUN leaves the same debt standing, so the note names
+  // both causes rather than blaming an open transaction it cannot check.
+  const auto owed_note = [&](const std::vector<std::string> &owed) {
+    if (owed.empty()) {
+      return std::string();
+    }
+    std::string names;
+    for (size_t i = 0; i < owed.size() && i < 3; i++) {
+      names += (i == 0 ? "" : ", ") + owed[i];
+    }
+    if (owed.size() > 3) {
+      names += ", …";
+    }
+    return "; " + std::to_string(owed.size()) +
+           " baseline(s) still owed a seeding scan (" + names +
+           ") — either a transaction is open, and a scan taken there cannot "
+           "establish one (COMMIT or ROLLBACK, then sync or read again), or "
+           "the scan did not run, which dbsp_stats() reports as "
+           "reconcile_failures / last_reconcile_error";
+  };
+
   if (data.sync_all) {
-    manager.sync_all(context);
-    output.SetCardinality(1);
-    output.SetValue(0, 0, Value("Synced all tracked tables"));
+    // WHITELISTED. dbsp_sync() is USER-INVOKED: the caller asked for a
+    // reconcile against committed storage, so committed storage is what it
+    // should read.
+    manager.sync_all(context, nullptr,
+                     dbsp_native::InternalReadPolicy::AllowedInTxn,
+                     "dbsp_sync()");
+    output.SetChildCardinality(1);
+    output.SetValue(0, 0,
+                    Value("Synced all tracked tables" +
+                          owed_note(manager.unestablished_baselines())));
   } else {
-    bool ok = manager.sync_table(context, CanonicalTableRef(context, data.table_name));
-    output.SetCardinality(1);
-    output.SetValue(
-        0, 0, Value(ok ? "Synced: " + data.table_name : "Failed to sync"));
+    const std::string key = CanonicalTableRef(context, data.table_name);
+    bool ok = manager.sync_table(context, key);
+    std::string msg =
+        ok ? "Synced: " + data.table_name : std::string("Failed to sync");
+    if (ok && !manager.baseline_established(key)) {
+      msg += owed_note({key});
+    }
+    output.SetChildCardinality(1);
+    output.SetValue(0, 0, Value(msg));
   }
   manager.maybe_save_checkpoint(context);
   data.done = true;
+}
+
+// A read surface must not serve a view whose answer may be wrong. Two ways
+// that happens, and this gate asks about both.
+//
+// UNSEEDED. Seeding is DEFERRED while a user transaction is open — the seeding
+// scan runs on an internal connection and cannot see that transaction's own
+// rows — so between `BEGIN; dbsp_create_view(...)` and that transaction's end
+// the view holds the empty answer. Measured before this gate: `dbsp_query`
+// returned NULL where plain SQL read 10.0, on the deferring connection and on
+// every other connection of the instance, on :memory: and on a file.
+//
+// PROVISIONAL. The baseline was seeded correctly and may still be short by
+// what a concurrently open transaction had written before the table was
+// tracked. The repair runs from the COMMIT hook, which fires AFTER the bind
+// that serves a read — so the FIRST read after the deferring transaction
+// committed, with no statement in between, was served from the short baseline:
+// measured `view 10.0 / sql 13.0` on both backends, the next read returning
+// 13.0. Transient, no error, wrong.
+//
+// A block is REPAIRABLE once the transaction it is waiting on has ended: one
+// scan of committed storage is then exactly what the baseline is missing, and
+// `reconcile_untrusted_baselines` takes it and retires the state. The repair is
+// only legal when the READER holds no transaction of its own — the scan opens
+// an internal connection, and running it inside the reader's transaction is the
+// very read that produces a wrong baseline. In autocommit (every ordinary
+// `SELECT * FROM dbsp_query(...)`) it is legal, which is why the first read
+// after the window answers correctly instead of refusing.
+//
+// A block whose readiness watermark has NOT cleared is not repairable here: the
+// rows that are missing live in another connection's UNCOMMITTED transaction,
+// so no scan can find them. It refuses, and so does any block the repair could
+// not clear — the reader is inside its own transaction, or the scan failed.
+//
+// `dbsp_view_state()` is not gated. It takes no view argument — it reports
+// row counts for every registered view — so there is no view for this gate to
+// ask about, and its numbers are diagnostics: a diagnostic that refuses while
+// the state is broken is useless exactly when it is needed.
+static void EnsureViewReadable(ClientContext &context,
+                               dbsp_native::CDCManager &manager,
+                               const string &fn, const string &view_name) {
+  using Baseline = dbsp_native::TrackedTable::Baseline;
+  auto block = manager.view_read_block(view_name);
+  if (block.state == Baseline::Seeded) {
+    return;
+  }
+  if (!dbsp_native::user_transaction_open(context)) {
+    // The reader holds no transaction of its own, so the scan is legal here.
+    // The sweep only takes tables whose readiness watermark has CLEARED, so a
+    // baseline whose deferring or seeding transaction is still alive is left
+    // alone and this read still refuses — it cannot establish a baseline that
+    // an open transaction would have changed.
+    manager.reconcile_untrusted_baselines(
+        context, dbsp_native::InternalReadPolicy::Forbidden,
+        "baseline reconcile at read");
+    block = manager.view_read_block(view_name);
+    if (block.state == Baseline::Seeded) {
+      return;
+    }
+  }
+  if (block.state == Baseline::Deferred) {
+    // Three different reasons nothing has established it yet, and they call
+    // for different remedies — say the one that applies (ViewReadBlock
+    // carries the taint of the blocking table; the older-open check is read
+    // live because that state moves under every commit).
+    const string why =
+        block.pre_trigger_rows
+            ? "That transaction may be on ANOTHER connection, and it had "
+              "already changed the table when it was tracked: nothing else can "
+              "report those changes, so no scan taken while it is open — "
+              "dbsp_sync() included — can establish the baseline. "
+            : !manager.untainted_establish_allowed(context, block.table)
+              ? "Another connection still holds a transaction open that is "
+                "older than this read: it may hold writes the table did not "
+                "have triggers for yet, so no scan taken while it is open — "
+                "dbsp_sync() included — can establish the baseline. "
+              : "That transaction is this connection's own, or no scan has run "
+                "since: another connection's scan (a dbsp_sync(), or any commit "
+                "there) can establish it, and so can the deferring transaction's "
+                "own COMMIT or ROLLBACK. ";
+    throw InvalidInputException(
+        fn + "('" + view_name + "'): source table '" + block.table +
+        "' has an UNSEEDED baseline — its seeding scan was DEFERRED because a "
+        "transaction was open when the view was created, and no scan since has "
+        "been able to establish it. " +
+        why +
+        "Reading now would return the unseeded (empty) answer, not the "
+        "table's content. End that transaction (COMMIT or ROLLBACK) and read "
+        "again.");
+  }
+  if (block.state == Baseline::Unseeded) {
+    throw InvalidInputException(
+        fn + "('" + view_name + "'): source table '" + block.table +
+        "' has an UNSEEDED baseline — nothing has scanned it. dbsp_track() "
+        "leaves a baseline empty by design and expects a dbsp_sync(). Reading "
+        "now would return the unseeded (empty) answer, not the table's "
+        "content. Run dbsp_sync() with no transaction open, and read again.");
+  }
+  throw InvalidInputException(
+      fn + "('" + view_name + "'): source table '" + block.table +
+      "' has a PROVISIONAL baseline — it was seeded while another connection "
+      "held a transaction open, and that transaction may already have written "
+      "the table before it was tracked. Those rows are not in committed "
+      "storage yet, so no scan can recover them and this view may be short by "
+      "them. It clears once every transaction that was open at seed time has "
+      "ended; `SELECT * FROM dbsp_stats()` reports the count as "
+      "`provisional_tables`.");
 }
 
 // ============================================================================
@@ -429,6 +656,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  EnsureViewReadable(context, manager, "dbsp_query", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   // Collect rows via scan_view: holds the read locks for the whole
@@ -451,7 +679,7 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.emplace_back(col.name);
+      names.push_back(Identifier(col.name));
     }
     data->types = return_types;
   } else if (!data->rows.empty()) {
@@ -459,12 +687,12 @@ unique_ptr<FunctionData> QueryBind(ClientContext &context,
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.emplace_back("col" + std::to_string(i));
+      names.push_back(Identifier("col" + std::to_string(i)));
     }
     data->types = return_types;
   } else {
     return_types.push_back(LogicalType::VARCHAR);
-    names.emplace_back("result");
+    names.push_back("result");
   }
 
   return std::move(data);
@@ -487,7 +715,7 @@ void QueryFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -520,6 +748,7 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   manager.maybe_autoload(context);
+  EnsureViewReadable(context, manager, "dbsp_changes", data->view_name);
   const auto *schema = manager.get_view_schema(data->view_name);
 
   bool found = manager.scan_view_delta(
@@ -535,17 +764,17 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context,
   if (schema && !schema->columns.empty()) {
     for (const auto &col : schema->columns) {
       return_types.push_back(col.type);
-      names.emplace_back(col.name);
+      names.push_back(Identifier(col.name));
     }
   } else if (!data->rows.empty()) {
     const auto &first = data->rows[0];
     for (size_t i = 0; i < first.columns.size(); i++) {
       return_types.push_back(first.columns[i].type());
-      names.emplace_back("col" + std::to_string(i));
+      names.push_back(Identifier("col" + std::to_string(i)));
     }
   }
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("weight");
+  names.push_back("weight");
 
   return std::move(data);
 }
@@ -566,7 +795,7 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -575,7 +804,8 @@ void ChangesFunc(ClientContext &context, TableFunctionInput &input,
 // Enabling backfills a __mv_ table per registered view and keeps them in
 // sync per commit (one internal transaction per propagation pass, plus a
 // __dbsp_mv_meta watermark row per view). Disabling stops mirroring and
-// leaves the tables as-is (stale until re-enabled).
+// leaves the tables as-is (stale until re-enabled), and the disable is STICKY
+// — see CDCManager::mv_tables_user_disabled_.
 // ============================================================================
 
 struct MvTablesBindData : public TableFunctionData {
@@ -602,7 +832,7 @@ unique_ptr<FunctionData> MvTablesBind(ClientContext &context,
                                 manager.last_error());
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -610,11 +840,11 @@ void MvTablesFunc(ClientContext &context, TableFunctionInput &input,
                   DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<MvTablesBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value(data.message));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -655,9 +885,9 @@ unique_ptr<FunctionData> RealizeBind(ClientContext &context,
     data->state_bytes = static_cast<int64_t>(b.total());
   });
   return_types.push_back(LogicalType::BOOLEAN);
-  names.emplace_back("realized");
+  names.push_back("realized");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("state_bytes");
+  names.push_back("state_bytes");
   return std::move(data);
 }
 
@@ -665,12 +895,12 @@ void RealizeFunc(ClientContext &context, TableFunctionInput &input,
                  DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<RealizeBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value::BOOLEAN(data.was_pending));
   output.SetValue(1, 0, Value::BIGINT(data.state_bytes));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -697,7 +927,7 @@ unique_ptr<FunctionData> WaitTeardownBind(ClientContext &context,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -705,11 +935,11 @@ void WaitTeardownFunc(ClientContext &context, TableFunctionInput &input,
                       DataChunk &output) {
   auto &data = input.bind_data->CastNoConst<WaitTeardownBindData>();
   if (data.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
   output.SetValue(0, 0, Value(data.message));
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   data.done = true;
 }
 
@@ -746,12 +976,12 @@ unique_ptr<FunctionData> ViewStateBind(ClientContext &context,
       });
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("view_name");
+  names.push_back("view_name");
   for (const char *col :
        {"result_bytes", "arrangement_bytes", "window_bytes",
         "recursion_bytes", "other_bytes", "total_bytes"}) {
     return_types.push_back(LogicalType::BIGINT);
-    names.emplace_back(col);
+    names.push_back(col);
   }
   return std::move(data);
 }
@@ -773,7 +1003,7 @@ void ViewStateFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -810,13 +1040,13 @@ unique_ptr<FunctionData> TableStateBind(ClientContext &context,
           int64_t bytes) { data->rows.push_back({name, mode, rows, bytes}); });
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("table_name");
+  names.push_back("table_name");
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("mode");
+  names.push_back("mode");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("distinct_rows");
+  names.push_back("distinct_rows");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("resident_bytes");
+  names.push_back("resident_bytes");
   return std::move(data);
 }
 
@@ -834,7 +1064,7 @@ void TableStateFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -866,9 +1096,9 @@ unique_ptr<FunctionData> DeltaGenerationsBind(ClientContext &context,
   });
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("view_name");
+  names.push_back("view_name");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("generation");
+  names.push_back("generation");
 
   return std::move(data);
 }
@@ -885,7 +1115,7 @@ void DeltaGenerationsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -911,13 +1141,13 @@ unique_ptr<FunctionData> ListViewsBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("view_name");
+  names.push_back("view_name");
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("sql");
+  names.push_back("sql");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("rows");
+  names.push_back("rows");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("version");
+  names.push_back("version");
 
   return std::move(data);
 }
@@ -938,7 +1168,7 @@ void ListViewsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -961,9 +1191,9 @@ unique_ptr<FunctionData> ListTablesBind(ClientContext &context,
   data->tables = manager.list_tracked_tables();
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("table_name");
+  names.push_back("table_name");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("columns");
+  names.push_back("columns");
 
   return std::move(data);
 }
@@ -986,15 +1216,28 @@ void ListTablesFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
 // dbsp_stats - Sync-path observability counters
 // ============================================================================
 
+// Three columns: metric, value, detail. `detail` exists for the one thing a
+// counter cannot carry — the TEXT of the last failed reconcile. A failed
+// reconcile is the one way a view is left stale with the manager knowing it,
+// and until this row its only trace was a stderr line, which a host embedding
+// the extension never sees. It is NULL on every numeric row.
+struct StatsMetric {
+  string name;
+  int64_t value = 0;
+  bool has_value = true; // false -> NULL, for a row that is text-only
+  string detail;         // empty -> NULL
+  bool has_detail = false;
+};
+
 struct StatsBindData : public TableFunctionData {
-  vector<pair<string, int64_t>> metrics;
+  vector<StatsMetric> metrics;
   idx_t current = 0;
 };
 
@@ -1006,24 +1249,54 @@ unique_ptr<FunctionData> StatsBind(ClientContext &context,
   auto data = make_uniq<StatsBindData>();
   auto &manager = dbsp_native::get_cdc_manager(context);
   data->metrics = {
-      // commits served by captured deltas (design-1 probes, plan tee,
-      // G2 LocalStorage) — one count per applied table delta
-      {"captured_delta_syncs",
-       NumericCast<int64_t>(manager.captured_delta_syncs())},
+      // Commits served by an exact trigger-fed delta instead of
+      // scan-and-diff — one count per applied table delta, so a commit
+      // touching two tracked tables adds two.
+      {"exact_delta_syncs",
+       NumericCast<int64_t>(manager.exact_delta_syncs())},
       // scan-and-diff table scans (the fallback path)
       {"scan_syncs", NumericCast<int64_t>(manager.scan_syncs())},
-      // capture commit-guard rejections (each fell back to a scan)
-      {"capture_guard_fallbacks",
-       NumericCast<int64_t>(manager.capture_guard_fallbacks())},
       // monotonic baseline-mutation counter (conflict detection)
       {"commit_seq", NumericCast<int64_t>(manager.commit_seq())},
       {"tracked_tables",
        NumericCast<int64_t>(manager.list_tracked_tables().size())},
+      // Trigger source: ingest calls the trigger bodies made, and row images
+      // they handed to the per-transaction buffer. Both stay 0 until a body
+      // has actually fired, which is what makes "the triggers are live" a
+      // thing a host can VERIFY rather than assume.
+      {"trigger_syncs",
+       NumericCast<int64_t>(
+           dbsp_native::trigger_source_stats().trigger_syncs.load())},
+      {"trigger_rows",
+       NumericCast<int64_t>(
+           dbsp_native::trigger_source_stats().trigger_rows.load())},
+      // Tables held PROVISIONAL: seeded while another connection had a
+      // transaction open, so an exact delta is refused and the table is
+      // reconciled by scan until every transaction alive at seed time has
+      // ended (TrackedTable::mark_provisional). Zero in an ordinary
+      // single-writer session — a non-zero value that never falls is a
+      // connection sitting on an open transaction.
+      {"provisional_tables",
+       NumericCast<int64_t>(manager.provisional_tables())},
+      // Reconcile scans that did NOT run. sync_table_scan_and_consume reports
+      // failure by RETURNING, so nothing throws out to the caller: a stale
+      // baseline with an error nobody sees was the whole hazard. The text of
+      // the last one rides the `detail` column.
+      {"reconcile_failures",
+       NumericCast<int64_t>(manager.reconcile_failures())},
   };
+  // value is NULL on this row: it is a TEXT metric, and repeating the
+  // reconcile_failures count there just invited it to be read as something of
+  // its own.
+  const string last_reconcile = manager.last_reconcile_error();
+  data->metrics.push_back({"last_reconcile_error", 0, /*has_value=*/false,
+                           last_reconcile, !last_reconcile.empty()});
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("metric");
+  names.push_back("metric");
   return_types.push_back(LogicalType::BIGINT);
-  names.emplace_back("value");
+  names.push_back("value");
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("detail");
   return std::move(data);
 }
 
@@ -1032,13 +1305,17 @@ void StatsFunc(ClientContext &context, TableFunctionInput &input,
   auto &data = input.bind_data->CastNoConst<StatsBindData>();
   idx_t count = 0;
   while (data.current < data.metrics.size() && count < STANDARD_VECTOR_SIZE) {
-    output.SetValue(0, count, Value(data.metrics[data.current].first));
+    const auto &m = data.metrics[data.current];
+    output.SetValue(0, count, Value(m.name));
     output.SetValue(1, count,
-                    Value::BIGINT(data.metrics[data.current].second));
+                    m.has_value ? Value::BIGINT(m.value)
+                                : Value(LogicalType::BIGINT));
+    output.SetValue(2, count,
+                    m.has_detail ? Value(m.detail) : Value(LogicalType::VARCHAR));
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1072,6 +1349,115 @@ void DropCascadeScalar(DataChunk &args, ExpressionState &state,
         }
         return StringVector::AddString(result, msg);
       });
+}
+
+// ============================================================================
+// dbsp_trigger_ingest - the trigger source's hand-off from SQL to C++
+//
+// Only ever called from a generated trigger body (see
+// dbsp_trigger_source.hpp), shaped
+//     INSERT INTO <sink> SELECT max(dbsp_trigger_ingest('<key>', <w>, <cols>))
+//                        FROM <transition table>
+// so the engine evaluates it once per transition-table row, vectorised, and
+// the surrounding aggregate collapses the whole firing to one sink row.
+//
+// It is VOLATILE (never constant-folded or cached) and declares SPECIAL_
+// NULL_HANDLING, because row images are full of NULLs and default handling
+// would skip them. It writes into the committing connection's
+// per-transaction buffer, which TransactionCommit applies in one pass.
+// ============================================================================
+
+static unique_ptr<FunctionData>
+TriggerIngestBind(BindScalarFunctionInput &input) {
+  // Bind runs single-threaded on the writing connection: the one safe moment
+  // to make sure the state the execution-time call needs actually exists.
+  EnsureContextState(input.GetClientContext());
+  return nullptr;
+}
+
+void TriggerIngestScalar(DataChunk &args, ExpressionState &state,
+                         Vector &result) {
+  const idx_t n = args.size();
+  // One value per row is what the aggregate above consumes; the value itself
+  // is never read, so a constant vector is the cheapest correct answer.
+  result.SetVectorType(VectorType::CONSTANT_VECTOR);
+  ConstantVector::GetData<int64_t>(result)[0] = NumericCast<int64_t>(n);
+  ConstantVector::SetNull(result, false);
+  if (n == 0 || args.ColumnCount() < 3) {
+    return;
+  }
+  // DBSP's own helper connections: never self-ingest. Thread-local, so it
+  // only covers work executed on the issuing thread — and trigger bodies run
+  // on WORKER threads, so a multi-chunk body can have some chunks see depth 0.
+  // Dropping those silently would leave a PARTIAL delta; poisoning makes the
+  // commit reconcile by scan instead.
+  //
+  // Every early exit below poisons for the same reason: this function is the
+  // only thing that knows the rows existed, so "return without buffering" is
+  // indistinguishable from "there was nothing to buffer" by the time
+  // TransactionCommit looks. Silence is the one outcome this source must not
+  // have.
+  auto poison = [&state]() {
+    if (!state.HasContext()) {
+      return; // nothing reachable to poison; see the throw below
+    }
+    auto st = state.GetContext()
+                  .registered_state->Get<dbsp_native::DBSPContextState>(
+                      "dbsp_cdc_state");
+    if (st) {
+      st->mark_delta_unknown();
+    }
+  };
+  if (dbsp_native::internal_query_depth > 0) {
+    poison();
+    return;
+  }
+  if (!state.HasContext()) {
+    // No context means no buffer and no way to reach one: failing the
+    // statement is the only loud option left.
+    throw duckdb::InternalException(
+        "dbsp_trigger_ingest: no ClientContext available to deliver a delta");
+  }
+  auto &context = state.GetContext();
+  auto ctx_state =
+      context.registered_state->Get<dbsp_native::DBSPContextState>(
+          "dbsp_cdc_state");
+  if (!ctx_state) {
+    throw duckdb::InternalException(
+        "dbsp_trigger_ingest: no DBSP state on this connection");
+  }
+  const Value key_v = args.data[0].GetValue(0);
+  const Value weight_v = args.data[1].GetValue(0);
+  if (key_v.IsNull() || weight_v.IsNull()) {
+    ctx_state->mark_delta_unknown();
+    return;
+  }
+  const string key = key_v.ToString();
+  const int64_t weight = weight_v.GetValue<int64_t>();
+  try {
+    dbsp_native::DuckDBZSet delta;
+    {
+      dbsp_native::DbspScopeTimer t_ing("trigger_ingest",
+                                        std::to_string(n) + " rows");
+      dbsp_native::trigger_chunk_to_zset(args, 2, weight, delta);
+    }
+    auto &stats = dbsp_native::trigger_source_stats();
+    stats.trigger_syncs.fetch_add(1, std::memory_order_relaxed);
+    stats.trigger_rows.fetch_add(n, std::memory_order_relaxed);
+    ctx_state->buffer_trigger_delta(key, std::move(delta));
+    // PROOF OF LIFE: the flag flips only here, on a DELIVERED ingest — never
+    // when the triggers are created. Triggers that exist but never fire leave
+    // the commit path's pessimistic net armed rather than letting it assume an
+    // unaccounted commit wrote nothing.
+    if (!dbsp_native::trigger_source_flag().load(std::memory_order_relaxed)) {
+      dbsp_native::trigger_source_flag().store(true, std::memory_order_relaxed);
+    }
+  } catch (...) {
+    // Conversion failed: the buffered picture is incomplete, so make the
+    // commit reconcile by scan rather than apply a partial delta. Never let
+    // this escape into the user's statement.
+    ctx_state->mark_delta_unknown();
+  }
 }
 
 // ============================================================================
@@ -1132,7 +1518,7 @@ unique_ptr<FunctionData> SaveBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1154,9 +1540,12 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     // Table mode (D3): view definitions into a table in the target catalog,
     // so they travel with the database file and its backups.
     // D3b: also snapshot circuit state so the next load can skip replay.
-    ok = manager.save_to_duck_table(context, data.target,
-                                    data.save_all ? "" : data.view_name,
-                                    data.catalog);
+    {
+      dbsp_native::DbspScopeTimer t_defs("save_view_defs", data.target);
+      ok = manager.save_to_duck_table(context, data.target,
+                                      data.save_all ? "" : data.view_name,
+                                      data.catalog);
+    }
     std::string ckpt_note;
     if (ok && data.save_all) {
       // Report how many views actually made it into the checkpoint —
@@ -1176,7 +1565,7 @@ void SaveFunc(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException("%s", msg);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(msg));
   data.done = true;
 }
@@ -1228,7 +1617,7 @@ unique_ptr<FunctionData> LoadBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1296,7 +1685,7 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
   }
   msg += ")";
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0, Value(msg));
   data.done = true;
 }
@@ -1305,6 +1694,63 @@ void LoadFunc(ClientContext &context, TableFunctionInput &input,
 // dbsp_deps - Show view dependencies
 // Usage: SELECT * FROM dbsp_deps('view_name');
 // ============================================================================
+
+// dbsp_set_view_key('view', 'col1,col2') -- declare the view's unique,
+// non-null row key so delta application retracts by an equi-join on those
+// columns instead of comparing every column of every row. Verified against
+// the view's current rows; see CDCManager::set_view_key.
+struct SetViewKeyData : public TableFunctionData {
+  string view_name;
+  string key_csv;
+  bool done = false;
+};
+
+unique_ptr<FunctionData> SetViewKeyBind(ClientContext &context,
+                                        TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types,
+                                        vector<Identifier> &names) {
+  auto data = make_uniq<SetViewKeyData>();
+  data->view_name = input.inputs[0].GetValue<string>();
+  data->key_csv = input.inputs[1].GetValue<string>();
+  return_types.push_back(LogicalType::VARCHAR);
+  names.push_back("result");
+  return std::move(data);
+}
+
+void SetViewKeyFunc(ClientContext &context, TableFunctionInput &input,
+                    DataChunk &output) {
+  EnsureContextState(context);
+  auto &data = input.bind_data->CastNoConst<SetViewKeyData>();
+  if (data.done) {
+    output.SetChildCardinality(0);
+    return;
+  }
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+
+  std::vector<std::string> cols;
+  std::string cur;
+  for (char c : data.key_csv) {
+    if (c == ',') {
+      if (!cur.empty()) {
+        cols.push_back(cur);
+      }
+      cur.clear();
+    } else if (c != ' ') {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) {
+    cols.push_back(cur);
+  }
+
+  if (!manager.set_view_key(data.view_name, cols)) {
+    throw InvalidInputException(manager.last_error());
+  }
+  output.SetCardinality(1);
+  output.SetValue(0, 0, Value(cols.empty() ? "key cleared" : "key set"));
+  data.done = true;
+}
 
 struct DepsBindData : public TableFunctionData {
   string view_name;
@@ -1341,9 +1787,9 @@ unique_ptr<FunctionData> DepsBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("name");
+  names.push_back("name");
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("relationship");
+  names.push_back("relationship");
 
   return std::move(data);
 }
@@ -1362,7 +1808,7 @@ void DepsFunc(ClientContext &context, TableFunctionInput &input,
     data.current++;
     count++;
   }
-  output.SetCardinality(count);
+  output.SetChildCardinality(count);
 }
 
 // ============================================================================
@@ -1392,7 +1838,7 @@ unique_ptr<FunctionData> AutoSyncBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1407,20 +1853,20 @@ void AutoSyncFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.is_auto_sync_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Auto-sync is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_auto_sync();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-sync ENABLED: views will update on transaction commit"));
     } else {
       manager.disable_auto_sync();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-sync DISABLED: use dbsp_sync() for manual updates"));
@@ -1456,7 +1902,7 @@ unique_ptr<FunctionData> AutoPersistBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1475,21 +1921,21 @@ void AutoPersistFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.autopersist_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Auto-persist is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_autopersist();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-persist ENABLED: views survive a clean connection "
                 "reopen"));
     } else {
       manager.disable_autopersist();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Auto-persist DISABLED: use dbsp_save()/dbsp_load() "
@@ -1526,7 +1972,7 @@ unique_ptr<FunctionData> AutoPersistIntervalBind(
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1539,7 +1985,7 @@ void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
 
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.n < 0) {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value("Auto-persist checkpoint interval: " +
@@ -1547,7 +1993,7 @@ void AutoPersistIntervalFunc(ClientContext &context, TableFunctionInput &input,
               " commits (0 = off)"));
   } else {
     manager.set_autopersist_interval(static_cast<size_t>(data.n));
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value("Auto-persist checkpoint interval set to " +
                           std::to_string(data.n) + " commits"));
@@ -1590,7 +2036,7 @@ unique_ptr<FunctionData> LazyRestoreBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1605,21 +2051,21 @@ void LazyRestoreFunc(ClientContext &context, TableFunctionInput &input,
 
   if (data.query_only) {
     bool enabled = manager.lazy_restore_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(string("Lazy restore is ") + (enabled ? "ENABLED" : "DISABLED")));
   } else {
     if (data.enable) {
       manager.enable_lazy_restore();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Lazy restore ENABLED: checkpointed views decode on first "
                 "need"));
     } else {
       manager.disable_lazy_restore();
-      output.SetCardinality(1);
+      output.SetChildCardinality(1);
       output.SetValue(
           0, 0,
           Value("Lazy restore DISABLED: dbsp_load() restores every "
@@ -1654,7 +2100,7 @@ unique_ptr<FunctionData> ParallelBind(ClientContext &context,
     data->enable = input.inputs[0].GetValue<bool>();
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1666,13 +2112,13 @@ void ParallelFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.get_parallel_sync();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value(string("Parallel mode is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
   } else {
     manager.set_parallel_sync(data.enable);
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(data.enable
@@ -1709,7 +2155,7 @@ unique_ptr<FunctionData> SpillBind(ClientContext &context,
     data->enable = input.inputs[0].GetValue<bool>();
   }
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1721,16 +2167,16 @@ void SpillFunc(ClientContext &context, TableFunctionInput &input,
   auto &manager = dbsp_native::get_cdc_manager(context);
   if (data.query_only) {
     bool enabled = manager.spill_enabled();
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0,
                     Value(string("Baseline spill is ") +
                           (enabled ? "ENABLED" : "DISABLED")));
   } else if (!manager.set_spill(context, data.enable)) {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(0, 0, Value("Spill toggle FAILED: " +
                                 manager.last_error()));
   } else {
-    output.SetCardinality(1);
+    output.SetChildCardinality(1);
     output.SetValue(
         0, 0,
         Value(data.enable
@@ -1768,7 +2214,7 @@ unique_ptr<FunctionData> UsePlannerBind(ClientContext &context,
   }
 
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1781,7 +2227,7 @@ void UsePlannerFunc(ClientContext &context, TableFunctionInput &input,
 
   // The planner is the only frontend since Phase C5 (the bespoke parser was
   // deleted); toggling is a no-op kept for backwards compatibility
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   output.SetValue(0, 0,
                   Value("Planner frontend is ENABLED (always: the bespoke "
                         "parser was removed in Phase C5)"));
@@ -1813,7 +2259,7 @@ unique_ptr<FunctionData> CreateMaterializedViewBind(
   data->or_replace =
       input.inputs.size() > 2 ? input.inputs[2].GetValue<bool>() : false;
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1824,7 +2270,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<CreateMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
@@ -1851,7 +2297,7 @@ void CreateMaterializedViewExecute(ClientContext &context,
   }
 
   // Return success message
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto info = manager.get_view_info(state.view_name);
   string sources = "";
   for (size_t i = 0; i < info.source_tables.size(); i++) {
@@ -1886,7 +2332,7 @@ ReplaceViewBind(ClientContext &context, TableFunctionBindInput &input,
   data->view_name = input.inputs[0].GetValue<string>();
   data->sql = input.inputs[1].GetValue<string>();
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1896,7 +2342,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
   auto &state = input.bind_data->CastNoConst<ReplaceViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
@@ -1913,7 +2359,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
     throw InvalidInputException(error);
   }
 
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   auto info = manager.get_view_info(state.view_name);
   string sources = "";
   for (size_t i = 0; i < info.source_tables.size(); i++) {
@@ -1936,6 +2382,7 @@ void ReplaceViewExecute(ClientContext &context, TableFunctionInput &input,
 struct DropMaterializedViewData : public TableFunctionData {
   string view_name;
   bool cascade = false;
+  bool if_exists = false;
   bool done = false;
 };
 
@@ -1946,8 +2393,12 @@ DropMaterializedViewBind(ClientContext &context, TableFunctionBindInput &input,
   auto data = make_uniq<DropMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   data->cascade = input.inputs[1].GetValue<bool>();
+  // Third argument = IF EXISTS. Absent on the two-parameter plan-function
+  // route, where the flag was parsed and then thrown away.
+  data->if_exists =
+      input.inputs.size() > 2 ? input.inputs[2].GetValue<bool>() : false;
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -1956,15 +2407,21 @@ void DropMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<DropMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
   auto &manager = dbsp_native::get_cdc_manager(context);
 
-  // Check if view exists
   if (!manager.view_exists(state.view_name)) {
-    // IF EXISTS was handled by parser, so this is an error
+    if (state.if_exists) {
+      output.SetValue(0, 0,
+                      Value("Materialized view does not exist: " +
+                            state.view_name + " (IF EXISTS)"));
+      output.SetChildCardinality(1);
+      state.done = true;
+      return;
+    }
     throw InvalidInputException("Materialized view does not exist: " +
                                 state.view_name);
   }
@@ -1991,21 +2448,25 @@ void DropMaterializedViewExecute(ClientContext &context,
         " CASCADE to drop with dependents");
   }
 
-  // Drop the view (and dependents if cascade)
+  // Drop the view (and dependents first, if cascade).
+  //
+  // get_drop_order returns the DEPENDENTS only, never the named view — so the
+  // cascade branch used to drop every dependent and leave the view itself
+  // behind. Measured the first time this path became reachable at all:
+  // `DROP MATERIALIZED VIEW a1 CASCADE` reported "a1 (and 1 dependent views)"
+  // and dbsp_views() still listed a1. It was unreachable before the
+  // parser_override reclaimed DROP MATERIALIZED VIEW, which is why it stood.
   size_t dropped_count = 1;
   if (state.cascade && !dependents.empty()) {
-    // Drop dependents first (in reverse topological order)
-    auto drop_order = manager.get_drop_order(state.view_name);
-    for (const auto &view : drop_order) {
+    for (const auto &view : manager.get_drop_order(state.view_name)) {
       manager.drop_view(view);
       dropped_count++;
     }
-  } else {
-    manager.drop_view(state.view_name);
   }
+  manager.drop_view(state.view_name);
 
   // Return success message
-  output.SetCardinality(1);
+  output.SetChildCardinality(1);
   string message = "Dropped materialized view: " + state.view_name;
   if (dropped_count > 1) {
     message +=
@@ -2031,7 +2492,7 @@ unique_ptr<FunctionData> RefreshMaterializedViewBind(
   auto data = make_uniq<RefreshMaterializedViewData>();
   data->view_name = input.inputs[0].GetValue<string>();
   return_types.push_back(LogicalType::VARCHAR);
-  names.emplace_back("result");
+  names.push_back("result");
   return std::move(data);
 }
 
@@ -2041,12 +2502,22 @@ void RefreshMaterializedViewExecute(ClientContext &context,
   auto &state = input.bind_data->CastNoConst<RefreshMaterializedViewData>();
 
   if (state.done) {
-    output.SetCardinality(0);
+    output.SetChildCardinality(0);
     return;
   }
 
-  // REFRESH is a no-op since views are automatically incremental
-  output.SetCardinality(1);
+  // REFRESH is a no-op only for a view that EXISTS. Without this check any
+  // name at all reported "is always up-to-date" — `REFRESH MATERIALIZED VIEW
+  // s2.qv` on a nonexistent qualified name succeeded silently, which is the
+  // worst possible answer to "is my view current?".
+  EnsureContextState(context);
+  auto &manager = dbsp_native::get_cdc_manager(context);
+  manager.maybe_autoload(context);
+  if (!manager.view_exists(state.view_name)) {
+    throw InvalidInputException("Materialized view does not exist: " +
+                                state.view_name);
+  }
+  output.SetChildCardinality(1);
   output.SetValue(
       0, 0,
       Value("Materialized view '" + state.view_name +
@@ -2066,60 +2537,46 @@ namespace dbsp_native {
 ParserExtensionPlanResult
 MaterializedViewPlan(ParserExtensionInfo *info, ClientContext &context,
                      unique_ptr<ParserExtensionParseData> parse_data_p) {
+  // One parse-data type, one switch. It used to be three ParseData subclasses
+  // and a three-way dynamic_cast chain, one arm per statement — the shape a
+  // second parser produces.
+  auto *data =
+      dynamic_cast<::dbsp_native::MaterializedViewParseData *>(parse_data_p.get());
+  if (data == nullptr) {
+    throw InternalException("MATERIALIZED VIEW plan: unexpected parse data");
+  }
+  const auto &ddl = data->ddl;
 
   ParserExtensionPlanResult result;
-
-  // Handle CREATE MATERIALIZED VIEW
-  if (auto *create_data =
-          dynamic_cast<::dbsp_native::CreateMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("create_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::VARCHAR,
-                        LogicalType::BOOLEAN},
-                       CreateMaterializedViewExecute,
-                       CreateMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(create_data->view_name));
-    result.parameters.push_back(Value(create_data->select_query));
-    result.parameters.push_back(Value(create_data->or_replace));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
+  result.return_type = StatementReturnType::QUERY_RESULT;
+  switch (ddl.kind) {
+  case ::dbsp_native::MvDdl::Kind::Create:
+    result.function = TableFunction("create_materialized_view",
+                                    {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                     LogicalType::BOOLEAN},
+                                    CreateMaterializedViewExecute,
+                                    CreateMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
+    result.parameters.push_back(Value(ddl.body));
+    result.parameters.push_back(Value(ddl.or_replace));
+    return result;
+  case ::dbsp_native::MvDdl::Kind::Drop:
+    result.function = TableFunction("drop_materialized_view",
+                                    {LogicalType::VARCHAR, LogicalType::BOOLEAN},
+                                    DropMaterializedViewExecute,
+                                    DropMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
+    result.parameters.push_back(Value(ddl.cascade));
+    return result;
+  case ::dbsp_native::MvDdl::Kind::Refresh:
+    result.function = TableFunction("refresh_materialized_view",
+                                    {LogicalType::VARCHAR},
+                                    RefreshMaterializedViewExecute,
+                                    RefreshMaterializedViewBind);
+    result.parameters.push_back(Value(ddl.name));
     return result;
   }
-
-  // Handle DROP MATERIALIZED VIEW
-  if (auto *drop_data =
-          dynamic_cast<::dbsp_native::DropMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("drop_materialized_view",
-                       {LogicalType::VARCHAR, LogicalType::BOOLEAN},
-                       DropMaterializedViewExecute, DropMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(drop_data->view_name));
-    result.parameters.push_back(Value(drop_data->cascade));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
-    return result;
-  }
-
-  // Handle REFRESH MATERIALIZED VIEW
-  if (auto *refresh_data =
-          dynamic_cast<::dbsp_native::RefreshMaterializedViewParseData *>(
-              parse_data_p.get())) {
-    TableFunction func("refresh_materialized_view", {LogicalType::VARCHAR},
-                       RefreshMaterializedViewExecute,
-                       RefreshMaterializedViewBind);
-
-    result.function = func;
-    result.parameters.push_back(Value(refresh_data->view_name));
-    result.return_type = StatementReturnType::QUERY_RESULT;
-
-    return result;
-  }
-
-  throw InternalException("Unknown materialized view statement type");
+  throw InternalException("Unknown materialized view statement kind");
 }
 
 } // namespace dbsp_native
@@ -2183,6 +2640,16 @@ public:
     if (total > internals + 1) {
       return; // other user connections remain
     }
+    // Past this point this IS the last connection, so the DatabaseInstance
+    // is going away. DuckDB reuses freed addresses, and a stale "already
+    // recovered" entry would make a BRAND-NEW database at the same address
+    // skip recovery entirely. Dropped here rather than after the take()
+    // below so a racing close cannot leave the entry behind.
+    dbsp_native::dbsp_forget_recovery(static_cast<const void *>(db));
+    // Same law for the trigger source's "these tables already carry triggers"
+    // set: a stale entry at a recycled address would make a new database skip
+    // installing them and go silently stale.
+    dbsp_native::dbsp_forget_triggers(static_cast<const void *>(db));
     // take() is atomic single-flight: a racing close gets nullptr.
     auto manager = dbsp_native::get_cdc_registry().take(db);
     if (!manager) {
@@ -2191,7 +2658,8 @@ public:
     // Clean shutdown: release the crash-marker lock here. Waiting for the
     // recovery manager's global static destructor never works in embedders
     // (Python teardown skips it), so every restart claimed a crash.
-    dbsp_native::get_recovery_manager().mark_session_end();
+    dbsp_native::get_recovery_manager().mark_session_end(
+        static_cast<const void *>(db));
     // Destroy on a detached thread: destroying views destroys their
     // Connections, whose destructors re-enter RemoveConnection and would
     // deadlock on connections_lock if run inline here. Auto-persist
@@ -2272,18 +2740,6 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Register extension callback
   ExtensionCallback::Register(config, make_shared_ptr<DBSPExtensionCallback>());
 
-  // D2 plan tee: exact captured deltas for DML shapes the design-1
-  // pre-image SELECT declines (docs/DESIGN_WRITE_CAPTURE.md)
-#ifndef DBSP_TIP_PORT
-  dbsp_native::register_plan_tee(config);
-#endif
-
-  // SaaS-fork engine hook: exact commit deltas straight from the patched
-  // engine (patches/v1.5.4-dbsp-txn-callback.patch). Returns false (no-op)
-  // when built without DBSP_ENGINE_HOOK; while active, the capture stack
-  // above stays disarmed (dbsp_context_state.hpp gates on the flag).
-  dbsp_native::register_engine_hook(instance);
-
   // Register table functions
   TableFunction track_func("dbsp_track", {LogicalType::VARCHAR}, TrackFunc,
                            TrackBind);
@@ -2307,11 +2763,35 @@ static void LoadInternal(ExtensionLoader &loader) {
   // Or just rely on the table function
 
   // Register Create Materialized View Table Function (internal)
+  // The functions MaterializedViewOverride rewrites its DDL into. They are
+  // registered rather than synthesized because the override has to hand the
+  // core parser real SQL: it returns SQLStatements, not a plan. Two arities:
+  // the two-parameter form predates the override, and the three-parameter one
+  // carries OR REPLACE.
   TableFunction create_mv_func("dbsp_create_materialized_view",
                                {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                CreateMaterializedViewExecute,
                                CreateMaterializedViewBind);
-  loader.RegisterFunction(create_mv_func);
+  TableFunctionSet create_mv_set("dbsp_create_materialized_view");
+  create_mv_set.AddFunction(create_mv_func);
+  create_mv_set.AddFunction(TableFunction(
+      "dbsp_create_materialized_view",
+      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN},
+      CreateMaterializedViewExecute, CreateMaterializedViewBind));
+  CreateTableFunctionInfo create_mv_set_info(create_mv_set);
+  loader.RegisterFunction(create_mv_set_info);
+
+  TableFunction drop_mv_func(
+      "dbsp_drop_materialized_view",
+      {LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+      DropMaterializedViewExecute, DropMaterializedViewBind);
+  loader.RegisterFunction(drop_mv_func);
+
+  TableFunction refresh_mv_func("dbsp_refresh_materialized_view",
+                                {LogicalType::VARCHAR},
+                                RefreshMaterializedViewExecute,
+                                RefreshMaterializedViewBind);
+  loader.RegisterFunction(refresh_mv_func);
 
   TableFunction insert_func("dbsp_notify_insert", {LogicalType::VARCHAR},
                             NotifyInsertFunc, NotifyBind);
@@ -2372,6 +2852,11 @@ static void LoadInternal(ExtensionLoader &loader) {
   TableFunction deps_func("dbsp_deps", {LogicalType::VARCHAR}, DepsFunc,
                           DepsBind);
   loader.RegisterFunction(deps_func);
+
+  TableFunction set_view_key_func("dbsp_set_view_key",
+                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                                  SetViewKeyFunc, SetViewKeyBind);
+  loader.RegisterFunction(set_view_key_func);
 
   TableFunction save_func("dbsp_save", {}, SaveFunc, SaveBind);
   save_func.varargs = LogicalType::VARCHAR;
@@ -2440,11 +2925,58 @@ static void LoadInternal(ExtensionLoader &loader) {
                      LogicalType::VARCHAR, DropCascadeScalar));
   loader.RegisterFunction(drop_cascade_alias_info);
 
+  // Trigger delta source: the SQL-side entry point the generated trigger
+  // bodies call. Triggers are catalog objects that outlive any one process, so
+  // this must exist for every database the extension opens or their persisted
+  // bodies would fail to bind.
+  ScalarFunction trigger_ingest_fn(
+      "dbsp_trigger_ingest", {LogicalType::VARCHAR, LogicalType::BIGINT},
+      LogicalType::BIGINT, TriggerIngestScalar, TriggerIngestBind, nullptr,
+      nullptr, LogicalType::ANY, FunctionStability::VOLATILE,
+      FunctionNullHandling::SPECIAL_HANDLING);
+  CreateScalarFunctionInfo trigger_ingest_info(trigger_ingest_fn);
+  loader.RegisterFunction(trigger_ingest_info);
+
   // Initialize Parser Extension for SQL syntax support
   auto &extension_manager = instance.GetExtensionManager();
   // We need to register the parser extension
   ParserExtension::Register(
       config, dbsp_native::CreateMaterializedViewParserExtension());
+
+  // parser_override callbacks are SKIPPED unless allow_parser_override_extension
+  // is FALLBACK or STRICT, and DuckDB's default is DEFAULT (skip). Raising it to
+  // FALLBACK is what makes `CREATE MATERIALIZED VIEW` keep the user's exact SQL
+  // and `DROP MATERIALIZED VIEW` reachable at all — the 2.0 PEG grammar claims
+  // DROP and its transformer throws `Cannot drop MATERIALIZED VIEW yet`, so a
+  // hook that only sees PEG FAILURES can never have it.
+  //
+  // FALLBACK, never STRICT: a query no override claims must still reach the core
+  // parser. And this raises the setting for EVERY parser-override extension in
+  // the database, not just this one — stated here because it is a real side
+  // effect of loading dbsp. Setting it back to DEFAULT does not break the DDL:
+  // the parse_function path still parses the same statements, it only
+  // normalises the stored SQL text and cannot reach DROP.
+  try {
+    // RAISE only, never lower. Reading it first matters: a user who has
+    // deliberately set STRICT (every override error surfaces instead of
+    // falling through to the core parser) had it silently downgraded to
+    // FALLBACK by LOAD — measured, `SET ...='STRICT'` then LOAD reported
+    // FALLBACK. Only DEFAULT, which skips override callbacks altogether and
+    // would leave this extension's DDL unreachable, is changed.
+    const auto current =
+        Settings::Get<AllowParserOverrideExtensionSetting>(config);
+    if (current == AllowParserOverride::DEFAULT_OVERRIDE) {
+      config.SetOptionByName("allow_parser_override_extension",
+                             Value("FALLBACK"));
+    }
+  } catch (const std::exception &e) {
+    // A build or embedding without that setting keeps the token path, which is
+    // functional. Say so rather than failing the LOAD.
+    std::cerr << "DBSP: could not enable parser overrides ("
+              << e.what()
+              << "); CREATE MATERIALIZED VIEW will keep its token-reconstructed "
+                 "SQL text and DROP MATERIALIZED VIEW stays unavailable\n";
+  }
 }
 
 #ifndef EXT_VERSION_DBSP

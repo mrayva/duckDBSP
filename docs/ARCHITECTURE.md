@@ -27,11 +27,11 @@ Internal design of the DBSP DuckDB extension.
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │      Auto-sync hooks (DBSPContextState, per connection)      ││
-│  │  - O(Δ) captured deltas: INSERT txns (LocalStorage scan,    ││
-│  │    G2) + whitelisted UPDATE/DELETE incl. autocommit          ││
-│  │    (pre-image capture SELECT, dbsp_write_capture.hpp)        ││
-│  │  - Commit guard: seq conflict + signed COUNT(*) + rowid      ││
-│  │    re-verify; any miss → scoped scan-and-diff fallback       ││
+│  │  - Trigger-fed exact deltas: generated AFTER triggers hand   ││
+│  │    old/new images to dbsp_trigger_ingest during the          ││
+│  │    statement (dbsp_trigger_source.hpp)                       ││
+│  │  - Buffered per transaction, applied at commit in ONE pass;  ││
+│  │    anything unaccounted → scoped scan-and-diff fallback      ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                              │                                   │
 │  ┌─────────────────────────────────────────────────────────────┐│
@@ -325,7 +325,8 @@ public:
     bool load_from_table(ClientContext& ctx);
 
 private:
-    void propagate_changes(const std::string& source);
+    void propagate_changes(const std::string& source);      // delegates ↓
+    void propagate_changes_multi(sources);  // ONE pass for a whole commit
 };
 ```
 
@@ -427,6 +428,55 @@ ONE `apply_changes_batch` call = one circuit step — required for the
 join's both-shared bilinear correction (−Δl⋈Δr) to fire. Per-source
 sequential applies would overcount Δl⋈Δr and strand stale rows.
 
+The same rule holds one level up, at the commit boundary: a transaction
+that wrote SEVERAL tracked tables runs as ONE propagation pass
+(`propagate_changes_multi` — every commit path collects all table deltas
+first: the trigger source via `apply_captured_deltas`, the scan fallback via
+`sync_tables`). Per-table passes would rewrite each
+downstream view's single-generation `dbsp_changes` buffer (a view over
+both tables keeps only the last table's effects) and miss the join
+both-shared correction above. All views stepped in the pass share one
+delta generation.
+
+### The delta source
+
+ONE way to learn what a committing transaction wrote: statement-level `AFTER`
+triggers, generated on every tracked table (`dbsp_trigger_source.hpp`). Their
+bodies call a volatile extension scalar during the statement, which buffers the
+exact old/new row images per transaction; `TransactionCommit` drains the buffer
+into `apply_captured_deltas`. Trigger expansion is binder-level, so this works
+on a STOCK engine and covers the Appender too (its flush runs an
+`INSERT ... SELECT`).
+
+```
+    a user statement writes a tracked table
+                    │
+                    ▼
+        generated AFTER trigger fires
+   (transition tables → dbsp_trigger_ingest,
+    a volatile extension scalar, per chunk)
+                    │
+                    ▼
+     DBSPContextState per-transaction buffer
+        (rollback simply clears it)
+                    │
+                    ▼
+      TransactionCommit → apply_captured_deltas
+             (ONE pass, all tables)
+```
+
+The trigger reports facts, so nothing guards it. What it cannot report — a
+firing that could not reach the buffer, a conversion failure, a transaction
+whose trigger bodies did not match its tables — poisons the buffer instead, and
+that commit reconciles by scan (`sync_tables` / `sync_all`). Silence is the one
+outcome this source must never have.
+
+Two predecessor sources were removed in the trigger-only transition: a
+predictive capture stack (a pre-image SELECT plus an optimizer plan tee, which
+guessed the delta and then distrusted itself with a commit-time guard) and a
+consumer for a patched engine's transaction callback. Both are gone, along with
+the engine patch; see `docs/DESIGN_TRIGGER_SOURCE.md`, "History".
+
 ### Incremental Aggregation Example
 
 ```
@@ -483,6 +533,22 @@ State after:
   partition's ordered source rows plus its rendered-output cache
   (`partitions_`/`partition_outputs_`), sized however that partition
   currently is — watermarked by source COUNT + bit_xor(hash(row)).
+  Window partition rows live PACKED at rest (`dbsp_window_rows.hpp`):
+  each store is one byte arena + positional slot directory using the
+  join-index codec (`dbsp_packed_row.hpp`), with binary searches
+  comparing sort columns straight from the packed bytes and render
+  passes memoizing full-row decodes; codec-unsupported types flip that
+  store to boxed rows transparently. Packed window checkpoint blobs are
+  bulk byte copies (in-blob `kWindowPackedMagic` marker); legacy
+  row-by-row blobs remain readable and re-encode on restore, while a
+  boxed-fallback store still writes the legacy layout. The embedded
+  window, sort, and distinct-on views' own result_ Z-sets are LAZY
+  caches (nothing in production reads them — EmbeddedViewNode
+  propagates the delta only, and ordered presentation reads iterate
+  the sort view's sorted_rows_): edits invalidate them, readers
+  rebuild them from the views' backing structures, and neither
+  checkpoints nor restores touch them. NativeLimitView keeps an eager
+  result_ — it is the diff base for its delta computation.
   `EmbeddedViewNode` reports whatever its wrapped view reports
   (`NativeMaterializedView::circuit_state_kind()`), so a `NativeSortView`/
   `NativeLimitView`/`NativeDistinctOnView` behind the same wrapper (the
@@ -525,8 +591,27 @@ State after:
   fingerprint sidecar written at save and ADOPTED at register over a
   watermark-verified deferred table (`sharr_*.flat`) — first edit after
   reopen stops paying a whole-baseline backfill. Serialization folds
-  flat + overlay back into one stream; a dirty save at big-model scale
-  pays the fold
+  flat + overlay back into one stream. VIEW-sourced arrangements adopt
+  the same way, but their trust anchor is the checkpoint itself, not a
+  data watermark: every save writes a random per-save id (`_dbsp_ckpt`
+  kind='saveid', same transaction as the view blobs) and stamps each
+  saved view's arrangement sidecar with it — clean files are re-stamped
+  in place (~24-byte header patch), changed ones re-fold or
+  delta-append. Register-time adoption requires the source view to be
+  PENDING (its checkpoint stash was accepted) and the file stamp to
+  equal the loaded checkpoint's save-id; anything else declines and the
+  arrangement backfills from the view's `__mv_` table/result as before
+  (full design note at `save_checkpoint`'s sidecar loop)
+- **Delta-append sidecars**: with an adopted base and a small overlay, a
+  dirty save writes only the changes — the digest-index overlay as
+  `.idx.d` and per-arrangement replacement buckets for touched keys as
+  `<sharr>.d` — each chained to its base by watermark (+ entry count /
+  live log size); adopt loads base + delta, any chain mismatch rescans.
+  Oversized overlays compact into a fresh self-adopted base. Every save
+  records the watermark it saved under, so a same-content save writes
+  nothing. An empty-diff `end_rebuild` discards instead of swapping — a
+  no-change sync must not destroy the adopted flat layer or the delta
+  chain. Measured 18M rows: dirty save 7.1s → 0.03s
 - **Lazy per-view restore (D-lazy)**, default ON (`dbsp_lazy_restore`):
   a watermark-matched load cold-creates the view exactly as before, but
   instead of decoding its node/sink blobs immediately it stashes the
@@ -535,22 +620,32 @@ State after:
   (`NativeMaterializedView::is_pending_restore()`). `dbsp_load()` returns
   without paying any per-view decode cost; each view's
   `realize_pending_view`/`realize_pending_view_locked` decodes on first
-  need — mirrors D3c's `TrackedTable::is_deferred()` +
+  need — mirrors D3c's `TrackedTable::restore_pending()` +
   `materialize_deferred_locked` shape (and its locking discipline:
   `pending_restore_` is guarded by the same `view_mutex_` tier that
   already owns view content, no new lock level). Realization is wired
   into every surface that reads a view's live state — `dbsp_query`'s
   read path (`scan_view`/`query_view`), an incoming delta reaching the
   view or a pending ancestor of it (`propagate_changes`'s pre-pass, which
-  runs sequentially before any per-level parallel `step_view` work so
-  `pending_restore_`'s single shared map is never touched from more than
-  one thread at a time), a warm `create_view` replay or shared-arrangement
+  completes before any per-level parallel `step_view` work; it walks the
+  dependency closure first, then realizes the whole worklist as one batch
+  — `realize_pending_views_locked` fans the per-view blob fetch, decode,
+  and own-arrangement backfill across worker threads that touch only
+  per-view-disjoint state, while all `pending_restore_` map mutation stays
+  on the locking thread in a sequential resolve step), a warm
+  `create_view` replay or shared-arrangement
   backfill reading another view's result as a source, and
   `dbsp_replace_view`/drop (which discard rather than decode a dropped
   view's stash). `save_checkpoint` re-saves a still-pending view's stash
   **verbatim** — valid because "pending" is definitionally "no deltas
   applied since the stash," so the undecoded bytes are still exactly
-  current. `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
+  current. Under disk-backed (Phase 3) lazy blobs the stash holds empty
+  placeholders — the bytes live only in `_dbsp_ckpt` — so a same-catalog
+  save preserves the view's existing rows in place instead (writing the
+  placeholders back would clobber the only copy: the root cause of the
+  historical "lazy-restore stash failed to decode" flake), and a
+  cross-catalog save fetches the bytes first, the way realize does.
+  `dbsp_lazy_restore(false)` reproduces the pre-D-lazy eager
   behavior (every checkpointed view fully restored during the load call
   itself).
 - A checkpoint blob format version travels alongside the data (a
@@ -634,8 +729,8 @@ src/
 ├── dbsp_extension.cpp           # Entry point, function registration
 include/
 ├── dbsp_cdc.hpp                 # CDC manager, dependency graph
-├── dbsp_context_state.hpp       # Auto-sync hooks + captured-delta paths
-├── dbsp_write_capture.hpp       # UPDATE/DELETE capture vetting + SQL builder
+├── dbsp_context_state.hpp       # Auto-sync hooks + commit-time delta apply
+├── dbsp_trigger_source.hpp      # Trigger-fed delta source (stock engine)
 ├── dbsp_duckdb_types.hpp        # DuckDB-native Z-sets and views
 └── dbsp_plan_translator.hpp     # Planner frontend + circuit-IR optimizer
 ```
@@ -646,3 +741,16 @@ duckDBSP/
 ├── CMakeLists.txt         # Build configuration
 └── build.sh               # Build script
 ```
+
+### Internal connection ownership
+
+`InternalConnection` in `dbsp_cdc.hpp` binds the recursion guard to the
+connection lifetime and checks the caller's explicit read policy before opening
+it. The guard survives connection destruction, including context teardown.
+Directly adjacent policy/guard/connection sites use this owner. Other legacy
+connection sites and policy/site forwarding remain; this is not blanket coverage
+of all internal connections. Checks preceding catch boundaries are retained.
+The strict switch still cannot detect a user transaction already cleared before
+the commit hook. The `[internal_connection]` canaries cover teardown suppression,
+construction-failure unwinding, and explicit allowed/forbidden transaction policy;
+run them both normally and with `DBSP_STRICT_INTERNAL_QUERY=1` in a fresh process.

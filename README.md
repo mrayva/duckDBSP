@@ -3,7 +3,7 @@
 Real-time incrementally maintained materialized views for DuckDB, based on [Database Stream Processing (DBSP)](https://www.feldera.com/blog/what-is-dbsp) theory.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![DuckDB](https://img.shields.io/badge/DuckDB-tip-blue.svg)](https://duckdb.org/)
+[![DuckDB](https://img.shields.io/badge/DuckDB-v2.0.0--alpha39998-blue.svg)](https://duckdb.org/)
 
 ## Overview
 
@@ -119,17 +119,121 @@ See [examples/](examples/) for more comprehensive demos.
 ```
 
 This will:
-1. Initialize the `duckdb/` submodule if not already present (tracks
-   current DuckDB main — bumped regularly, not a fixed release)
-2. Build the DBSP extension against it in tip-compatibility mode (uses
-   `ccache` and Ninja automatically when installed; parallelism capped at
-   `-j 8`)
+1. Download DuckDB source (if not present), pinned by COMMIT
+2. Build the DBSP extension (uses `ccache` and Ninja automatically when
+   installed; parallelism capped at `-j 8`)
 3. Output `dbsp.duckdb_extension`
 
-`DBSP_ENGINE_HOOK=1 ./build.sh` instead builds the legacy SaaS-fork path
-against a patched v1.5.4-era engine (`patches/v1.5.4-dbsp-txn-callback.patch`)
-— requires your own patched `duckdb/` checkout; unmaintained against
-current tip and not the primary supported path.
+**No engine patch.** The engine tree in `duckdb/` is stock, and `build.sh`
+fails loudly if it is not: change capture comes from generated statement
+triggers, which are ordinary SQL objects a stock DuckDB already supports. The
+extension therefore loads into the public PyPI wheel of the same engine commit,
+and CI can build against one.
+
+### SQL DDL
+
+`CREATE [OR REPLACE] MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW [IF EXISTS]
+name [CASCADE]` and `REFRESH MATERIALIZED VIEW` are recognised by
+`ParserExtension::parser_override`, which sees the RAW query text before
+DuckDB's PEG grammar. The SQL a view stores is therefore byte-exact with what
+was typed (comments included), and `DROP MATERIALIZED VIEW` works — the 2.0
+grammar claims that statement and throws `Cannot drop MATERIALIZED VIEW yet`,
+so a hook running only on parse failures could never reach it.
+
+**Loading the extension raises `allow_parser_override_extension` to
+`FALLBACK`, but only from `DEFAULT`** — DuckDB's default, which skips every
+override callback. An explicit `FALLBACK` or `STRICT` is left alone. The
+setting is global, so other parser-override extensions in that database become
+active too. Setting it back to `DEFAULT` keeps the DDL working through the
+older token-reconstruction hook — same view, normalised stored SQL, no DROP.
+
+### The delta source
+
+The extension learns what a committing transaction wrote from statement-level
+`AFTER` triggers it generates on every tracked table. `dbsp_track(t)` creates
+three of them plus a small `dbsp_trigger_sink` table in `t`'s own catalog; the
+bodies hand the exact old/new row images to the extension, which buffers them
+per transaction and applies them at commit. There is no mode switch and no
+second mechanism. Full design: `docs/DESIGN_TRIGGER_SOURCE.md`.
+
+The scan-and-diff reconcile (`dbsp_sync`) remains the safety net: any commit
+whose picture is or might be incomplete is reconciled by scanning, so
+correctness never depends on a trigger having fired.
+
+#### What tracking a table costs it
+
+These are engine behaviours, measured on `v2.0.0-alpha39998` and pinned by
+`test/unit/test_trigger_source.cpp`. They are permanent constraints on every
+tracked table, to be re-checked when DuckDB 2.0 goes stable.
+
+| On a tracked (triggered) table | Engine response |
+|---|---|
+| `MERGE INTO <t> ...` | `Not implemented Error: MERGE INTO is not supported on tables with triggers` |
+| `INSERT ... ON CONFLICT DO UPDATE` | `Not implemented Error: ON CONFLICT DO UPDATE is not yet supported with REFERENCING NEW TABLE AS triggers` |
+| `INSERT OR REPLACE` (same path) | same error |
+| `ALTER TABLE ... DROP COLUMN` / `RENAME COLUMN` / `ALTER COLUMN ... TYPE` / `RENAME TO` | `Dependency Error: Cannot alter entry "t" because there are entries that depend on it.` |
+| `ALTER TABLE ... ADD COLUMN` | allowed — the sweep notices and regenerates the bodies |
+| `INSERT ... ON CONFLICT DO NOTHING` | allowed |
+| `DROP TABLE` | allowed; takes the triggers with it, and a recreate + re-track reinstalls them |
+
+**Storage version.** `CREATE TRIGGER` requires a database at storage version
+`v2.0.0` or higher. A file written by DuckDB 1.5.4 is `v1.0.0+`, and tracking a
+table in it throws
+`Binder Error: CREATE TRIGGER is only supported for storage versions v2.0.0 and higher`.
+Files created by the 2.0 wheel are `v2.0.0+` and need nothing. To migrate an
+older one:
+
+```sql
+ATTACH 'old.duckdb' AS src (READ_ONLY);
+ATTACH 'new.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');
+COPY FROM DATABASE src TO dst;
+```
+
+then move the `old.duckdb.dbsp_spill/` sidecar directory alongside the new file
+(the paths are derived from the database path). Verified: the restored views
+match plain SQL, the triggers install on the next statement, and edits are
+served by exact deltas.
+
+The triggers and the sink are user-visible catalog objects: they appear in
+`duckdb_triggers()` / `duckdb_tables()`, are WAL-logged, and travel in
+`EXPORT DATABASE`.
+
+Verify the source is live — a database whose triggers never fire is otherwise
+indistinguishable from one with nothing to report:
+
+```sql
+SELECT * FROM dbsp_stats();
+-- trigger_syncs          5   trigger-body ingests served
+-- trigger_rows          12   row images buffered
+-- exact_delta_syncs      4   table deltas applied exactly (no scan)
+-- scan_syncs             2   scan-and-diff reconciles
+-- provisional_tables     0   baselines awaiting a concurrency watermark
+-- reconcile_failures     0   reconcile scans that did NOT run
+-- last_reconcile_error  NULL text of the last one, in the `detail` column
+```
+
+`dbsp_stats()` has three columns — `metric`, `value` (BIGINT) and `detail`
+(VARCHAR, NULL on every numeric row).
+
+With `DBSP_TIMING=1` the trigger path prints `[dbsp-timing] trigger_ingest`.
+
+`provisional_tables` is 0 in a single-writer session. It counts tables seeded
+while ANOTHER connection had a transaction open: that transaction may already
+have written the table before it was tracked — invisible to the seeding scan
+and reported by no trigger — so the table takes no exact deltas and is
+reconciled by scan until every transaction alive at seed time has ended.
+
+### Python probe scripts
+
+`test/python/*.py` run the loadable extension on a real Python client and are
+**not** part of `ctest`. Each takes the extension path and prints `PASS`:
+
+```bash
+uv run --isolated --with 'duckdb==1.6.0.dev379' --with pyarrow \
+  python test/python/test_ddl_syntax.py build/dbsp.duckdb_extension
+```
+
+See `docs/TESTING.md`.
 
 ### Loading the Extension
 
@@ -141,28 +245,26 @@ LOAD '/path/to/dbsp.duckdb_extension';
 
 ### Running Tests
 
-Default build/test flow, against the `duckdb/` submodule (current tip):
-
 ```bash
-cmake -S . -B build -DDUCKDB_SOURCE_DIR="$PWD/duckdb"
-cmake --build build -j8
-ctest --test-dir build --output-on-failure -j1 --timeout 120
+# Build and run the full suite (unit + integration)
+cd test/build_test
+cmake .. && make -j8
+ctest
+
+# Same suite under DuckDB's vector verification — catches chunks handed to
+# the engine with stale child-vector sizes. CI runs all three.
+DBSP_TEST_VERIFY_VECTORS=1 ctest
+
+# Same suite under the internal-connection law: a helper that opens its own
+# connection for a data read or DDL while the user's transaction is open
+# throws, naming the site. Off by default (see docs/TESTING.md).
+DBSP_STRICT_INTERNAL_QUERY=1 ctest
 
 # Benchmarks (built but not part of ctest)
-cmake --build build --target bench_planner_eval soak_differential -j4
-build/test/bench_planner_eval
-SOAK_ROUNDS=60 build/test/soak_differential "[soak]"
+make bench_planner_eval soak_differential
+./bench_planner_eval
+SOAK_ROUNDS=60 ./soak_differential "[soak]"
 ```
-
-`DBSP_TIP_PORT`/`DBSP_ENGINE_HOOK` default to the tip-compatible,
-stock-engine configuration (`ON`/`OFF`) since the submodule always tracks
-current DuckDB main. The excluded-on-tip tests (legacy write-capture,
-optimizer plan-tee, engine-hook APIs current DuckDB has removed or
-changed) simply aren't built by default — see
-[docs/TESTING.md](docs/TESTING.md) for the exact boundary and validated
-counts. Pass `-DDBSP_TIP_PORT=OFF -DDBSP_ENGINE_HOOK=ON` only against a
-separately checked-out, patched v1.5.4-era DuckDB tree (unmaintained
-legacy path).
 
 ### Test Coverage
 
@@ -259,8 +361,14 @@ See [Error Handling Guide](docs/ERROR_HANDLING.md) for details.
 - `CREATE MATERIALIZED VIEW name AS SELECT ...`
 - `CREATE OR REPLACE MATERIALIZED VIEW name AS SELECT ...` - redefine a
   view, rebuilding only it and its transitive dependents
-- `DROP MATERIALIZED VIEW name [CASCADE]`
 - `REFRESH MATERIALIZED VIEW name` (no-op with auto-refresh)
+- Dropping a view is a FUNCTION, not DDL: `SELECT dbsp_drop_view('name')`
+  (aliases `dbsp_drop`) and `SELECT dbsp_drop_view_cascade('name')`
+  (`dbsp_drop_cascade`) to take the dependents with it. `DROP MATERIALIZED
+  VIEW` is claimed by DuckDB's own parser, which throws
+  `NotImplementedException` before any parser extension is consulted — on
+  1.5.4 and on 2.0 alike. The functions return a status string
+  (`'Dropped'`, or the reason) rather than raising, so callers must read it.
 
 **Query Operations:**
 - `SELECT * FROM table` / `SELECT columns FROM table`
@@ -350,20 +458,14 @@ For the mathematical foundations, see [Theory](docs/THEORY.md).
 | **Incremental aggregation** | ~2,200,000 rows/s |
 | **Incremental join (100k delta vs 100k index)** | ~460,000 rows/s |
 | **Delta propagation, 3-level view chain** | ~13 µs/row |
-| **Captured-delta commit (explicit INSERT txn)** | ~0.3 ms |
-| **Captured UPDATE/DELETE commit (1M-row table, single row)** | ~1.5 ms |
-| **Captured autocommit INSERT (1M-row table)** | ~1.0 ms |
 | **Full scan-and-diff sync (50k rows, 3 views)** | ~41 ms |
 
-*Apple M-series, release build (`build`), 100k-row deltas unless noted;
-reproduce with `bench_planner_eval`.*
-
-The captured-delta and plan-tee rows (commit latencies) describe the
-legacy `DBSP_TIP_PORT=OFF` build against a patched engine — that capture
-stack, and its `bench_write_capture` perf gate, aren't built in the
-default (tip) configuration; tip mode uses scan-and-diff for every write
-(docs/DESIGN_WRITE_CAPTURE.md, docs/TESTING.md). The incremental
-filter/aggregate/join/propagation rows apply to both configurations.
+*Apple M-series, release build, 100k-row deltas unless noted; reproduce with
+`bench_planner_eval`. The per-commit figures that used to sit here were
+measured under the predictive capture stack, which no longer exists — they are
+not reproducible and have been removed rather than re-labelled. A commit whose
+trigger bodies fired is served by an exact delta and pays no table scan; every
+other commit pays the scan-and-diff above.*
 
 ## Project Structure
 
@@ -419,3 +521,16 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - The DBSP theory was developed by Mihai Budiu, Tej Chajed, Frank McSherry, Leonid Ryzhyk, and Val Tannen
 - DuckDB team for the excellent embeddable database
+
+### Internal connection ownership
+
+`InternalConnection` in `dbsp_cdc.hpp` binds the recursion guard to the
+connection lifetime and checks the caller's explicit read policy before opening
+it. The guard survives connection destruction, including context teardown.
+Directly adjacent policy/guard/connection sites use this owner. Other legacy
+connection sites and policy/site forwarding remain; this is not blanket coverage
+of all internal connections. Checks preceding catch boundaries are retained.
+The strict switch still cannot detect a user transaction already cleared before
+the commit hook. The `[internal_connection]` canaries cover teardown suppression,
+construction-failure unwinding, and explicit allowed/forbidden transaction policy;
+run them both normally and with `DBSP_STRICT_INTERNAL_QUERY=1` in a fresh process.

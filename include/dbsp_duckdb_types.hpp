@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <iostream>
+
 #include <cmath>
 
 #include "dbsp_circuit.hpp" // dbsp::Node::StateKind, reused by circuit_state_kind()
@@ -453,6 +455,12 @@ public:
 
   // Persist the digest index sidecar for a durable spilled baseline
   // (called from save_checkpoint with the just-computed watermark).
+  // True when the spilled baseline serves from an mmap'd flat index (its
+  // RAM digest map is folded away).
+  bool baseline_flat_mapped() const {
+    return spill_ != nullptr && spill_->flat_mapped();
+  }
+
   bool save_spill_index(int64_t wm_count, const std::string &wm_hash) {
     if (spill_ == nullptr || !spill_durable_) {
       return false;
@@ -465,20 +473,20 @@ public:
   // of rescanning the whole table. Returns false (leaving the table
   // deferred, nothing allocated) on any mismatch.
   bool try_adopt_durable_spill() {
-    if (!deferred_ || spill_ != nullptr || !spill_durable_ ||
+    if (!restore_pending_ || spill_ != nullptr || !spill_durable_ ||
         spill_path_hint_.empty()) {
       return false;
     }
     auto candidate = std::make_unique<SpilledBaseline>(spill_path_hint_);
     candidate->set_keep_files(true);
-    if (!candidate->try_load_index(deferred_weight_, deferred_hash_)) {
+    if (!candidate->try_load_index(restore_weight_, restore_hash_)) {
       return false; // dtor keeps the (possibly stale) files for later saves
     }
     spill_ = std::move(candidate);
     pending_changes_.clear();
     sequence_++;
-    deferred_ = false;
-    deferred_hash_.clear();
+    restore_pending_ = false;
+    restore_hash_.clear();
     return true;
   }
 
@@ -552,8 +560,20 @@ public:
     spill_.reset();
   }
 
+  // ---- checkpoint-watermark cache (see fields below) -------------------
+  bool wm_begin_scan() { return wm_dirty_.exchange(false); }
+  void wm_store(int64_t count, std::string hash) {
+    wm_count_ = count;
+    wm_hash_ = std::move(hash);
+  }
+  bool wm_clean() const { return !wm_dirty_.load(); }
+  int64_t wm_count() const { return wm_count_; }
+  const std::string &wm_hash() const { return wm_hash_; }
+  void wm_mark_dirty() { wm_dirty_.store(true); }
+
   // Apply changes
   void insert(const DuckDBRow &row) {
+    wm_mark_dirty();
     maybe_auto_spill();
     if (spill_) {
       spill_->apply_row(row_values(row), 1);
@@ -564,6 +584,7 @@ public:
   }
 
   void remove(const DuckDBRow &row) {
+    wm_mark_dirty();
     if (spill_) {
       spill_->apply_row(row_values(row), -1);
     } else {
@@ -573,6 +594,7 @@ public:
   }
 
   void update(const DuckDBRow &old_row, const DuckDBRow &new_row) {
+    wm_mark_dirty();
     if (spill_) {
       spill_->apply_row(row_values(old_row), -1);
       spill_->apply_row(row_values(new_row), 1);
@@ -588,6 +610,7 @@ public:
   // sync: the delta is propagated by the caller, so pending_changes_ is
   // not involved)
   void apply_delta(const DuckDBZSet &delta) {
+    wm_mark_dirty();
     maybe_auto_spill();
     for (const auto &[row, w] : delta) {
       if (spill_) {
@@ -605,6 +628,7 @@ public:
   // swaps the new baseline in.
 
   void begin_rebuild() {
+    wm_mark_dirty();
     if (spill_) {
       spill_->begin_rebuild();
     } else {
@@ -626,7 +650,7 @@ public:
     }
   }
 
-  // ---- deferred baseline (D3c lazy restore) ----------------------------
+  // ---- restore-pending baseline (D3c lazy restore) ---------------------
   // A checkpoint-restored table whose save-time watermark matched live
   // storage does not need its baseline materialized to serve reads: the
   // restored sink already holds the view results. The baseline (and any
@@ -635,20 +659,208 @@ public:
   // semantically "exactly the committed table content", summarized by the
   // restore-time watermark carried here.
 
-  void mark_deferred(int64_t expected_weight, std::string row_hash) {
-    deferred_ = true;
-    deferred_weight_ = expected_weight;
-    deferred_hash_ = std::move(row_hash);
+  void mark_restore_pending(int64_t expected_weight, std::string row_hash) {
+    restore_pending_ = true;
+    restore_weight_ = expected_weight;
+    restore_hash_ = std::move(row_hash);
+    // A deferred baseline IS the committed table content by construction —
+    // the restore verified the save-time watermark against live storage. So
+    // deferral is a RESIDENCY state, not a trust state: the content is
+    // trusted, it is merely not materialized yet, and an exact delta is served
+    // through prepare_deferred_for_delta rather than refused. Hence SEEDED
+    // here, with `restore_pending_` living beside the trust enum rather than in it.
+    mark_seeded();
   }
 
-  bool is_deferred() const { return deferred_; }
-  int64_t deferred_weight() const { return deferred_weight_; }
-  const std::string &deferred_hash() const { return deferred_hash_; }
+  // RESIDENCY, not trust — and deliberately not sharing a word with
+  // Baseline::Deferred, which is the trust state for "a seeding scan is owed".
+  bool restore_pending() const { return restore_pending_; }
+  int64_t restore_weight() const { return restore_weight_; }
+  const std::string &restore_hash() const { return restore_hash_; }
+
+  // ---- baseline trust state ---------------------------------------------
+  //
+  // How far this table's baseline can be trusted. This is the ONLY question
+  // the two consultation points ask: the delta APPLY path
+  // (CDCManager::apply_captured_deltas) and the view READ path
+  // (CDCManager::view_read_block). Anything not SEEDED is scanned by the
+  // commit hook's reconcile sweep (CDCManager::untrusted_baselines) instead of
+  // being served an exact delta.
+  //
+  // UNSEEDED — nothing has read committed storage into it yet, so it is empty
+  // BECAUSE NOTHING SCANNED IT, which is not the same as "empty because the
+  // table is empty"; the two are indistinguishable from the Z-set alone. A
+  // freshly constructed table is here until its seeding scan runs. Applying an
+  // exact delta onto it makes the view hold the delta ALONE — measured across
+  // connections, `view 1.0 / sql 11.0`.
+  //
+  // DEFERRED — unseeded, and OWED a scan: CDCManager::seed_baseline was asked
+  // for a baseline while a user transaction was open, where a scan on an
+  // internal connection cannot see that transaction's uncommitted rows. This
+  // is the state that used to be a sticky per-CONNECTION boolean naming no
+  // table, which is why the debt could only be paid by a full sync_all on that
+  // one connection. It refuses exact deltas and reads exactly as UNSEEDED
+  // does; what it adds is a NAME and a readiness watermark, so any connection's
+  // commit can pay it with one scoped scan once the deferring transaction has
+  // ended. A read is refused rather than repaired: the missing rows are
+  // uncommitted on another connection, so no scan can find them.
+  //
+  // PROVISIONAL — seeded correctly from committed storage while ANOTHER
+  // connection held a transaction open, so it may be SHORT by what that
+  // transaction had already written to the table before it was tracked: the
+  // scan could not see those rows and no trigger fired for them, because there
+  // were no triggers when the statement ran. Measured before this state:
+  // `view 10.0 / sql 13.0`, then `14.0 / 17.0`, and it never healed. The
+  // watermark is a transaction-manager start timestamp newer than every
+  // transaction alive at seed time; once no_active_snapshot_before() reports
+  // that DuckDB's minimum visibility bound covers the watermark, one scan of
+  // committed storage pays the debt (CDCManager::sync_tables retires it there,
+  // on a scan that SUCCEEDED).
+  //
+  // SEEDED — established from committed storage with nothing outstanding. The
+  // only state that serves an exact delta.
+  //
+  // Atomic because the retirement runs under a SHARED struct lock, having
+  // already released the per-table lock the scan held.
+  // Ordered WORST FIRST: the read gate reports the worst state in a view's
+  // source tree, which is then a `<` on this enum and needs no second ranking.
+  enum class Baseline { Unseeded, Deferred, Provisional, Seeded };
+
+  Baseline baseline() const { return baseline_.load(); }
+
+  // The one predicate the apply path asks.
+  bool serves_exact_delta() const { return baseline() == Baseline::Seeded; }
+
+  // Has a scan of committed storage ever stood behind this baseline? False for
+  // both states that have never had one, which is what decides whether
+  // create_view must seed the source before replaying it.
+  bool established() const {
+    const auto b = baseline();
+    return b == Baseline::Provisional || b == Baseline::Seeded;
+  }
+
+  // The seeding scan could not run: a user transaction was open, and a scan on
+  // an internal connection cannot see its uncommitted rows. `watermark` is a
+  // timestamp the deferring transaction's end passes (its own start + 1), so
+  // ready_watermark_cleared() is the question "has that transaction ended?" —
+  // the same comparison PROVISIONAL uses, against the same counter.
+  // `pre_trigger_rows`: the deferring transaction ALREADY held uncommitted
+  // changes when it tracked this table — see pre_trigger_rows() for what that
+  // costs. Sticky across repeated deferrals:
+  // one tainted deferral taints the debt, and only establishing it clears the
+  // bit.
+  void mark_seed_deferred(uint64_t watermark, bool pre_trigger_rows) {
+    if (pre_trigger_rows) {
+      pre_trigger_rows_ = true;
+    }
+    auto s = baseline_.load();
+    while (s == Baseline::Unseeded || s == Baseline::Deferred) {
+      if (baseline_.compare_exchange_weak(s, Baseline::Deferred)) {
+        // NEVER LOWER IT. Two connections can defer the same table, and the
+        // watermark says which transaction the debt is waiting on — the LAST
+        // one to end. Overwriting let an older transaction's lower watermark
+        // clear while the newer transaction was still open, and the reconcile
+        // scan then established the baseline without its rows: measured
+        // `view 10.0` against SQL `13.0`, and it never healed, because the
+        // write predated the triggers and so fed nothing. Pinned by
+        // `watermark_never_lowers` in test/python/test_create_view_seeding.py.
+        uint64_t seen = ready_watermark_.load();
+        while (watermark > seen &&
+               !ready_watermark_.compare_exchange_weak(seen, watermark)) {
+        }
+        return;
+      }
+    }
+  }
+
+  // A scan established this baseline. Never DOWNGRADES a PROVISIONAL table:
+  // retiring that state needs proof its watermark cleared, which only
+  // CDCManager::retire_scanned_baseline can supply.
+  //
+  // Only a scan that could have seen everything may call this, and only
+  // retire_scanned_baseline knows whether one did — which is why
+  // finish_rebuild() takes no say in it at all and install_rebuild's
+  // `establishes` is true at exactly one site, the seeding scan. Measured with
+  // any scan clearing the debt: crash recovery's resync, which runs from
+  // QueryBegin inside the very transaction that deferred the seed, marked the
+  // baseline trusted from a committed-only read and the commit then reconciled
+  // nothing — view 10.0 where SQL read 13.0.
+  void mark_seeded() {
+    auto s = baseline_.load();
+    while (s == Baseline::Unseeded || s == Baseline::Deferred) {
+      if (baseline_.compare_exchange_weak(s, Baseline::Seeded)) {
+        ready_watermark_ = 0;
+        pre_trigger_rows_ = false;
+        return;
+      }
+    }
+  }
+
+  // Does this DEFERRED debt hold rows NOBODY can report?
+  //
+  // The rows a deferred baseline is missing belong to the transaction that
+  // deferred it, and they reach a view one of two ways: the triggers report
+  // them at that transaction's commit, or `capture_.touched` names the table
+  // and the commit scans it. BOTH need the table to have been tracked BEFORE
+  // the write — the triggers do not exist until the transaction ends, and a
+  // statement that writes an UNTRACKED table folds without naming it. Note it
+  // is TRACKED that matters, not TRIGGERED: a write to a tracked table whose
+  // triggers are not installed yet is still named by `touched`.
+  //
+  // So a transaction that had already changed this table when it tracked it —
+  // appended, deleted or updated rows — holds changes no one will ever report.
+  // Nothing but that transaction's OWN commit sweep can establish the
+  // baseline, and a scan by anyone else — a third connection's `dbsp_sync()`,
+  // another connection's commit reconcile — would mark it trusted while it is
+  // wrong. Measured: `view 10.0` against SQL `13.0` for an INSERT, `13.0`
+  // against `10.0` for a DELETE and for an UPDATE, permanently.
+  //
+  // The bit is `DuckTransaction::ChangesMade()` at tracking time, which is
+  // transaction-WIDE: the engine offers no public per-table answer
+  // (CDCManager::probe_deferring_transaction says what it does offer and why
+  // that is not enough), so a transaction that changed ANYTHING before tracking
+  // reads as tainted. The name is historical — the first probe saw only
+  // appended rows, which is the wrong answer this replaces.
+  //
+  // False is the common case and costs nothing: the table was tracked first,
+  // so every later write of that transaction is accounted for and any scan may
+  // establish the baseline — which is what keeps a second connection reading
+  // correct answers during the window instead of being refused.
+  bool pre_trigger_rows() const { return pre_trigger_rows_; }
+
+  // Watermark BEFORE state; mark_seed_deferred writes state before watermark.
+  // Neither order is safe on its own against a concurrent reader, and neither
+  // needs to be: both run under CDCManager::struct_mutex_ held EXCLUSIVELY (a
+  // fresh track/create) or under the scanned table's own exclusive lock, so no
+  // reader can observe the pair half-written. The atomics are for the LOCK-FREE
+  // readers of `baseline()` on the apply and read paths, which take only a
+  // shared lock and read one field.
+  void mark_provisional(uint64_t watermark) {
+    ready_watermark_ = watermark;
+    baseline_ = Baseline::Provisional;
+  }
+  void retire_provisional() {
+    ready_watermark_ = 0;
+    baseline_ = Baseline::Seeded;
+  }
+
+  // Zero = nothing to wait on. Meaningful in DEFERRED and PROVISIONAL.
+  uint64_t ready_watermark() const { return ready_watermark_; }
 
   // Install the rows fed through begin_rebuild()/add_scanned_row() as the
   // baseline WITHOUT diffing against the previous one (there is none: the
   // table was deferred). Clears the deferred flag.
-  void install_rebuild() {
+  // `establishes`: MANDATORY, because the wrong answer is silent. TRUE only
+  // for a scan that could see everything a not-yet-Seeded baseline is waiting
+  // on — in practice the seeding scan, which CDCManager::seed_baseline already
+  // refuses to run inside an open user transaction. Every other caller
+  // REFRESHES content and passes false; establishing then belongs to
+  // CDCManager::retire_scanned_baseline, which asks the readiness and
+  // concurrency questions a refresh does not.
+  void install_rebuild(bool establishes) {
+    if (establishes) {
+      mark_seeded();
+    }
     if (spill_) {
       // No diff wanted: swap the generation in directly. The end_rebuild
       // diff path reads every added payload back from disk — hours at
@@ -660,10 +872,14 @@ public:
     }
     pending_changes_.clear();
     sequence_++;
-    deferred_ = false;
-    deferred_hash_.clear();
+    restore_pending_ = false;
+    restore_hash_.clear();
   }
 
+  // Installs CONTENT and diffs it; it never touches the trust state. The one
+  // caller is CDCManager::sync_table_scan_and_consume, and the decision to
+  // retire an untrusted baseline is taken once, next to it, by
+  // CDCManager::retire_scanned_baseline.
   DuckDBZSet finish_rebuild() {
     DuckDBZSet delta;
     if (spill_) {
@@ -718,17 +934,17 @@ public:
   }
 
   size_t state_size() const {
-    if (deferred_) {
+    if (restore_pending_) {
       // Distinct-row count is unknown while deferred; total weight is the
       // best (upper-bound) answer and exact for duplicate-free tables.
-      return static_cast<size_t>(deferred_weight_);
+      return static_cast<size_t>(restore_weight_);
     }
     return spill_ ? spill_->distinct_rows() : current_state_.size();
   }
 
   int64_t state_total_weight() const {
-    if (deferred_) {
-      return deferred_weight_; // restore-time COUNT(*), watermark-verified
+    if (restore_pending_) {
+      return restore_weight_; // restore-time COUNT(*), watermark-verified
     }
     if (spill_) {
       return spill_->total_weight();
@@ -751,7 +967,7 @@ public:
   // as StateBytes.
 
   const char *state_mode() const {
-    if (deferred_) {
+    if (restore_pending_) {
       return "deferred";
     }
     return spill_ ? "spilled" : "boxed";
@@ -759,7 +975,7 @@ public:
 
   size_t resident_bytes(StateAccounting &acct) const {
     size_t b = acct.zset_bytes(pending_changes_);
-    if (deferred_) {
+    if (restore_pending_) {
       return b; // nothing materialized yet
     }
     if (spill_) {
@@ -827,11 +1043,26 @@ private:
   std::string spill_path_hint_; // set by CDCManager; empty = no auto-spill
   bool spill_durable_ = false;  // files survive process exit (per-DB dir)
   uint64_t sequence_;
-  // Deferred baseline (D3c): true until the first operation that needs
-  // table state materializes it from a storage scan.
-  bool deferred_ = false;
-  int64_t deferred_weight_ = 0; // restore-time COUNT(*)
-  std::string deferred_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
+  // Checkpoint-watermark cache (save_checkpoint): starts dirty; every
+  // content mutation re-dirties. wm_begin_scan() uses exchange so a write
+  // racing the save's scan re-dirties AFTER the exchange and the next
+  // save rescans — a stale cached watermark can only ever cause a
+  // load-side mismatch (safe rebuild), never a wrong adopt.
+  std::atomic<bool> wm_dirty_{true};
+  int64_t wm_count_ = 0;
+  std::string wm_hash_;
+  // Restore-pending baseline (D3c): true until the first operation that needs
+  // table state materializes it from a storage scan. RESIDENCY, not trust —
+  // see mark_restore_pending().
+  bool restore_pending_ = false;
+  // The one trust state — see Baseline above.
+  std::atomic<Baseline> baseline_{Baseline::Unseeded};
+  // The transaction-manager timestamp this state waits on; 0 = nothing.
+  std::atomic<uint64_t> ready_watermark_{0};
+  // See pre_trigger_rows(). Meaningful only while baseline_ is DEFERRED.
+  std::atomic<bool> pre_trigger_rows_{false};
+  int64_t restore_weight_ = 0; // restore-time COUNT(*)
+  std::string restore_hash_;   // restore-time bit_xor(hash(row)) as VARCHAR
 };
 
 // Base class for native materialized views
@@ -902,6 +1133,30 @@ public:
 
   // Reset the view
   virtual void reset() = 0;
+
+  // --- Declared row key (delta-apply fast path) ------------------------
+  // A delta is applied to the backing table by deleting the retracted row
+  // and inserting the new one. Without a key that DELETE has to match on
+  // EVERY column (`IS NOT DISTINCT FROM` per column), so applying a
+  // one-row delta scans the whole view across all its columns: measured
+  // O(rows x columns) per commit, ~0.5ms per column on a 1M-row view, and
+  // the dominant cost of an incremental edit.
+  //
+  // When the creator declares a key, the DELETE matches those columns with
+  // plain equality instead, which is an equi-join the planner can hash
+  // (17x on 1M rows x 199 columns). `IS NOT DISTINCT FROM` is NOT an
+  // equi-join key, which is why narrowing the predicate without switching
+  // to equality does not help — it measured slower.
+  //
+  // CONTRACT, and the caller owns it: the columns must be UNIQUE over the
+  // view's rows and NEVER NULL. create_view verifies uniqueness against
+  // the initial result and refuses the key otherwise; a key that only
+  // becomes non-unique later would retract the wrong row. Empty = no key
+  // declared = the all-columns path, which stays the default.
+  const std::vector<std::string> &key_columns() const { return key_columns_; }
+  void set_key_columns(std::vector<std::string> cols) {
+    key_columns_ = std::move(cols);
+  }
 
   virtual void
   scan(const std::function<void(const DuckDBRow &, Weight)> &callback) const {
@@ -980,7 +1235,7 @@ public:
   }
 
   // --- Lazy per-view checkpoint restore (D-lazy) -------------------------
-  // Mirrors TrackedTable::is_deferred()/mark_deferred() for views: a view
+  // Mirrors TrackedTable::restore_pending()/mark_restore_pending() for views: a view
   // cold-created (skip_init_replay) from the D3b checkpoint fast path with
   // dbsp_lazy_restore ON has its node/sink blobs stashed, undecoded, in
   // CDCManager::pending_restore_ instead of being injected immediately.
@@ -998,6 +1253,8 @@ protected:
   std::string name_;
   std::string sql_;
   uint64_t version_;
+  // Declared unique/non-null row key; empty = match on all columns.
+  std::vector<std::string> key_columns_;
   // apply_changes_batch state (default multi-source path only)
   DuckDBZSet batch_delta_;
   bool batched_ = false;
@@ -1582,23 +1839,56 @@ public:
       }
 
       DuckDBRow result_row = project_ ? project_(row) : row;
-      result_.insert(result_row, weight);
       delta_.insert(result_row, weight);
     }
+    // result_ is LAZY (same contract as NativeWindowView's): the one
+    // production construction is embedded behind EmbeddedViewNode, which
+    // propagates get_delta() only; the presentation-root ordered read path
+    // (PlannedCircuitView::scan -> ordered_view_->scan) iterates
+    // sorted_rows_, never result_. With a projection, result_ was a full
+    // UNSHARED second copy of every row.
+    result_.clear();
+    result_valid_ = false;
     ++version_;
   }
 
-  const DuckDBZSet &get_result() const override { return result_; }
-  void set_result(const DuckDBZSet &result) override { result_ = result; version_++; }
+  const DuckDBZSet &get_result() const override {
+    if (!result_valid_) {
+      result_.clear();
+      for (const auto &row : sorted_rows_) {
+        result_.insert(project_ ? project_(row) : row, 1);
+      }
+      result_valid_ = true;
+    }
+    return result_;
+  }
+  void set_result(const DuckDBZSet &result) override {
+    result_ = result;
+    result_valid_ = true;
+    version_++;
+  }
   const DuckDBZSet &get_delta() const override { return delta_; }
   const TableSchema &result_schema() const override { return schema_; }
   std::vector<std::string> source_tables() const override {
     return {source_table_};
   }
 
+  // Direct-member accounting: the base impl calls get_result(), which
+  // would materialize the lazy result_ during a RAM-accounting pass. The
+  // resident state is sorted_rows_ (+ delta buffer + whatever result_ a
+  // reader materialized).
+  void account_state(StateBytes &out, StateAccounting &acct) const override {
+    out.result += acct.zset_bytes(result_);
+    out.other += acct.zset_bytes(delta_);
+    for (const auto &row : sorted_rows_) {
+      out.other += acct.row_bytes(row) + 32;
+    }
+  }
+
   void reset() override {
     sorted_rows_.clear();
     result_.clear();
+    result_valid_ = true; // empty view: empty result is correct
     delta_.clear();
     version_ = 0;
   }
@@ -1674,7 +1964,8 @@ private:
   RowComparator comparator_;
   std::multiset<DuckDBRow, RowComparator> sorted_rows_;
   ProjectFn project_;
-  DuckDBZSet result_;
+  mutable DuckDBZSet result_; // lazy — see apply_changes/get_result
+  mutable bool result_valid_ = true;
   DuckDBZSet delta_;
 };
 

@@ -60,9 +60,8 @@ inline bool is_valid_table_reference(const std::string &name) {
 
 // Canonical dotted key for a resolved table.
 inline std::string canonical_table_key(const duckdb::TableCatalogEntry &entry) {
-  return entry.ParentCatalog().GetName().GetIdentifierName() + "." +
-         entry.ParentSchema().name.GetIdentifierName() + "." +
-         entry.name.GetIdentifierName();
+  return entry.ParentCatalog().GetName() + "." + entry.ParentSchema().name +
+         "." + entry.name;
 }
 
 // Resolve a user-supplied table reference (bare or dotted) through the
@@ -70,21 +69,20 @@ inline std::string canonical_table_key(const duckdb::TableCatalogEntry &entry) {
 inline duckdb::optional_ptr<duckdb::TableCatalogEntry>
 resolve_table_entry(duckdb::ClientContext &context, const std::string &ref) {
   try {
+    // DuckDB 2.0: QualifiedName stores a component path behind Catalog()/
+    // Schema()/Name() accessors, Parse() leaves absent components empty
+    // (no INVALID_CATALOG/INVALID_SCHEMA placeholders), and the catalog
+    // lookup takes the QualifiedName directly.
     auto qn = duckdb::QualifiedName::Parse(ref);
-    const auto catalog = qn.Catalog().GetIdentifierName();
-    const auto schema = qn.Schema().GetIdentifierName();
-    const auto name = qn.Name().GetIdentifierName();
     auto entry = duckdb::Catalog::GetEntry<duckdb::TableCatalogEntry>(
-        context, duckdb::Identifier(catalog), duckdb::Identifier(schema),
-        duckdb::Identifier(name),
-        duckdb::OnEntryNotFound::RETURN_NULL);
-    if (!entry && catalog.empty() && !schema.empty()) {
+        context, qn, duckdb::OnEntryNotFound::RETURN_NULL);
+    if (!entry && qn.Catalog().empty() && !qn.Schema().empty()) {
       // Two-part refs are ambiguous: Parse() reads "a.li" as schema.table,
       // but "a" may be a catalog (ATTACH ... AS a). Mirror the binder and
       // retry with the first part as the catalog.
       entry = duckdb::Catalog::GetEntry<duckdb::TableCatalogEntry>(
-          context, duckdb::Identifier(schema), duckdb::Identifier(),
-          duckdb::Identifier(name),
+          context,
+          duckdb::QualifiedName(qn.Schema(), duckdb::Identifier(), qn.Name()),
           duckdb::OnEntryNotFound::RETURN_NULL);
     }
     return entry;

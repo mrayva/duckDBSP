@@ -51,12 +51,49 @@ Accepted for compatibility — a no-op, since views refresh automatically.
 
 ### DROP MATERIALIZED VIEW
 
-DuckDB parses `DROP MATERIALIZED VIEW` natively, which bypasses the
-extension's parser hook — use the function form instead:
+```sql
+DROP MATERIALIZED VIEW [IF EXISTS] name [CASCADE | RESTRICT];
+```
+
+Drops the view. `IF EXISTS` turns a missing view from an error into a message;
+`CASCADE` drops the view together with every view that depends on it (without
+it, a view with dependents is refused and the error names them).
+
+This works because the extension recognises the statement in
+`ParserExtension::parser_override`, which runs BEFORE the core PEG grammar. The
+grammar CLAIMS `DROP MATERIALIZED VIEW` and its transformer then throws
+`NotImplementedException: Cannot drop MATERIALIZED VIEW yet`, so a hook that
+only sees statements the grammar failed on could never have it. See "How the
+DDL is parsed" below.
+
+The function forms still work and are unchanged:
 
 ```sql
+SELECT dbsp_drop_view('name');      -- or dbsp_drop_view_cascade('name')
 SELECT dbsp_drop('name');           -- or dbsp_drop_cascade('name')
 ```
+
+### How the DDL is parsed
+
+`CREATE`/`DROP`/`REFRESH MATERIALIZED VIEW` are recognised by
+`ParserExtension::parser_override` (`include/dbsp_parser_extension.hpp`), which
+receives the RAW query text before the PEG grammar sees it and rewrites the
+statement into a call on the extension's own functions. Two consequences:
+
+- **The stored SQL is byte-exact.** `dbsp_views()` returns the substring you
+  typed after `AS`, comments and spacing included.
+- **`DROP MATERIALIZED VIEW` is reachable**, as above.
+
+`parser_override` callbacks are SKIPPED unless
+`allow_parser_override_extension` is `FALLBACK` or `STRICT`, and DuckDB's
+default is `DEFAULT`. **Loading the extension raises that setting to
+`FALLBACK`, and only from `DEFAULT`** — an explicit `FALLBACK` or `STRICT` is
+read and left alone. The change is for the whole database, so any other
+parser-override extension becomes active too. Setting it back does not break the DDL: the older
+token-reconstruction hook (which runs on PEG failures) still parses
+`CREATE`/`REFRESH`, and builds the same view. What is lost there is the exact
+text — `dbsp_views()` reports a normalised `t . "col" AS m , ...` with comments
+stripped — and `DROP MATERIALIZED VIEW` goes back to the core parser's refusal.
 
 ---
 
@@ -441,6 +478,30 @@ SELECT * FROM dbsp_query('customer_totals');
 - Query is O(result_size), not O(source_size)
 - Column names derived from SQL or auto-generated (col0, col1, ...)
 
+**Refuses on an unseeded baseline.** Creating a view inside an open
+transaction defers the seeding scan of its sources (that scan runs on an
+internal connection and cannot see the transaction's own rows), so between
+`BEGIN; dbsp_create_view(...)` and the end of that transaction the view stands
+on a baseline nothing has scanned. `dbsp_query` and `dbsp_changes` throw there
+rather than serve the empty answer:
+
+```
+Invalid Input Error: dbsp_query('mv'): source table 'db.main.t' has an
+UNSEEDED baseline — its seeding scan was deferred because a transaction was
+open when the view was created, and nothing has scanned the table since.
+Reading now would return the unseeded (empty) answer, not the table's content.
+End that transaction (COMMIT or ROLLBACK), or run dbsp_sync(), and read again.
+```
+
+The refusal fires on every connection of the instance, not only the one
+holding the transaction: the debt is per-connection but the baseline is
+per-instance. It clears when the deferring transaction ends (its COMMIT widens
+itself to a scan-and-diff; its ROLLBACK asks for a rebuild from committed
+storage) or when someone runs `dbsp_sync()`. `dbsp_view_state()` is not
+gated: it takes no view argument, so there is no view for the gate to ask
+about. Its numbers are diagnostics anyway, and a diagnostic that refuses while
+the state is broken is useless exactly when it is needed.
+
 ---
 
 ### dbsp_changes(view_name)
@@ -690,47 +751,28 @@ SELECT * FROM dbsp_notify_delete('orders', 1, 'Alice', 100.00);
 Toggle automatic change capture — **ON by default**: views update on
 every transaction commit without calling `dbsp_sync`.
 
-Most plain SQL writes commit in **O(delta)** via captured deltas:
+Every write to a tracked table commits in **O(delta)**: `dbsp_track` puts
+statement-level `AFTER` triggers on the table, and their bodies hand the exact
+old and new row images to the extension as the statement runs. That covers
+INSERT (`VALUES`, `SELECT`, `COPY FROM`, the C++ `Appender`), UPDATE, DELETE
+and TRUNCATE, whatever the predicate — including shapes nothing could predict:
+`UPDATE ... FROM`, volatile expressions, prepared parameters, subqueries that
+read this transaction's own uncommitted writes, indexed-column UPDATEs, and
+repeated writes to one table in a transaction.
 
-- **INSERT** — explicit transactions containing only INSERTs (G2,
-  captured from transaction-local storage), and autocommit INSERTs from a
-  VALUES list or a deterministic SELECT (evaluated with the INSERT's own
-  casts; partial column lists take their declared DEFAULTs; ~1.0 ms at
-  1M rows). SELECT sources must be repeatable: no LIMIT/SAMPLE, no table
-  functions, no window functions, no CTEs.
-- **Upserts** (`INSERT ... ON CONFLICT (cols) DO UPDATE SET
-  excluded.-qualified / DO NOTHING`) — captured via a LEFT JOIN probe of
-  committed state; unqualified target columns in SET, conditional
-  `DO ... WHERE`, `OR REPLACE`, and implicit conflict targets fall back.
-- **UPDATE / DELETE** — explicit-transaction *and* autocommit statements
-  (write capture: one internal SELECT reads the old images and computes
-  the new ones before the statement runs; a commit guard — interleaved-
-  commit check, signed COUNT(*), rowid re-verification — validates the
-  captured delta against committed storage). Subquery predicates and
-  `DELETE ... USING` (rewritten to a correlated EXISTS probe) capture
-  too, when the statement sees pure committed state: autocommit, or an
-  explicit transaction before its first write. A single-row UPDATE on a
-  1M-row table syncs in ~1.5 ms vs ~2.4 s for scan-and-diff.
+Scan-and-diff, scoped to the tables the transaction touched, remains the
+fallback for anything the triggers could not account for: a write matching zero
+rows (the bodies evaluate nothing, so the commit cannot tell that from silence),
+a transaction under which the triggers were installed or regenerated, an
+unparseable or multi-statement string whose targets could not be resolved, and
+a delta that failed to convert. Correctness never depends on a trigger having
+fired.
 
-- **Any other UPDATE or DELETE** — a plan tee (optimizer extension)
-  observes the exact rows the statement processed, covering everything
-  the pre-image capture declines: `UPDATE ... FROM`, prepared
-  parameters, volatile expressions, post-write subqueries, `USING` over
-  transaction-local state, indexed-column UPDATEs, repeated writes to
-  one table in a transaction.
-
-Everything else uses scan-and-diff scoped to the tables the transaction
-touched: multi-match `UPDATE ... FROM` (two new images for one row —
-ambiguous, the tee detects it and steps aside), CTEs/`RETURNING` on
-non-teeable shapes,
-non-deterministic expressions (`random()`, `now()`), UPDATEs of indexed
-or LIST-typed columns, multi-statement strings, and any
-transaction that writes the same table twice. If any
-statement in a transaction is un-capturable, the whole transaction falls
-back — captured and scanned deltas never mix for one commit, and guard
-failures fall back loudly (`capture_guard_fallbacks` counter).
-Correctness never depends on capture; the design is in
-`docs/DESIGN_WRITE_CAPTURE.md`.
+Tracking a table also **costs** it: on a table carrying triggers the engine
+refuses `MERGE INTO`, `INSERT ... ON CONFLICT DO UPDATE`, `INSERT OR REPLACE`,
+and every `ALTER TABLE` form except `ADD COLUMN`; the database must be at
+storage version `v2.0.0` or higher. The full list, with the engine's own error
+messages, is in `docs/DESIGN_TRIGGER_SOURCE.md`.
 
 **DuckDB tip compatibility:** the write-capture and optimizer plan-tee APIs
 used by the release path are not present in current DuckDB tip. In
@@ -811,7 +853,9 @@ still-pending view's live state decodes it transparently — the query or
 delta still returns/applies the exact same result, just with the decode
 cost deferred to when it's actually needed. A checkpointed view never
 touched between reopen and the next `dbsp_save()` is re-saved verbatim
-(no decode at all).
+(no decode at all); on a disk-backed database, where the stash holds
+placeholders and the bytes live in `_dbsp_ckpt`, the save keeps that
+view's existing rows in place instead of rewriting them.
 
 One deliberate exception to "decodes transparently on first read": `dbsp_views()`
 reports a pending view's row count from the checkpoint's stashed metadata
@@ -841,15 +885,46 @@ SELECT * FROM dbsp_lazy_restore();       -- Query status
 Sync-path observability counters, for monitoring which ingestion path
 serves a workload:
 
+Three columns: `metric`, `value` (BIGINT), `detail` (VARCHAR, NULL on every
+numeric row).
+
 ```sql
 SELECT * FROM dbsp_stats();
--- metric                  | value
--- captured_delta_syncs    | 1042   -- O(Δ) captured applies (per table)
--- scan_syncs              | 3      -- scan-and-diff fallbacks
--- capture_guard_fallbacks | 0      -- guard-rejected captures (loud)
--- commit_seq              | 1045   -- monotonic baseline mutations
--- tracked_tables          | 4
+-- metric                | value | detail
+-- exact_delta_syncs    | 1042  |        -- exact table deltas applied (no scan)
+-- scan_syncs            | 3     |        -- scan-and-diff fallbacks
+-- commit_seq            | 1045  |        -- monotonic baseline mutations
+-- tracked_tables        | 4     |
+-- trigger_syncs         | 1310  |        -- trigger-body ingest calls served
+-- trigger_rows          | 5218  |        -- row images they buffered
+-- provisional_tables    | 0     |        -- awaiting a concurrency watermark
+-- reconcile_failures    | 0     |        -- reconcile scans that did NOT run
+-- last_reconcile_error  | NULL  | NULL   -- text of the last one
 ```
+
+`trigger_syncs` is the proof of life: it stays 0 until a generated trigger body
+has actually delivered, so a database whose triggers never fire is
+distinguishable from one with nothing to report. An UPDATE fires ONE trigger
+whose body evaluates the ingest scalar TWICE — the two arms of a UNION ALL over
+the old and new transition tables — so it adds 2.
+
+`provisional_tables` counts tables seeded while ANOTHER connection had a
+transaction open. Such a transaction may already have written the table before
+it was tracked — invisible to the seeding scan and reported by no trigger — so
+the table takes no exact deltas and is reconciled by scan until every
+transaction alive at seed time has ended, at which point one scan retires it.
+It is 0 in an ordinary single-writer session. A value that never falls means a
+connection is sitting on an open transaction; every commit is paying a scan of
+those tables until it ends.
+
+`reconcile_failures` counts reconcile scans that did NOT run, and
+`last_reconcile_error` carries the text of the last one in `detail`. This is the
+one way a view is left stale with the manager knowing it: the scan reports
+failure by RETURNING, not by throwing, so nothing propagates out of the commit
+hook and the only other trace is a stderr line an embedding host never sees.
+A non-zero `reconcile_failures` means at least one baseline is unchanged when it
+should have been rescanned — read `last_reconcile_error`, fix the cause (a
+dropped source is the usual one) and run `dbsp_sync()`.
 
 ### dbsp_parallel(enable)
 
@@ -870,7 +945,11 @@ backfilled on enable and at view creation, then kept in sync with one
 internal transaction per propagation pass. `__dbsp_mv_meta(view_name,
 commit_seq)` records the watermark of each table's last write. Backing
 tables are ordinary tables: durable across reopen and readable without any
-DBSP state. Disabling stops mirroring and leaves the tables stale.
+DBSP state. Disabling stops mirroring and leaves the tables stale, and the
+disable is STICKY: `load_from_duck_table` runs more than once per manager (once
+from the auto-load, again from crash recovery's `load_views`) and its
+`__dbsp_mv_meta` block would otherwise re-enable mirroring behind the user's
+back. Only an explicit `dbsp_mv_tables(true)` turns it back on.
 
 ```sql
 SELECT * FROM dbsp_mv_tables(true);
@@ -879,6 +958,39 @@ SELECT * FROM dbsp_mv_tables(true);
 Per-commit apply is DELETE (retractions) + INSERT (additions) via a staged
 temp table; any delta weight beyond ±1 rebuilds the table from its own
 current rows + the delta.
+
+By default that DELETE has to identify the retracted row by comparing EVERY
+column of the view (`t.c IS NOT DISTINCT FROM s.c`, one per column), so
+applying a one-row delta scans the whole backing table across all its
+columns — O(rows × columns) per commit. Declare a key with
+`dbsp_set_view_key` to turn it into an equi-join.
+
+### dbsp_set_view_key(view_name, key_columns)
+
+Declares the view's unique, non-null row key as a comma-separated column
+list. The delta-apply DELETE then matches those columns by equality instead
+of comparing every column, which the planner can hash: measured 1.45x on a
+whole authority commit of a 199-column view over a 1M-row grid, and 17x on
+the DELETE in isolation.
+
+```sql
+SELECT * FROM dbsp_set_view_key('orders_mv', 'customer_id');
+SELECT * FROM dbsp_set_view_key('orders_mv', '');  -- clear
+```
+
+Requires `dbsp_mv_tables(true)` first — the key is verified against the
+`__mv_` backing table. The call FAILS if the columns are not unique over the
+view's current rows, if any is NULL, if a column is not in the view, or if
+the view is unknown. Uniqueness is checked against the rows that exist at
+declaration time, which is all it can do: declare a key the view's SQL
+GUARANTEES (a GROUP BY's grouping columns, a dense coordinate grid), never
+one that merely happens to be unique right now — a key that stops being
+unique later retracts the wrong row.
+
+Plain `=` is the point. `IS NOT DISTINCT FROM` is not an equi-join key, so
+narrowing the predicate without switching to equality does not help; it
+measured slower than matching every column. That is why the key must be
+non-null.
 
 **Table-backed reads (Phase 1c)**: once a view's table is written, the sink
 stops integrating — the RAM result is dropped and the __mv_ table IS the

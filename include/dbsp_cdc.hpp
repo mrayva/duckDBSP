@@ -5,8 +5,9 @@
 #pragma once
 
 #include "dbsp_duckdb_types.hpp"
-#include "dbsp_qualified_name.hpp"
 #include "dbsp_plan_translator.hpp"
+#include "dbsp_qualified_name.hpp"
+#include "dbsp_trigger_capability.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -36,6 +38,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <random>
 #include <shared_mutex>
 #include <thread>
 #include <cerrno>
@@ -49,7 +52,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <iostream>
 
 namespace dbsp_native {
 
@@ -59,11 +61,30 @@ namespace dbsp_native {
 // g_recompute_invocations in dbsp_plan_translator.hpp) for asserting "only
 // this view's chain decoded" without parsing DBSP_TIMING stderr output.
 inline std::atomic<size_t> g_lazy_view_decodes{0};
+// Lazy realizes that FAILED to decode their stash (each one schedules the
+// rebuild_pending_ full-rebuild escape hatch). Observable so tests can pin
+// the failure site: record_error_best_effort cannot set last_error_ from
+// realize_pending_view_locked (its callers hold struct_mutex_ shared, so
+// the try-lock always fails and the message goes to stderr only).
+inline std::atomic<size_t> g_lazy_realize_failures{0};
+
+// View-arrangement sidecars (design note at save_checkpoint's sidecar
+// loop): test-observable counters, same g_* convention as above.
+// Arrangements adopted from a view-sourced sidecar at register time
+// (reattach skipped that arrangement's __mv_/result backfill scan):
+inline std::atomic<size_t> g_view_arr_sidecar_adopts{0};
+// Clean view-sourced sidecar files re-stamped in place at save (content
+// unchanged, identity moved to the new checkpoint's save-id):
+inline std::atomic<size_t> g_view_arr_sidecar_restamps{0};
+// Shared-arrangement backfill scans actually performed, across every fill
+// site (register-time, deferred-table materialize, pending-view realize).
+// "Reattach adopts without scanning" == this counter not moving.
+inline std::atomic<size_t> g_arr_backfills{0};
 
 // DBSP_TIMING=1: emit per-phase wall-clock lines to stderr
 // ("[dbsp-timing] <phase> <detail> ms=..."), for profiling restore cost
 // (source sync / arrangement backfill / blob decode) and commit propagation
-// path (apply_captured_delta / arrangements / view_step). Off by default.
+// path (apply_captured_deltas / arrangements / view_step). Off by default.
 inline bool dbsp_timing_enabled() {
   static const bool on = std::getenv("DBSP_TIMING") != nullptr;
   return on;
@@ -73,9 +94,15 @@ struct DbspScopeTimer {
   const char *phase;
   std::string detail;
   std::chrono::steady_clock::time_point t0;
-  DbspScopeTimer(const char *phase_p, std::string detail_p)
-      : phase(phase_p), detail(std::move(detail_p)),
-        t0(std::chrono::steady_clock::now()) {}
+  // Timing off (the default): skip the clock read and drop the detail
+  // string immediately — several call sites build "name rows=N" strings
+  // per view per commit purely for this ctor.
+  DbspScopeTimer(const char *phase_p, std::string detail_p) : phase(phase_p) {
+    if (dbsp_timing_enabled()) {
+      detail = std::move(detail_p);
+      t0 = std::chrono::steady_clock::now();
+    }
+  }
   ~DbspScopeTimer() {
     if (!dbsp_timing_enabled()) {
       return;
@@ -98,6 +125,139 @@ struct InternalQueryGuard {
   InternalQueryGuard(const InternalQueryGuard &) = delete;
   InternalQueryGuard &operator=(const InternalQueryGuard &) = delete;
 };
+
+// Own the recursion guard before opening the connection; reverse member
+// destruction keeps hooks suppressed through Connection/ClientContext teardown.
+// Policy remains explicit: callers sharing a scan helper can have different
+// transaction contracts, and the commit hook has already lost that context.
+class InternalConnection {
+public:
+  InternalConnection(duckdb::ClientContext &context, InternalReadPolicy policy,
+                     const char *site)
+      : connection_(checked_database(context, policy, site)) {}
+
+  duckdb::Connection &operator*() { return connection_; }
+  duckdb::Connection *operator->() { return &connection_; }
+  InternalConnection(const InternalConnection &) = delete;
+  InternalConnection &operator=(const InternalConnection &) = delete;
+
+private:
+  static duckdb::DatabaseInstance &checked_database(
+      duckdb::ClientContext &context, InternalReadPolicy policy,
+      const char *site) {
+    enforce_internal_read_policy(context, policy, site);
+    return duckdb::DatabaseInstance::GetDatabase(context);
+  }
+
+  InternalQueryGuard guard_;
+  duckdb::Connection connection_;
+};
+
+// ---- instance transaction watermark ---------------------------------------
+//
+// A table is seeded from COMMITTED storage. Another connection holding a
+// transaction open at that moment may already have written the table while it
+// was untracked and untriggered — invisible to the seeding scan, and no
+// trigger fired for it because there were no triggers when the statement ran.
+// Its commit then applies nothing and the view is short by those rows forever
+// (measured: `view 10.0 / sql 13.0`, then `14.0 / 17.0`).
+//
+// DuckDB's current API publishes the minimum active snapshot boundary through
+// LowestVisibilityBound(). Compared with a transaction start or the watermark
+// minted by a probe transaction, a boundary below that timestamp means an
+// older snapshot may still be active. Durability can also lower the boundary,
+// so the check errs on the safe side and may delay retirement. A table seeded
+// while an older transaction was open is marked PROVISIONAL; the watermark is
+// clear once no_active_snapshot_before() says the minimum boundary covers it.
+//
+// An attached catalog served by an extension (`IsDuckTransactionManager()`
+// false) has no DuckDB snapshot bound. Deferral is refused there, and the
+// provisional check leaves that catalog's behavior unchanged.
+
+// The attached database holding a canonical `catalog.schema.table` key, or
+// nullptr.
+//
+// Resolved through the DATABASE MANAGER, never through the ClientContext.
+// `resolve_table_entry` needs the transaction's catalog SNAPSHOT, and inside
+// the commit hook that snapshot is already gone: it returned nullptr on every
+// commit and the provisional sweep below never found its table (measured —
+// `cannot resolve fi.main.t` on all seven commits of the reproduction). This
+// lookup only maps a name to an attached database, which the instance owns
+// outside any transaction. The shared_ptr keeps it alive across the call, so a
+// concurrent DETACH cannot pull the transaction manager out from under it.
+// (`Catalog::GetCatalog(DatabaseInstance &, ...)` is declared in the 2.0 alpha
+// header but never defined — it does not link.)
+inline duckdb::shared_ptr<duckdb::AttachedDatabase>
+attached_of_table_key(duckdb::ClientContext &context, const std::string &key) {
+  std::string catalog_name, schema, table;
+  if (!split_table_key(key, catalog_name, schema, table)) {
+    return nullptr;
+  }
+  try {
+    auto &manager = duckdb::DatabaseManager::Get(
+        duckdb::DatabaseInstance::GetDatabase(context));
+    return manager.GetDatabase(duckdb::Identifier(catalog_name));
+  } catch (...) {
+    return nullptr; // detached, or not a name the instance knows
+  }
+}
+
+// Whether the minimum active snapshot boundary is at or beyond timestamp.
+// DuckDB 2.1 exposes a visibility bound rather than the old lowest-start
+// timestamp. A durability-limited bound can be older than a transaction's
+// start, so this may conservatively delay establishment but cannot publish a
+// baseline that missed an older transaction's writes.
+inline bool no_active_snapshot_before(duckdb::AttachedDatabase &attached,
+                                      uint64_t timestamp) {
+  auto &tm = duckdb::TransactionManager::Get(attached);
+  if (!tm.IsDuckTransactionManager()) {
+    return true;
+  }
+  const auto bound =
+      duckdb::DuckTransactionManager::Get(attached).LowestVisibilityBound();
+  const auto start = static_cast<duckdb::transaction_t>(timestamp);
+  return start < bound || bound == duckdb::VisibilityBound::Before(start);
+}
+
+// With no live statement transaction, establishing a baseline is safe only
+// when DuckDB's active-snapshot set is empty. The manager uses these two
+// sentinels before the first transaction and after the last one, respectively.
+inline bool no_active_snapshots(duckdb::AttachedDatabase &attached) {
+  auto &tm = duckdb::TransactionManager::Get(attached);
+  if (!tm.IsDuckTransactionManager()) {
+    return true;
+  }
+  const auto bound =
+      duckdb::DuckTransactionManager::Get(attached).LowestVisibilityBound();
+  return bound == duckdb::VisibilityBound::AllCommitted() ||
+         bound == duckdb::VisibilityBound::IncludingUncommitted();
+}
+
+// A start timestamp strictly newer than every transaction active on `attached`
+// right now, taken by starting one and rolling it straight back. Returns 0 when
+// the database has no DuckDB transaction manager, or when the probe throws.
+//
+// It reads no data and no catalog entries — only the transaction manager's own
+// counter — so it does not fall under "never read committed-only state on an
+// internal connection while the user's transaction is open".
+inline uint64_t probe_new_start_timestamp(duckdb::ClientContext &context,
+                                          duckdb::AttachedDatabase &attached) {
+  auto &tm = duckdb::TransactionManager::Get(attached);
+  if (!tm.IsDuckTransactionManager()) {
+    return 0;
+  }
+  InternalQueryGuard guard;
+  try {
+    duckdb::Connection probe(duckdb::DatabaseInstance::GetDatabase(context));
+    probe.BeginTransaction();
+    const uint64_t start = static_cast<uint64_t>(
+        duckdb::DuckTransaction::Get(*probe.context, attached).start_time);
+    probe.Rollback();
+    return start;
+  } catch (...) {
+    return 0;
+  }
+}
 
 // Security validation functions
 
@@ -288,7 +448,28 @@ public:
   // Returns nodes in order they should be updated
   std::vector<std::string>
   topological_order(const std::string &changed_node) const {
-    std::vector<std::string> dependents = get_all_dependents(changed_node);
+    return topological_order(std::vector<std::string>{changed_node});
+  }
+
+  // Multi-source variant: one Kahn pass over the UNION of the sources'
+  // dependent cones. Feeding all of a commit's changed tables through one
+  // pass is what lets a multi-table commit run as a single circuit step —
+  // see CDCManager::propagate_changes_multi.
+  std::vector<std::string>
+  topological_order(const std::vector<std::string> &changed_nodes) const {
+    std::unordered_set<std::string> changed(changed_nodes.begin(),
+                                            changed_nodes.end());
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> dependents;
+    for (const auto &node : changed_nodes) {
+      for (auto &dep : get_all_dependents(node)) {
+        // A source is "already processed" (it carries this pass's input
+        // delta), even when it sits inside another source's cone.
+        if (!changed.count(dep) && seen.insert(dep).second) {
+          dependents.push_back(std::move(dep));
+        }
+      }
+    }
     if (dependents.empty())
       return {};
 
@@ -554,6 +735,14 @@ public:
       last_error_ = "Invalid catalog name: " + catalog;
       return false;
     }
+    {
+      // Release the persistent mirror connection (see the mv_con_ member
+      // comment: holding it across idle periods is an instance-lifetime
+      // cycle). Exclusive view lock: mutual exclusion with propagate's
+      // mv_after_propagate, the only user.
+      std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
+      mv_reset_mirror_conn();
+    }
     struct ViewCkpt {
       std::string name;
       std::string sql; // fingerprint (Finding 1): definition at save time
@@ -561,8 +750,18 @@ public:
       std::vector<uint8_t> sink;
     };
     std::vector<ViewCkpt> view_blobs;
+    // Still-pending lazy-from-table views (Phase 3): their _dbsp_ckpt rows
+    // are the ONLY copy of their checkpoint bytes (the stash holds empty
+    // placeholders). The write phase keeps these views' existing rows in
+    // place instead of rewriting them.
+    std::vector<std::string> preserve_pending;
     std::vector<std::string> table_names;
+    // Generation observed per view during this save; promoted into
+    // view_saved_generation_ only after the write COMMITs.
+    std::unordered_map<std::string, uint64_t> view_gen_now;
+    int dbsp_ck_preserved = 0, dbsp_ck_serialized = 0;
     {
+      DbspScopeTimer t_ser("ckpt_serialize", "all views");
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
       std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
       for (const auto &[name, view] : views_) {
@@ -586,6 +785,59 @@ public:
         // realized view would otherwise silently (and wrongly) produce
         // below.
         auto pend_it = pending_restore_.find(name);
+        if (pend_it != pending_restore_.end() &&
+            pend_it->second.lazy_from_table) {
+          // Phase 3 (lazy-from-table): the stash holds EMPTY placeholders
+          // -- the real bytes live only in _dbsp_ckpt (blob_catalog) and
+          // are fetched at realize time. Re-saving the stash "verbatim"
+          // here would clobber that only copy with 0-byte rows; the next
+          // realize (this session, or any later one -- watermarks still
+          // match) would fail to decode and take the full-rebuild escape
+          // hatch. That was the intermittent "lazy-restore stash for view
+          // '...' failed to decode" report. Same-catalog saves keep the
+          // view's existing rows in place (see the write phase below); a
+          // cross-catalog save must copy the bytes over, so fetch them
+          // now, the same way realize_pending_view_locked does.
+          if (pend_it->second.blob_catalog == catalog) {
+            preserve_pending.push_back(name);
+            continue;
+          }
+          bool fetched = false;
+          if (mv_db_ != nullptr) {
+            try {
+              InternalQueryGuard fetch_guard;
+              duckdb::Connection fcon(*mv_db_);
+              auto rows = fcon.Query(
+                  "SELECT kind, node_id, data FROM " +
+                  qualify(pend_it->second.blob_catalog, "_dbsp_ckpt") +
+                  " WHERE name = '" + escape_string(name) +
+                  "' AND kind IN ('node', 'sink')");
+              if (rows->HasError()) {
+                throw std::runtime_error(rows->GetError());
+              }
+              for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+                const auto blob_str =
+                    duckdb::StringValue::Get(rows->GetValue(2, i));
+                std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+                if (rows->GetValue(0, i).ToString() == "node") {
+                  ck.nodes.emplace_back(
+                      static_cast<uint64_t>(
+                          rows->GetValue(1, i).GetValue<int64_t>()),
+                      std::move(blob));
+                } else {
+                  ck.sink = std::move(blob);
+                }
+              }
+              fetched = true;
+            } catch (...) {
+            }
+          }
+          if (!fetched) {
+            continue; // not checkpointed this save: replays at next load
+          }
+          view_blobs.push_back(std::move(ck));
+          continue;
+        }
         if (pend_it != pending_restore_.end()) {
           if (std::getenv("DBSP_DEBUG_SYNC") && !view->get_result().empty()) {
             // Invariant check: pending == no deltas seen == empty live
@@ -604,9 +856,42 @@ public:
           view_blobs.push_back(std::move(ck));
           continue;
         }
+        // INCREMENTAL SAVE: a view whose operator state has not changed
+        // since the last successful save to THIS catalog still has valid
+        // rows in _dbsp_ckpt — preserve them instead of re-serializing and
+        // rewriting identical bytes. Every save used to serialize all 126
+        // views regardless (3.3s of a 7.6s save at wfp/60, paid even when
+        // literally nothing had changed), which is what made "checkpoint
+        // continuously" unaffordable.
+        //
+        // view_delta_generation_ is the signal because it is stamped in
+        // exactly the places a view's state can move — creation's initial
+        // replay, and a propagate step that applied — and it is already
+        // trusted for correctness by delta consumers. A NEW flag could miss
+        // a mutation path and preserve stale bytes, which restores as
+        // silently wrong values.
+        {
+          auto gen_it = view_delta_generation_.find(name);
+          const uint64_t cur_gen =
+              gen_it == view_delta_generation_.end() ? 0 : gen_it->second;
+          view_gen_now[name] = cur_gen;
+          static const bool incremental_ckpt = [] {
+            const char *e = std::getenv("DBSP_INCREMENTAL_CKPT");
+            return e == nullptr || std::string(e) != "0";
+          }();
+          auto saved_it = view_saved_generation_.find(name);
+          if (incremental_ckpt && view_saved_catalog_ == catalog &&
+              saved_it != view_saved_generation_.end() &&
+              saved_it->second == cur_gen) {
+            preserve_pending.push_back(name);
+            dbsp_ck_preserved++;
+            continue;
+          }
+        }
         if (!view->serialize_circuit_state(ck.nodes)) {
           continue;
         }
+        dbsp_ck_serialized++;
         BlobWriter w;
         // Phase 1c: a table-backed view's rows are durable in its __mv_
         // table — checkpoint operator state only (empty result blob).
@@ -632,11 +917,42 @@ public:
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
 
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      // WHITELISTED for the DDL below AND the per-source watermark reads
+      // further down. The DDL creates DBSP's OWN bookkeeping tables
+      // (_dbsp_ckpt*), never the user's, so it never needs to see their
+      // uncommitted catalog — the hazard the sweep's DDL hit. The watermarks
+      // describe COMMITTED storage and are compared against committed storage
+      // at restore, beside circuit state that is likewise committed-only
+      // (deltas apply at commit), so a reader that cannot see an open
+      // transaction's rows is reading exactly the right thing.
+      DbspScopeTimer t_write("ckpt_write", "tables+watermarks");
+      InternalConnection con_owner(
+          context, InternalReadPolicy::AllowedInTxn,
+          "save_checkpoint (bookkeeping DDL + source watermarks)");
+      auto &con = *con_owner;
       con.Query("BEGIN");
-      con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, name "
-                "VARCHAR, node_id BIGINT, data BLOB)");
+      if (preserve_pending.empty()) {
+        con.Query("CREATE OR REPLACE TABLE " + ckpt_tbl + " (kind VARCHAR, "
+                  "name VARCHAR, node_id BIGINT, data BLOB)");
+      } else {
+        // Keep still-pending lazy views' rows (node/sink/sql) -- the only
+        // copy of their bytes -- and replace everything else. The table
+        // necessarily exists with this schema: the placeholders were
+        // stashed by a load that read it from this same catalog.
+        con.Query("CREATE TABLE IF NOT EXISTS " + ckpt_tbl + " (kind "
+                  "VARCHAR, name VARCHAR, node_id BIGINT, data BLOB)");
+        std::string keep;
+        for (const auto &n : preserve_pending) {
+          keep += (keep.empty() ? "'" : ", '") + escape_string(n) + "'";
+        }
+        auto del = con.Query("DELETE FROM " + ckpt_tbl +
+                             " WHERE name NOT IN (" + keep + ")");
+        if (del->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = del->GetError();
+          return false;
+        }
+      }
       con.Query("CREATE OR REPLACE TABLE " + ckpt_meta_tbl + " (table_name "
                 "VARCHAR, row_count BIGINT, row_hash VARCHAR)");
       // Format version (see dbsp_checkpoint.hpp kDbspCkptFormatVersion): a
@@ -659,6 +975,33 @@ public:
         if (rv->HasError()) {
           con.Query("ROLLBACK");
           last_error_ = rv->GetError();
+          return false;
+        }
+      }
+      // View-arrangement sidecar identity for THIS save (design note at
+      // the sidecar loop below): a fresh random 16-hex id every save, so
+      // a sidecar file stamped with it is provably the one this exact
+      // checkpoint's sidecar pass wrote or re-stamped. seq is a monotone
+      // informative counter carried in the file's wm_count field.
+      int64_t save_seq = 0;
+      std::string save_id;
+      {
+        {
+          std::lock_guard<std::mutex> g(seeds_mutex_);
+          save_seq = view_arr_seq_ + 1;
+        }
+        std::random_device rd;
+        const uint64_t r =
+            (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        char hex[17];
+        std::snprintf(hex, sizeof(hex), "%016llx",
+                      static_cast<unsigned long long>(r));
+        save_id = hex;
+        auto rs = ins->Execute("saveid", "", save_seq,
+                               duckdb::Value::BLOB(save_id));
+        if (rs->HasError()) {
+          con.Query("ROLLBACK");
+          last_error_ = rs->GetError();
           return false;
         }
       }
@@ -697,32 +1040,100 @@ public:
       }
       std::unordered_map<std::string, std::pair<int64_t, std::string>>
           saved_wms;
+      int dbsp_wm_cached = 0, dbsp_wm_dirty = 0, dbsp_wm_untracked = 0,
+          dbsp_wm_nohash = 0;
+      DbspScopeTimer t_wm("ckpt_watermarks", std::to_string(table_names.size()) + " tables");
+      // Shared: only reads the tracked_tables_ map shape + per-table atomic
+      // flags; scoped so it releases before the post-COMMIT block takes the
+      // same mutex (same-thread recursive shared locking is UB).
+      {
+      std::shared_lock<std::shared_mutex> wm_struct_lock(struct_mutex_);
       for (const auto &t : table_names) {
-        // Alias must not be shadowable by a same-named column: `hash(x)`
-        // resolves to the COLUMN x when one exists, silently hashing a
-        // single column instead of the row and blinding the watermark to
-        // every other column's updates.
-        auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
-                            "__dbsp_wm_row)) AS VARCHAR) FROM " +
-                            quote_table_key(t) + " __dbsp_wm_row");
-        if (wm->HasError() || wm->RowCount() != 1) {
-          con.Query("ROLLBACK");
-          last_error_ = "checkpoint watermark failed for " + t;
-          return false;
+        // Skip the O(rows) scan for tables whose content has not changed
+        // since their last scan: TrackedTable re-dirties on every content
+        // mutation, and wm_begin_scan()'s exchange means a write racing
+        // this scan re-dirties for the NEXT save. A stale cache can only
+        // produce a load-side mismatch (safe rebuild), never a wrong adopt.
+        TrackedTable *tt = nullptr;
+        {
+          auto tt_it = tracked_tables_.find(t);
+          if (tt_it != tracked_tables_.end()) {
+            tt = tt_it->second.get();
+          }
         }
-        auto r = insm->Execute(t, wm->GetValue(0, 0),
-                               wm->GetValue(1, 0).ToString());
+        int64_t wm_count = 0;
+        std::string wm_hash;
+        if (tt != nullptr && tt->wm_clean() && !tt->wm_hash().empty()) {
+          wm_count = tt->wm_count();
+          wm_hash = tt->wm_hash();
+          dbsp_wm_cached++;
+        } else {
+          if (tt == nullptr) {
+            dbsp_wm_untracked++;
+          } else if (!tt->wm_clean()) {
+            dbsp_wm_dirty++;
+          } else {
+            dbsp_wm_nohash++;
+          }
+          if (tt != nullptr) {
+            tt->wm_begin_scan();
+          }
+          // Alias must not be shadowable by a same-named column: `hash(x)`
+          // resolves to the COLUMN x when one exists, silently hashing a
+          // single column instead of the row and blinding the watermark to
+          // every other column's updates.
+          auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
+                              "__dbsp_wm_row)) AS VARCHAR) FROM " +
+                              quote_table_key(t) + " __dbsp_wm_row");
+          if (wm->HasError() || wm->RowCount() != 1) {
+            con.Query("ROLLBACK");
+            last_error_ = "checkpoint watermark failed for " + t;
+            return false;
+          }
+          wm_count = wm->GetValue(0, 0).GetValue<int64_t>();
+          wm_hash = wm->GetValue(1, 0).ToString();
+          if (tt != nullptr) {
+            tt->wm_store(wm_count, wm_hash);
+          }
+        }
+        auto r = insm->Execute(t, duckdb::Value::BIGINT(wm_count), wm_hash);
         if (r->HasError()) {
           con.Query("ROLLBACK");
           last_error_ = r->GetError();
           return false;
         }
-        saved_wms[t] = {wm->GetValue(0, 0).GetValue<int64_t>(),
-                        wm->GetValue(1, 0).ToString()};
+        saved_wms[t] = {wm_count, wm_hash};
+      }
+      if (std::getenv("DBSP_TIMING")) {
+        std::fprintf(stderr,
+                     "[dbsp-timing] ckpt_wm_breakdown cached=%d dirty=%d "
+                     "untracked=%d nohash=%d\n",
+                     dbsp_wm_cached, dbsp_wm_dirty, dbsp_wm_untracked,
+                     dbsp_wm_nohash);
+      }
       }
       con.Query("COMMIT");
-      last_ckpt_saved_count_ = view_blobs.size();
+      last_ckpt_saved_count_ = view_blobs.size() + preserve_pending.size();
       mark_saved();
+      // Committed: these generations are now what _dbsp_ckpt holds, so the
+      // NEXT save may preserve any view still sitting at the same one.
+      // Promoted only after COMMIT — a rolled-back save must not leave a
+      // record claiming bytes were written.
+      view_saved_generation_ = std::move(view_gen_now);
+      view_saved_catalog_ = catalog;
+      if (std::getenv("DBSP_TIMING")) {
+        std::fprintf(stderr,
+                     "[dbsp-timing] ckpt_views serialized=%d preserved=%d\n",
+                     dbsp_ck_serialized, dbsp_ck_preserved);
+      }
+      {
+        // The committed checkpoint's identity is now this save's: later
+        // register-time adoption (same session) and the next save's
+        // seq increment both key off it.
+        std::lock_guard<std::mutex> g(seeds_mutex_);
+        view_arr_seq_ = save_seq;
+        view_arr_id_ = save_id;
+      }
       // Recovery inc B: persist each durable spilled baseline's digest
       // index under the watermark just written — a reopen whose live
       // table still matches it adopts the pair instead of rescanning.
@@ -734,37 +1145,159 @@ public:
           if (tt_it == tracked_tables_.end()) {
             continue;
           }
+          // UNIQUE: a full-fold save adopts the file it just wrote (the
+          // overlay folds into a fresh mmap so later saves skip or write
+          // small deltas) — that mutates baseline state, which a shared
+          // lock must not do under concurrent readers.
           auto lk = table_locks_.find(t);
-          std::shared_lock<std::shared_mutex> tl;
+          std::unique_lock<std::shared_mutex> tl;
           if (lk != table_locks_.end()) {
-            tl = std::shared_lock<std::shared_mutex>(*lk->second);
+            tl = std::unique_lock<std::shared_mutex>(*lk->second);
           }
+          DbspScopeTimer t_idx("ckpt_spill_index", t);
           tt_it->second->save_spill_index(wm.first, wm.second);
         }
         // Recovery inc 3: fingerprint sidecars for shared packed
         // arrangements, under the same just-saved watermarks. Skipped for
         // free when an adopted flat layer is still clean. Best-effort —
         // a missing sidecar only costs the baseline backfill on reopen.
+        //
+        // ---- View-sourced arrangement sidecars: correctness design ----
+        // A TABLE-sourced sidecar's trust anchor is the source table's
+        // content watermark: the load verified it against live storage,
+        // so a file stamped with it is exactly the live content. A
+        // VIEW-sourced arrangement has no independently-verifiable
+        // source: its truth is the view's restored circuit state, whose
+        // own trust anchor is "this view's stash was accepted" (SQL
+        // fingerprint matched AND no table in its source closure is
+        // stale). So the sidecar's identity must be *the checkpoint that
+        // wrote those view blobs*, not any data watermark:
+        //   stamp := (save_seq, save_id), the random per-save id written
+        //   as the _dbsp_ckpt 'saveid' row IN THE SAME TRANSACTION as
+        //   every view blob and watermark.
+        // Adoption (register_arrangements' cold defer branch) requires
+        //   (1) the source view is PENDING — its stash was accepted, so
+        //       its restored state is exactly the save-time state — and
+        //   (2) the file's stamp equals the loaded checkpoint's save-id.
+        // (1)+(2) ⇒ file content == arrangement content at that save ==
+        // content the realized view will present. Deltas can only reach
+        // the arrangement after the pending source realizes (D-lazy
+        // Global Constraint), exactly as with a scan backfill. Hazards:
+        //   (a) lazy realize replays nothing beyond the stash (watermarks
+        //       pin the sources), so adopt-then-realize is delta-clean;
+        //   (b) dirty/partial saves: the save-id changes EVERY save, so a
+        //       clean file (content still exact) is re-stamped in place
+        //       (restamp_flat_index_file, ~24 bytes) instead of skipped
+        //       the way table files are — a skipped old stamp would be
+        //       indistinguishable from stale. Changed arrangements write
+        //       a delta chained to the (unrestamped) base identity or a
+        //       full fold, exactly like the table path;
+        //   (c) a still-pending view's arrangement is either adopted
+        //       (content unchanged by definition of pending — restamp is
+        //       correct) or needs_backfill (skipped: nothing to write,
+        //       and its file, if any, keeps its old stamp and simply
+        //       declines later — never clobbered), mirroring how the
+        //       pending view's ckpt bytes are preserved verbatim.
+        // Crash windows: sidecar writes/restamps run post-COMMIT, so a
+        // crash leaves files stamped with an id no checkpoint carries —
+        // adoption declines, the arrangement backfills (today's cost).
+        // Only views actually carried by THIS checkpoint (blobs written
+        // or preserved) get stamped: anything else could not be pending
+        // at the next load, so its file would be unusable anyway.
         if (spill_durable_dir_) {
           std::shared_lock<std::shared_mutex> vl(view_mutex_);
+          std::unordered_set<std::string> saved_views;
+          saved_views.reserve(view_blobs.size() + preserve_pending.size());
+          for (const auto &ck : view_blobs) {
+            saved_views.insert(ck.name);
+          }
+          for (const auto &n : preserve_pending) {
+            saved_views.insert(n);
+          }
           for (const auto &[fp, weak] : arrangements_) {
             auto arr = weak.lock();
             if (!arr || !arr->packed_ok || arr->track_weights ||
                 arr->track_counters || arr->needs_backfill) {
               continue;
             }
+            int64_t swc = 0;
+            std::string swh;
+            bool view_src = false;
             auto wm_it = saved_wms.find(arr->table);
-            if (wm_it == saved_wms.end()) {
+            if (wm_it != saved_wms.end()) {
+              swc = wm_it->second.first;
+              swh = wm_it->second.second;
+            } else if (saved_views.count(arr->table) > 0) {
+              view_src = true;
+              swc = save_seq;
+              swh = save_id;
+            } else {
               continue;
             }
-            if (arr->packed.empty() && !arr->flat.empty()) {
-              continue; // adopted and untouched: sidecar already current
+            if (arr->packed.empty() && !arr->flat.empty() &&
+                arr->flat_file_wm_count >= 0) {
+              // Adopted (or previously saved) and untouched: the sidecar
+              // on disk is already exactly this content. A LOCALLY folded
+              // flat (compact_to_flat, flat_file_wm_count == -1) has no
+              // file yet and must fall through to the full write.
+              if (!view_src) {
+                continue; // table identity unchanged: file stays valid
+              }
+              // View identity moves every save: re-stamp the clean file
+              // to this save's id (content bytes untouched — see (b)).
+              DbspScopeTimer t_rs("ckpt_arr_restamp", arr->table);
+              if (flatpacked::restamp_flat_index_file(sharr_path(fp), fp,
+                                                      swc, swh)) {
+                g_view_arr_sidecar_restamps++;
+                arr->flat_file_wm_count = swc;
+                arr->flat_file_wm_hash = swh;
+                arr->sidecar_saved_wm_count = swc;
+                arr->sidecar_saved_wm_hash = swh;
+                continue;
+              }
+              // missing/odd file: fall through to the full fold
+            }
+            if (!view_src && arr->sidecar_saved_wm_count == swc &&
+                arr->sidecar_saved_wm_hash == swh) {
+              continue; // this exact content is already on disk
+            }
+            DbspScopeTimer t_fp("ckpt_arr_sidecar", arr->table);
+            // Delta-append: with an adopted base and a small overlay,
+            // write only the touched keys' replacement buckets chained to
+            // the base — O(touched) instead of a whole-arrangement fold.
+            // (View arrs chain to the base's OLD stamp: the base file is
+            // deliberately NOT re-stamped when a delta references it.)
+            if (arr->flat_file_wm_count >= 0 &&
+                arr->packed.size() * 10 < arr->flat.dir_size()) {
+              flatpacked::ReplacementBuckets touched;
+              arr->fold_packed_touched(touched);
+              if (flatpacked::write_flat_delta_file(
+                      sharr_path(fp) + ".d", fp, swc, swh,
+                      arr->flat_file_wm_count, arr->flat_file_wm_hash,
+                      touched)) {
+                arr->sidecar_saved_wm_count = swc;
+                arr->sidecar_saved_wm_hash = swh;
+                continue;
+              }
+              // fall through to the full fold on a delta-write failure
             }
             flatpacked::FlatPackedIndex folded;
             arr->fold_packed(folded);
-            flatpacked::write_flat_index_file(sharr_path(fp), fp,
-                                              wm_it->second.first,
-                                              wm_it->second.second, folded);
+            if (flatpacked::write_flat_index_file(sharr_path(fp), fp, swc,
+                                                  swh, folded)) {
+              // A full fold supersedes any delta chained to the old base.
+              std::error_code fec;
+              std::filesystem::remove(sharr_path(fp) + ".d", fec);
+              arr->sidecar_saved_wm_count = swc;
+              arr->sidecar_saved_wm_hash = swh;
+              // The just-written file IS a valid delta-chain base: future
+              // replacement buckets are absolute per key (merge of the
+              // live layers), so chaining them to this file's watermark is
+              // correct whether `flat` was adopted, locally folded, or
+              // still layered under `packed`.
+              arr->flat_file_wm_count = swc;
+              arr->flat_file_wm_hash = swh;
+            }
           }
         }
       }
@@ -787,6 +1320,13 @@ public:
     // the view's definition changed since this checkpoint was written, so
     // the fast path is declined for that view alone.
     std::unordered_map<std::string, std::string> sql_fingerprints;
+    // View-arrangement sidecar identity of this checkpoint (the
+    // kind='saveid' row; design note at save_checkpoint's sidecar loop):
+    // sidecar files stamped with exactly this (seq, id) pair were written
+    // or re-stamped by the save that wrote these view blobs. An empty id
+    // (pre-feature checkpoint) just declines view-sidecar adoption.
+    int64_t view_arr_seq = -1;
+    std::string view_arr_id;
     // Verified per-source watermarks (COUNT, bit_xor(hash) as VARCHAR) —
     // seeds for lazy (deferred) baselines on the load fast path (D3c).
     // Only tables whose live content MATCHED the save-time watermark
@@ -809,12 +1349,18 @@ public:
 
   bool checkpoint_valid(duckdb::ClientContext &context, CkptData &out,
                         const std::string &catalog = "") {
+    // WHITELISTED. Restore-time verification: it compares the SAVED watermark
+    // against live COMMITTED storage, which is the state the saved circuit
+    // corresponds to. Reached from load_from_duck_table, which can run inside
+    // an open user transaction.
     const std::string ckpt_tbl = qualify(catalog, "_dbsp_ckpt");
     const std::string ckpt_meta_tbl = qualify(catalog, "_dbsp_ckpt_meta");
     const std::string ckpt_ver_tbl = qualify(catalog, "_dbsp_ckpt_version");
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(
+          context, InternalReadPolicy::AllowedInTxn,
+          "checkpoint_valid (restore watermarks)");
+      auto &con = *con_owner;
       // Scope the existence check to the right catalog when one is given.
       std::string exists_sql;
       if (catalog.empty()) {
@@ -874,6 +1420,15 @@ public:
         }
         out.watermarks[t] = {meta->GetValue(1, i).GetValue<int64_t>(),
                              meta->GetValue(2, i).ToString()};
+      }
+      // View-arrangement sidecar identity (kind='saveid'; design note at
+      // save_checkpoint's sidecar loop). A missing row — pre-feature
+      // checkpoint — leaves the id empty and adoption simply declines.
+      auto sid = con.Query("SELECT node_id, data FROM " + ckpt_tbl +
+                           " WHERE kind = 'saveid'");
+      if (!sid->HasError() && sid->RowCount() == 1) {
+        out.view_arr_seq = sid->GetValue(0, 0).GetValue<int64_t>();
+        out.view_arr_id = duckdb::StringValue::Get(sid->GetValue(1, 0));
       }
       // Phase 3 (reattach): on a disk-backed database (mv tables present,
       // marked earlier in load_from_duck_table) operator blobs run to GBs
@@ -973,7 +1528,7 @@ public:
   }
 
   // --- Lazy per-view checkpoint restore (D-lazy) --------------------------
-  // Precedent: D3c's TrackedTable::is_deferred() + materialize_deferred_
+  // Precedent: D3c's TrackedTable::restore_pending() + materialize_deferred_
   // locked (baseline materialization). This is the same lazy-materialize-
   // on-first-need shape applied to a VIEW's checkpoint blobs instead of a
   // table's storage scan: load_from_duck_table's checkpoint fast path
@@ -986,7 +1541,7 @@ public:
   // Guarded by view_mutex_ (tier 3) -- the same lock that already guards
   // NativeMaterializedView content -- not a new lock level: presence in
   // this map is a property of a view's CONTENT (decoded or not), exactly
-  // like TrackedTable::deferred_ is a property of a table's baseline
+  // like TrackedTable::restore_pending_ is a property of a table's baseline
   // content and lives on the table's own per-table lock, not struct_mutex_.
   struct PendingViewCkpt {
     std::unordered_map<uint64_t, std::vector<uint8_t>> nodes;
@@ -1051,6 +1606,65 @@ public:
   // drop_view()s and create_view()s every view fresh from committed
   // storage -- same "rare correctness escape hatch" the codebase already
   // accepts for a deferred-baseline watermark mismatch.
+  // Decode one stashed view's node + sink blobs and inject them into the
+  // view. Pure per-view mutation: touches ONLY `view` and reads ONLY `pv`
+  // (blobs must already be fetched) — no manager maps, no locks, no
+  // pending_restore_ mutation — so the batched pre-pass realize
+  // (realize_pending_views_locked) may run several of these on worker
+  // threads under the ONE exclusive view_mutex_ hold, the same
+  // disjoint-per-view-state reliance propagate_changes_multi's level-step
+  // threads already make. Returns decode success; the caller does all
+  // bookkeeping (counters, pending_restore_ erase, rebuild escalation,
+  // arrangement backfill).
+  bool decode_pending_stash(const std::string &view_name,
+                            NativeMaterializedView &view,
+                            const PendingViewCkpt &pv, bool table_backed) {
+    bool ok;
+    try {
+      DbspScopeTimer t_nodes("ckpt_node_restore", view_name);
+      ok = view.restore_circuit_state(pv.nodes);
+    } catch (...) {
+      fprintf(stderr, "[dbsp] realize(%s): node restore threw\n",
+              view_name.c_str());
+      ok = false;
+    }
+    if (ok) {
+      try {
+        DbspScopeTimer t_sink("ckpt_sink_decode", view_name);
+        BlobReader r(pv.sink.data(), pv.sink.size());
+        DuckDBZSet result;
+        const uint64_t n = r.u64();
+        for (uint64_t i = 0; i < n; i++) {
+          DuckDBRow row = r.hashed_row();
+          const int64_t w = r.i64();
+          result.insert(row, w);
+        }
+        view.set_result(result);
+        ok = r.done();
+        if (!ok) {
+          fprintf(stderr,
+                  "[dbsp] realize(%s): sink blob has trailing bytes "
+                  "(%zu total)\n",
+                  view_name.c_str(), pv.sink.size());
+        }
+      } catch (...) {
+        fprintf(stderr,
+                "[dbsp] realize(%s): sink blob decode threw (%zu bytes)\n",
+                view_name.c_str(), pv.sink.size());
+        ok = false;
+      }
+    }
+    // Phase 3 (reattach): set_result turned sink integration back on; an
+    // adopted table-backed view must stay table-backed — its checkpoint
+    // result blob is deliberately empty (rows live in __mv_), and letting
+    // the sink integrate again would grow a partial RAM result no reader
+    // uses.
+    if (table_backed) {
+      view.set_table_backed();
+    }
+    return ok;
+  }
+
   bool realize_pending_view_locked(const std::string &view_name) {
     auto pend_it = pending_restore_.find(view_name);
     if (pend_it == pending_restore_.end()) {
@@ -1066,67 +1680,22 @@ public:
     // Phase 3 (reattach): the stash holds placeholders — fetch this view's
     // bytes from _dbsp_ckpt now (mv_db_ is set whenever lazy_from_table
     // was, both keyed on the mv-table marker at load).
-    if (pend_it->second.lazy_from_table && mv_db_ != nullptr) {
-      try {
-        InternalQueryGuard fetch_guard;
-        duckdb::Connection fcon(*mv_db_);
-        auto rows = fcon.Query(
-            "SELECT kind, node_id, data FROM " +
-            qualify(pend_it->second.blob_catalog, "_dbsp_ckpt") +
-            " WHERE name = '" + escape_string(view_name) +
-            "' AND kind IN ('node', 'sink')");
-        if (rows->HasError()) {
-          throw std::runtime_error(rows->GetError());
-        }
-        for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
-          const auto blob_str = duckdb::StringValue::Get(rows->GetValue(2, i));
-          std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
-          if (rows->GetValue(0, i).ToString() == "node") {
-            pend_it->second.nodes[static_cast<uint64_t>(
-                rows->GetValue(1, i).GetValue<int64_t>())] = std::move(blob);
-          } else {
-            pend_it->second.sink = std::move(blob);
-          }
-        }
-      } catch (...) {
-        pending_restore_.erase(pend_it);
-        view_it->second->clear_pending_restore();
-        rebuild_pending_ = true;
-        record_error_best_effort(
-            "DBSP: lazy checkpoint fetch for view '" + view_name +
-            "' failed; scheduling full rebuild");
-        return false;
-      }
+    if (!fetch_pending_blobs(view_name, pend_it->second)) {
+      pending_restore_.erase(pend_it);
+      view_it->second->clear_pending_restore();
+      rebuild_pending_ = true;
+      record_error_best_effort(
+          "DBSP: lazy checkpoint fetch for view '" + view_name +
+          "' failed; scheduling full rebuild");
+      return false;
     }
-    bool ok;
-    try {
-      ok = view_it->second->restore_circuit_state(pend_it->second.nodes);
-      if (ok) {
-        BlobReader r(pend_it->second.sink.data(), pend_it->second.sink.size());
-        DuckDBZSet result;
-        const uint64_t n = r.u64();
-        for (uint64_t i = 0; i < n; i++) {
-          DuckDBRow row = r.hashed_row();
-          const int64_t w = r.i64();
-          result.insert(row, w);
-        }
-        view_it->second->set_result(result);
-        ok = ok && r.done();
-      }
-    } catch (...) {
-      ok = false;
-    }
-    // Phase 3 (reattach): set_result turned sink integration back on; an
-    // adopted table-backed view must stay table-backed — its checkpoint
-    // result blob is deliberately empty (rows live in __mv_), and letting
-    // the sink integrate again would grow a partial RAM result no reader
-    // uses.
-    if (mv_table_backed_.count(view_name) > 0) {
-      view_it->second->set_table_backed();
-    }
+    const bool ok =
+        decode_pending_stash(view_name, *view_it->second, pend_it->second,
+                             mv_table_backed_.count(view_name) > 0);
     pending_restore_.erase(pend_it);
     view_it->second->clear_pending_restore();
     if (!ok) {
+      g_lazy_realize_failures++;
       rebuild_pending_ = true;
       record_error_best_effort(
           "DBSP: lazy-restore stash for view '" + view_name +
@@ -1149,6 +1718,203 @@ public:
       backfill_deferred_arrangements_locked(view_name, /*view_lock_held=*/true);
     }
     return ok;
+  }
+
+  // Fetch a still-placeholder stash's node/sink blobs from _dbsp_ckpt.
+  // No-op (true) when the stash already holds bytes or there is no mv db.
+  // Per-view `name =` probes beat one big IN-list query here: measured at
+  // the 60emp reattach, 141 filtered probes cost 1.3s total while a
+  // 110-name IN scan cost 2.0s alone (the equality filter prunes row
+  // groups before the blob column is touched; the IN filter does not).
+  // Thread-safe by construction — touches only `pv` (per-view state) on a
+  // fresh internal connection — so the batched pre-pass realize calls it
+  // from worker threads, which also overlaps the fetch I/O per view.
+  bool fetch_pending_blobs(const std::string &view_name, PendingViewCkpt &pv) {
+    if (!pv.lazy_from_table || mv_db_ == nullptr) {
+      return true;
+    }
+    try {
+      DbspScopeTimer t_fetch("ckpt_fetch", view_name);
+      InternalQueryGuard fetch_guard;
+      duckdb::Connection fcon(*mv_db_);
+      auto rows = fcon.Query("SELECT kind, node_id, data FROM " +
+                             qualify(pv.blob_catalog, "_dbsp_ckpt") +
+                             " WHERE name = '" + escape_string(view_name) +
+                             "' AND kind IN ('node', 'sink')");
+      if (rows->HasError()) {
+        throw std::runtime_error(rows->GetError());
+      }
+      for (duckdb::idx_t i = 0; i < rows->RowCount(); i++) {
+        const auto blob_str = duckdb::StringValue::Get(rows->GetValue(2, i));
+        std::vector<uint8_t> blob(blob_str.begin(), blob_str.end());
+        if (rows->GetValue(0, i).ToString() == "node") {
+          pv.nodes[static_cast<uint64_t>(
+              rows->GetValue(1, i).GetValue<int64_t>())] = std::move(blob);
+        } else {
+          pv.sink = std::move(blob);
+        }
+      }
+      pv.lazy_from_table = false;
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  // Batched realize for propagate_changes_multi's pre-pass: the per-view
+  // blob fetch + CPU decode + own-arrangement backfill fanned across
+  // worker threads, instead of a fetch-query + decode + backfill-scan per
+  // view in sequence (the dominant reattach cost at 60emp: 7.9s of 18.4s).
+  //
+  // Locking contract identical to realize_pending_view_locked: caller
+  // holds struct_mutex_ (shared) and view_mutex_ EXCLUSIVELY. Worker
+  // threads run strictly inside that exclusive hold and touch only
+  // per-view-disjoint state:
+  //   - decode_pending_stash mutates only the worker's own view;
+  //   - the backfill fills only arrangements SOURCED on that view (every
+  //     arrangement has exactly one source, so no two workers share one),
+  //     reading rows from the view's own __mv_ table on a fresh internal
+  //     connection (concurrent read-only queries are safe; the
+  //     thread-local InternalQueryGuard keeps hooks out per thread) or
+  //     from the view's just-decoded result;
+  //   - shared maps (pending_restore_, views_, arrangements_by_table_,
+  //     mv_table_backed_) are only READ during the parallel phase — all
+  //     mutation happens in the sequential resolve below, exactly like
+  //     the level-step loop publishes its results sequentially.
+  // A worklist entry that is a table name or not pending is skipped; a
+  // per-view fetch failure escalates that view alone in the sequential
+  // resolve, same as the per-view path.
+  void realize_pending_views_locked(const std::vector<std::string> &names) {
+    struct Item {
+      std::string name;
+      NativeMaterializedView *view = nullptr;
+      PendingViewCkpt *pv = nullptr;
+      bool table_backed = false;
+      std::vector<std::shared_ptr<SharedArrangement>> needy;
+      bool ok = false;
+      bool fetch_failed = false;
+    };
+    std::vector<Item> items;
+    items.reserve(names.size());
+    for (const auto &name : names) {
+      auto pend_it = pending_restore_.find(name);
+      if (pend_it == pending_restore_.end()) {
+        continue; // not pending: already live, or was never checkpointed
+      }
+      auto view_it = views_.find(name);
+      if (view_it == views_.end()) {
+        pending_restore_.erase(pend_it);
+        continue;
+      }
+      Item it;
+      it.name = name;
+      it.view = view_it->second.get();
+      it.pv = &pend_it->second;
+      it.table_backed = mv_table_backed_.count(name) > 0;
+      auto arr_it = arrangements_by_table_.find(name);
+      if (arr_it != arrangements_by_table_.end()) {
+        for (auto &weak : arr_it->second) {
+          auto arr = weak.lock();
+          if (arr && arr->needs_backfill) {
+            it.needy.push_back(std::move(arr));
+          }
+        }
+      }
+      items.push_back(std::move(it));
+    }
+    if (items.empty()) {
+      return;
+    }
+    if (items.size() == 1) {
+      realize_pending_view_locked(items[0].name);
+      return;
+    }
+    // Parallel fetch + decode + per-view backfill. Same worker-count clamp
+    // as set_parallel_sync's shard knob; work-stealing over an atomic
+    // cursor.
+    std::exception_ptr first_error;
+    std::mutex error_mutex;
+    auto run_item = [&](Item &it) {
+      DbspScopeTimer timer("blob_decode", it.name);
+      if (!fetch_pending_blobs(it.name, *it.pv)) {
+        it.fetch_failed = true;
+        return;
+      }
+      it.ok = decode_pending_stash(it.name, *it.view, *it.pv, it.table_backed);
+      if (!it.ok || it.needy.empty()) {
+        return;
+      }
+      // Mirrors backfill_deferred_arrangements_locked's view-source arm
+      // (the batched worklist only ever names views).
+      DbspScopeTimer t_bf("arr_backfill", it.name);
+      g_arr_backfills += it.needy.size();
+      for (auto &arr : it.needy) {
+        arr->begin_initial_fill();
+      }
+      if (it.table_backed && mv_db_ != nullptr) {
+        DuckDBZSet chunk; // Phase 1c: backfill from the backing table
+        mv_scan_table(it.name, [&](const DuckDBRow &row, Weight w) {
+          chunk.insert(row, w);
+        });
+        for (auto &arr : it.needy) {
+          arr->apply(chunk);
+        }
+      } else {
+        for (auto &arr : it.needy) {
+          arr->apply(it.view->get_result());
+        }
+      }
+      for (auto &arr : it.needy) {
+        arr->finish_initial_fill();
+        arr->needs_backfill = false;
+      }
+    };
+    const size_t nthreads = std::min<size_t>(
+        {8, items.size(),
+         std::max<size_t>(2, std::thread::hardware_concurrency())});
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (size_t t = 0; t < nthreads; t++) {
+      threads.emplace_back([&]() {
+        for (size_t i = next.fetch_add(1); i < items.size();
+             i = next.fetch_add(1)) {
+          try {
+            run_item(items[i]);
+          } catch (...) {
+            std::lock_guard<std::mutex> g(error_mutex);
+            if (!first_error) {
+              first_error = std::current_exception();
+            }
+          }
+        }
+      });
+    }
+    for (auto &t : threads) {
+      t.join();
+    }
+    // Sequential resolve: all shared-map mutation and error escalation
+    // happens here, on the locking thread, in worklist order.
+    for (auto &it : items) {
+      g_lazy_view_decodes++;
+      pending_restore_.erase(it.name);
+      it.view->clear_pending_restore();
+      if (it.fetch_failed) {
+        rebuild_pending_ = true;
+        record_error_best_effort(
+            "DBSP: lazy checkpoint fetch for view '" + it.name +
+            "' failed; scheduling full rebuild");
+      } else if (!it.ok) {
+        g_lazy_realize_failures++;
+        rebuild_pending_ = true;
+        record_error_best_effort(
+            "DBSP: lazy-restore stash for view '" + it.name +
+            "' failed to decode; scheduling full rebuild");
+      }
+    }
+    if (first_error) {
+      std::rethrow_exception(first_error);
+    }
   }
 
   // Self-locking entry point for callers that hold neither struct_mutex_
@@ -1219,10 +1985,49 @@ public:
                      [](const ViewDefinition &a, const ViewDefinition &b) {
                        return a.created_at < b.created_at;
                      });
+    // Skip the rewrite when the definitions are byte-for-byte what this
+    // catalog already holds. This table is DELETE-all + one INSERT per view
+    // into a PRIMARY KEY'd table, so it re-indexed all 140 rows on EVERY
+    // save (~1.2s at wfp/60) even though definitions only move when a view
+    // is created, replaced or dropped.
+    //
+    // The guard compares the CONTENT rather than a "definitions changed"
+    // counter: view_definitions_ is mutated at seven sites, and a counter
+    // that missed one would leave stale SQL on disk — which a later load
+    // reads as the view's definition. Exact string, not a hash: a collision
+    // here would do the same damage, and a few hundred KB is nothing.
+    std::string defs_image;
+    if (only_view.empty()) {
+      for (const auto &d : defs) {
+        defs_image += d.name;
+        defs_image += '\x01';
+        defs_image += d.sql;
+        defs_image += '\x01';
+        for (const auto &src : d.source_tables) {
+          defs_image += src;
+          defs_image += ',';
+        }
+        defs_image += '\x01';
+        defs_image += std::to_string(d.created_at);
+        defs_image += '\x02';
+      }
+      if (view_defs_saved_catalog_ == catalog &&
+          view_defs_saved_image_ == defs_image && !defs_image.empty()) {
+        if (std::getenv("DBSP_TIMING")) {
+          std::fprintf(stderr, "[dbsp-timing] save_view_defs skipped "
+                               "(unchanged)\n");
+        }
+        return true;
+      }
+    }
     try {
       // Fresh connection: `context` is mid-query inside a table function.
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "save_view_definitions");
+      auto &con = *con_owner;
       con.Query("BEGIN");
       auto res = con.Query(
           "CREATE TABLE IF NOT EXISTS " + qtable +
@@ -1270,6 +2075,14 @@ public:
         }
       }
       con.Query("COMMIT");
+      // Committed: this catalog now holds exactly these definitions, so an
+      // identical next save may skip. Recorded only after COMMIT, and only
+      // for a full save — a single-view save leaves the rest untouched, so
+      // it cannot stand in for the whole image.
+      if (only_view.empty()) {
+        view_defs_saved_image_ = std::move(defs_image);
+        view_defs_saved_catalog_ = catalog;
+      }
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("Save failed: ") + e.what();
@@ -1369,7 +2182,15 @@ public:
     // declines (fingerprint mismatch) is cold-created below; create_view's
     // own mirror block then REWRITES its table from the fresh result
     // (the adopted-view guard there keys on ckpt_restored_views_).
-    try {
+    //
+    // NOT after the user has said `dbsp_mv_tables(false)`. This function runs
+    // more than once per manager: once from maybe_autoload, and again from
+    // crash recovery's load_views. A disable landing between the two was
+    // silently undone — measured, the __mv_ table went on tracking the view
+    // through the very edit that was supposed to leave it stale, which is the
+    // opposite of what dbsp_mv_tables(false) documents.
+    if (!mv_tables_user_disabled_.load()) {
+      try {
       InternalQueryGuard meta_guard;
       duckdb::Connection meta_con(
           duckdb::DatabaseInstance::GetDatabase(context));
@@ -1389,8 +2210,9 @@ public:
           mv_tables_enabled_ = true;
         }
       }
-    } catch (...) {
-      // no meta table = not a disk-backed database; nothing to mark
+      } catch (...) {
+        // no meta table = not a disk-backed database; nothing to mark
+      }
     }
 
     // Fast path (D3b): when a circuit-state checkpoint exists and every
@@ -1407,6 +2229,11 @@ public:
     if (have_ckpt) {
       std::lock_guard<std::mutex> g(seeds_mutex_);
       deferred_seeds_ = ckpt.watermarks;
+      // View-arrangement sidecars: this checkpoint's save-id is the ONLY
+      // identity register_arrangements may adopt view-sourced sidecars
+      // under (empty for a pre-feature checkpoint: adoption declines).
+      view_arr_seq_ = ckpt.view_arr_seq;
+      view_arr_id_ = ckpt.view_arr_id;
     }
 
     size_t loaded = 0;
@@ -1465,32 +2292,46 @@ public:
                   << "': a source table changed since save -- rebuilding "
                      "by replay\n";
       }
-      if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
-        if (cold && lazy) {
-          // D-lazy: stash the already-read blobs undecoded instead of
-          // calling restore_view_state eagerly -- realize_pending_view[_
-          // locked] decodes them on first need. stash_pending_view cannot
-          // itself fail the way the eager decode below can (it copies
-          // bytes, it doesn't parse them), so there is no per-view decline
-          // branch here: a corrupt stash surfaces later, at realize time.
-          stash_pending_view(name, ckpt);
-          ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
-          ckpt_restored++;
-          pending_now_count++;
-          loaded++;
-        } else if (cold && !restore_view_state(name, ckpt)) {
-          // Corrupt/mismatched blob: rebuild this view the normal way
-          drop_view(name);
-          if (create_view(context, name, view_sql)) {
-            loaded++;
-          }
-        } else {
-          if (cold) {
+      // Per-view try/catch: the loop's contract is "continue on individual
+      // failures (e.g. a source table was dropped)", and create_view can now
+      // THROW rather than return false — a source in a database too old to
+      // carry the change-capture triggers, or a seeding scan that failed.
+      // Without this, one such view aborted the whole restore mid-loop and
+      // took every later view with it.
+      try {
+        if (create_view(context, name, view_sql, /*skip_init_replay=*/cold)) {
+          if (cold && lazy) {
+            // D-lazy: stash the already-read blobs undecoded instead of
+            // calling restore_view_state eagerly -- realize_pending_view[_
+            // locked] decodes them on first need. stash_pending_view cannot
+            // itself fail the way the eager decode below can (it copies
+            // bytes, it doesn't parse them), so there is no per-view decline
+            // branch here: a corrupt stash surfaces later, at realize time.
+            stash_pending_view(name, ckpt);
             ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
             ckpt_restored++;
+            pending_now_count++;
+            loaded++;
+          } else if (cold && !restore_view_state(name, ckpt)) {
+            // Corrupt/mismatched blob: rebuild this view the normal way
+            drop_view(name);
+            if (create_view(context, name, view_sql)) {
+              loaded++;
+            }
+          } else {
+            if (cold) {
+              ckpt_restored_views_.insert(name); // Phase 3: adoption-eligible
+              ckpt_restored++;
+            }
+            loaded++;
           }
-          loaded++;
         }
+      } catch (const std::exception &e) {
+        record_error_best_effort("DBSP: view '" + name +
+                                 "' could not be restored: " + e.what());
+      } catch (...) {
+        record_error_best_effort("DBSP: view '" + name +
+                                 "' could not be restored (unknown error)");
       }
       // Continue on individual failures (e.g. a source table was dropped)
     }
@@ -1504,7 +2345,7 @@ public:
       size_t deferred_now = 0;
       std::shared_lock<std::shared_mutex> lock(struct_mutex_);
       for (const auto &[_, tt] : tracked_tables_) {
-        if (tt->is_deferred()) {
+        if (tt->restore_pending()) {
           deferred_now++;
         }
       }
@@ -1563,7 +2404,7 @@ public:
         continue;
       }
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      if (!tt->is_deferred()) {
+      if (!tt->restore_pending()) {
         continue;
       }
       try {
@@ -1585,7 +2426,13 @@ public:
     if (!rebuild_pending_.exchange(false)) {
       return;
     }
-    commit_seq_++; // baselines change wholesale: invalidate in-flight captures
+    // Advance the delta generation before the views are recreated below: each
+    // recreate stamps view_delta_generation_ with commit_seq_, so without this
+    // the rebuilt buffers would carry the same generation as the pre-rebuild
+    // ones and a dbsp_changes consumer could not tell them apart. (It is no
+    // longer about invalidating in-flight write captures — that stack is
+    // gone.)
+    commit_seq_++;
     // Refresh every tracked baseline from committed storage first: after
     // an out-of-band divergence the in-memory baseline is not trustworthy
     // (e.g. a trailing notify double-applied against a scan that already
@@ -1600,13 +2447,29 @@ public:
         std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
         TrackedTable &table = *tt; // lambda capture (structured bindings
                                    // are not capturable pre-C++20)
-        const bool was_deferred = table.is_deferred();
+        const bool was_deferred = table.restore_pending();
         try {
           table.begin_rebuild();
-          stream_table_rows(context, name, [&](DuckDBRow &&row) {
-            table.add_scanned_row(std::move(row));
-          });
-          table.install_rebuild();
+          stream_table_rows(
+              context, name,
+              [&](DuckDBRow &&row) { table.add_scanned_row(std::move(row)); },
+              // WHITELISTED. rebuild_all_views runs from QueryBegin, which
+              // fires inside open user transactions, and it REFRESHES a
+              // baseline that already exists rather than establishing one:
+              // the committed content it reads is the right answer for a
+              // rebuild, and the transaction's own writes still arrive through
+              // its triggers and its commit reconcile.
+              InternalReadPolicy::AllowedInTxn, "rebuild_all_views");
+          // establishes=false: this REFRESHES a baseline that already exists.
+          // It runs from QueryBegin, possibly inside the very transaction
+          // whose openness deferred a seed, and it asks neither the readiness
+          // nor the concurrency question — so it must never retire an
+          // untrusted state. A table left owing one is picked up by the next
+          // reconcile, which does ask both.
+          table.install_rebuild(/*establishes=*/false);
+          fold_fresh_baseline(context, name, table,
+                              InternalReadPolicy::AllowedInTxn,
+                              "rebuild_all_views (baseline fold)");
           if (was_deferred) {
             deferred_tables_--;
           }
@@ -1747,7 +2610,7 @@ public:
     std::unique_lock<std::shared_mutex> lock(struct_mutex_);
     {
       auto it = tracked_tables_.find(table_name);
-      if (it != tracked_tables_.end() && it->second->is_deferred()) {
+      if (it != tracked_tables_.end() && it->second->restore_pending()) {
         deferred_tables_--;
       }
     }
@@ -1808,6 +2671,7 @@ public:
         }
         mv_schemas.emplace_back(existing_name, existing_view->result_schema());
       }
+      DbspScopeTimer t_tr("create_translate", view_name);
       auto translated =
           PlanTranslator::translate(context, view_name, sql, mv_schemas);
       view = std::move(translated.view);
@@ -1910,8 +2774,12 @@ public:
 
         // Use a fresh connection: `context` is mid-query (we run inside a table
         // function on it), so context.Query() would block on the context lock.
-        InternalQueryGuard guard;
-        duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+        // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the
+        // user's, so it never needs to see their uncommitted catalog — the
+        // hazard the sweep's DDL hit.
+        InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                      "create_view _dbsp_views upsert");
+        auto &con = *con_owner;
         con.Query("CREATE TABLE IF NOT EXISTS _dbsp_views (name VARCHAR "
                   "PRIMARY KEY, sql VARCHAR, sources VARCHAR, created_at "
                   "BIGINT)");
@@ -1972,21 +2840,39 @@ public:
       // mv_rebuild_from_table inside mv_apply_delta (correct, but O(result)
       // transient — acceptable: duplicate-row results are rare and small).
       bool stream_failed = false;
+      // DBSP_TIMING split of create_replay: circuit apply vs mirror flush
+      // (the remainder of create_replay is the source scan/boxing).
+      double apply_ms = 0.0, mirror_ms = 0.0;
       auto apply_step = [&](const std::string &src, const DuckDBZSet &delta) {
         if (stream_failed) {
           return;
         }
+        const bool timing = dbsp_timing_enabled();
+        auto t0 = timing ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
         view->apply_changes(src, delta);
+        if (timing) {
+          apply_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+        }
         if (!streaming_mirror) {
           return;
         }
         const DuckDBZSet &out = view->get_batch_delta();
         if (!out.empty()) {
+          auto m0 = timing ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
           InternalQueryGuard mv_guard;
           duckdb::Connection mv_con(*mv_db_);
           if (!mv_apply_delta(mv_con, view_name, *view, out)) {
             stream_failed = true;
             return;
+          }
+          if (timing) {
+            mirror_ms += std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - m0)
+                             .count();
           }
         }
         view->drop_delta();
@@ -1997,6 +2883,8 @@ public:
       // tables or other views can occur; reads are safe without table_locks_
       // Checkpoint restore (D3b) skips this replay: node state and the sink
       // result are injected from the checkpoint instead.
+      {
+      DbspScopeTimer t_rp("create_replay", view_name);
       for (const auto &source :
            skip_init_replay ? std::vector<std::string>{} : resolved_sources) {
         if (pview && pview->shared_init_skip().count(source)) {
@@ -2006,9 +2894,34 @@ public:
           // D3c: replay needs real table state — materialize a deferred
           // baseline first (struct_mutex_ exclusive: no table lock needed;
           // view_mutex_ already held)
-          if (tracked_tables_.at(source)->is_deferred()) {
+          if (tracked_tables_.at(source)->restore_pending()) {
             materialize_deferred_locked(context, source, nullptr,
                                         /*view_lock_held=*/true);
+          }
+          // A source tracked through the PUBLIC track_table() has an EMPTY
+          // baseline by design — that entry point defers the initial scan and
+          // tells the caller to run dbsp_sync(). Replaying it here would build
+          // the view over nothing and return a permanently wrong answer, with
+          // no error and no counter moving.
+          //
+          // It normally looked fine only by accident: some unrelated commit
+          // usually ran a scan-sync between the track and the create. Measured
+          // with that accident removed (a prior FAILED dbsp_track shifts the
+          // commit sequencing): view 0.0 where SQL read 3.0, and it never
+          // self-healed — every later edit kept the same constant offset.
+          //
+          // So establish it here instead of hoping, exactly as
+          // track_table_internal does for auto-tracked sources: scan, then
+          // discard the pending changes, because the replay below IS the
+          // initialization and the delta must not be applied twice.
+          if (!tracked_tables_.at(source)->established() &&
+              !seed_baseline(context, source, /*new_tracking=*/false)) {
+            // A seeding scan that FAILED must not fall through to the replay:
+            // that would build the view over the empty baseline, which is the
+            // exact defect this branch exists to prevent.
+            throw std::runtime_error(
+                "Failed to establish the baseline of source '" + source +
+                "' for view '" + view_name + "': " + last_error_);
           }
           // Stream the baseline in bounded chunks: deltas are additive,
           // so N smaller applies equal one big one — and spill mode never
@@ -2047,6 +2960,13 @@ public:
             apply_step(source, views_[source]->get_result());
           }
         }
+      }
+      if (dbsp_timing_enabled()) {
+        fprintf(stderr,
+                "[dbsp-timing] create_replay_split %s apply_ms=%.1f "
+                "mirror_ms=%.1f\n",
+                view_name.c_str(), apply_ms, mirror_ms);
+      }
       }
 
       if (stream_failed) {
@@ -2129,6 +3049,13 @@ public:
   // must materialize first (D3c).
   void register_arrangements(duckdb::ClientContext &context,
                              PlannedCircuitView &pview, bool cold) {
+    // WHITELISTED for the sidecar watermark read below. It stamps a shared
+    // arrangement's on-disk index with the COMMITTED state that arrangement
+    // was built from, and it is compared against committed storage when the
+    // sidecar is adopted. Reached from create_view, which can run inside an
+    // open user transaction.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "register_arrangements (sidecar watermark)");
     for (const auto &req : pview.arrangement_requests()) {
       const bool source_is_table = tracked_tables_.count(req.table) > 0;
       const bool source_is_view = views_.count(req.table) > 0;
@@ -2136,7 +3063,7 @@ public:
         continue; // untracked — node keeps its local index
       }
       if (source_is_table && !cold &&
-          tracked_tables_.at(req.table)->is_deferred()) {
+          tracked_tables_.at(req.table)->restore_pending()) {
         materialize_deferred_locked(context, req.table, nullptr,
                                     /*view_lock_held=*/true);
       }
@@ -2172,7 +3099,7 @@ public:
         source_view_pending = false; // realized above; fill normally below
       }
       const bool defer_fill =
-          (source_is_table && tracked_tables_.at(req.table)->is_deferred()) ||
+          (source_is_table && tracked_tables_.at(req.table)->restore_pending()) ||
           source_view_pending;
       std::shared_ptr<SharedArrangement> arr;
       auto it = arrangements_.find(req.fingerprint);
@@ -2216,23 +3143,49 @@ public:
           // Recovery inc 3: adopt the fingerprint sidecar written by the
           // last save instead of backfilling from a 36M-row baseline scan
           // at first edit. Only over a DEFERRED table (its watermark was
-          // verified against live storage at load) and only for plain
-          // packed arrangements — pads/marks keep the backfill path.
+          // verified against live storage at load) or a PENDING view
+          // (its checkpoint stash was accepted — the sidecar's identity
+          // is then the checkpoint's save-id; see the design note at
+          // save_checkpoint's sidecar loop) and only for plain packed
+          // arrangements — pads/marks keep the backfill path.
           bool adopted = false;
-          if (source_is_table && spill_durable_dir_ && arr->packed_ok &&
-              !arr->track_weights && !arr->track_counters) {
-            const auto &tt = tracked_tables_.at(req.table);
-            adopted = flatpacked::load_flat_index_file(
-                sharr_path(req.fingerprint), req.fingerprint,
-                tt->deferred_weight(), tt->deferred_hash(), arr->flat);
+          if (spill_durable_dir_ && arr->packed_ok && !arr->track_weights &&
+              !arr->track_counters) {
+            if (source_is_table) {
+              const auto &tt = tracked_tables_.at(req.table);
+              adopted = adopt_arrangement_sidecar(*arr, req.fingerprint,
+                                                  tt->restore_weight(),
+                                                  tt->restore_hash());
+            } else {
+              // defer_fill && !source_is_table ⇒ the source view is
+              // pending, i.e. its stash was accepted (fingerprint match,
+              // stale-closure clean) — condition (1) of the design note.
+              int64_t seq = -1;
+              std::string id;
+              {
+                std::lock_guard<std::mutex> g(seeds_mutex_);
+                seq = view_arr_seq_;
+                id = view_arr_id_;
+              }
+              if (!id.empty()) {
+                adopted = adopt_arrangement_sidecar(*arr, req.fingerprint,
+                                                    seq, id);
+                if (adopted) {
+                  g_view_arr_sidecar_adopts++;
+                }
+              }
+            }
             if (std::getenv("DBSP_DEBUG_SYNC") && adopted) {
               std::cerr << "[dbsp] shared arrangement adopted from sidecar"
-                           " for table '" << req.table << "'\n";
+                           " for source '" << req.table << "'"
+                        << (arr->packed.empty() ? "" : " (+delta)") << "\n";
             }
           }
           arr->needs_backfill = !adopted;
         } else {
           DbspScopeTimer timer("arr_backfill", req.table);
+          g_arr_backfills++;
+          arr->begin_initial_fill(); // streaming build (flat PODs)
           if (source_is_table) {
             DuckDBZSet chunk;
             tracked_tables_.at(req.table)
@@ -2255,6 +3208,48 @@ public:
             arr->apply(chunk);
           } else {
             arr->apply(views_.at(req.table)->get_result());
+          }
+          // Initial fill complete: the streamed build (or, for
+          // non-streaming shapes, a fold of the bucket maps) becomes the
+          // flat arena. No probes yet; deltas overlay from here.
+          arr->finish_initial_fill();
+          // Arena-mmap increment: with a durable dir and COMMIT-STABLE
+          // content (we are inside the CREATE VIEW statement), write the
+          // v2 sidecar NOW and re-point `flat` at the mapping — the arena
+          // leaves process RAM for the rest of the create, the reopen
+          // adopt is prewritten, and the first save skips this
+          // arrangement entirely. Runs under the create path's exclusive
+          // locks — no concurrent probes.
+          if (source_is_table && spill_durable_dir_ && !arr->flat.empty() &&
+              !arr->flat.mapped()) {
+            try {
+              DbspScopeTimer t_early("arr_sidecar_early", req.table);
+              InternalQueryGuard iguard;
+              duckdb::Connection con(
+                  duckdb::DatabaseInstance::GetDatabase(context));
+              auto wm = con.Query(
+                  "SELECT COUNT(*), CAST(bit_xor(hash(__dbsp_wm_row)) AS "
+                  "VARCHAR) FROM " +
+                  quote_table_key(req.table) + " __dbsp_wm_row");
+              if (!wm->HasError() && wm->RowCount() == 1) {
+                const int64_t wc = wm->GetValue(0, 0).GetValue<int64_t>();
+                const std::string wh = wm->GetValue(1, 0).ToString();
+                if (flatpacked::write_flat_index_file(
+                        sharr_path(req.fingerprint), req.fingerprint, wc, wh,
+                        arr->flat) &&
+                    flatpacked::load_flat_index_file(
+                        sharr_path(req.fingerprint), req.fingerprint, wc, wh,
+                        arr->flat)) {
+                  arr->flat_file_wm_count = wc;
+                  arr->flat_file_wm_hash = wh;
+                  arr->sidecar_saved_wm_count = wc;
+                  arr->sidecar_saved_wm_hash = wh;
+                }
+              }
+            } catch (...) {
+              // Best-effort: the owned flat stays; the first save writes
+              // the sidecar as before.
+            }
           }
         }
         arrangements_[req.fingerprint] = arr;
@@ -2549,8 +3544,12 @@ public:
       return; // matches create_view's own persistence gate
     }
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "erase_persisted_view_row");
+      auto &con = *con_owner;
       con.Query("DELETE FROM _dbsp_views WHERE name = '" + name + "'");
       // Ignore errors (including "table does not exist") — persistence is
       // best-effort throughout this file.
@@ -2572,8 +3571,12 @@ public:
   void erase_persisted_checkpoint_rows(duckdb::ClientContext &context,
                                        const std::string &name) {
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      // WHITELISTED. DDL/DML over DBSP's OWN bookkeeping table, never the
+      // user's, so it never needs to see their uncommitted catalog — the
+      // hazard the sweep's DDL hit.
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "erase_persisted_checkpoint_rows");
+      auto &con = *con_owner;
       con.Query("DELETE FROM _dbsp_ckpt WHERE name = '" + name + "'");
       // Ignore errors (including "table does not exist") — persistence is
       // best-effort throughout this file.
@@ -2723,6 +3726,28 @@ public:
     }
   }
 
+  // Column types of a tracked table (empty when not tracked). Notify-style
+  // callers MUST cast raw values to these before building a delta row:
+  // every other ingestion path (scan, trigger source) produces
+  // schema-typed rows, and packed arrangements/join indexes encode by
+  // schema type — an untyped literal (5000.0 parses as DECIMAL, not
+  // DOUBLE) is unencodable, and even boxed, a differently-typed row would
+  // not cancel its baseline twin.
+  std::vector<duckdb::LogicalType>
+  tracked_column_types(const std::string &table_name) const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_name);
+    if (it == tracked_tables_.end()) {
+      return {};
+    }
+    std::vector<duckdb::LogicalType> types;
+    types.reserve(it->second->schema().columns.size());
+    for (const auto &col : it->second->schema().columns) {
+      types.push_back(col.type);
+    }
+    return types;
+  }
+
   // Sync tracked table with actual DuckDB table
   bool sync_table(duckdb::ClientContext &context,
                   const std::string &table_ref) {
@@ -2744,7 +3769,20 @@ public:
     std::optional<DuckDBZSet> delta_opt;
     {
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      delta_opt = sync_table_scan_and_consume(context, table_name);
+      delta_opt = sync_table_scan_and_consume(
+          context, table_name, nullptr,
+          // WHITELISTED. sync_table is the USER-INVOKED entry point
+          // (`dbsp_sync('t')`, and crash recovery): the caller asked for a
+          // reconcile against committed storage, so committed storage is
+          // exactly what it should read.
+          //
+          // It is NOT a repair for a baseline whose seeding was deferred, when
+          // called from inside the transaction that deferred it: the scan runs
+          // on an internal connection and cannot see that transaction's rows,
+          // so retire_scanned_baseline refuses to establish and dbsp_sync()
+          // reports what is still owed. Called with no transaction open, it
+          // establishes and the debt is gone.
+          InternalReadPolicy::AllowedInTxn, "dbsp_sync(table)");
     }
 
     if (!delta_opt.has_value()) {
@@ -2761,8 +3799,12 @@ public:
   }
 
   // Sync all tracked tables (sequential or parallel based on use_parallel_sync_)
-  void sync_all(duckdb::ClientContext &context,
-                duckdb::MetaTransaction *meta_transaction = nullptr) {
+  // Returns sync_tables' verdict: false when at least one table was NOT
+  // reconciled (see there).
+  bool sync_all(duckdb::ClientContext &context,
+                duckdb::MetaTransaction *meta_transaction = nullptr,
+                InternalReadPolicy policy = InternalReadPolicy::Forbidden,
+                const char *site = "sync_all") {
     // Snapshot table names and parallel flag under a shared lock, then release
     // before spawning threads. Holding struct_mutex_ while waiting on futures
     // that also need struct_mutex_ would block — snapshot it instead.
@@ -2775,16 +3817,29 @@ public:
         table_names.push_back(entry.first);
       }
     }
-    sync_tables(context, table_names, do_parallel, meta_transaction);
+    return sync_tables(context, table_names, do_parallel, meta_transaction,
+                       policy, site);
   }
 
   // Sync only the named tables (H1 touched-table scoping: the transaction
   // hooks know which tables a transaction wrote, so a commit need not scan
   // every tracked table). Unknown names are skipped.
-  void sync_tables(duckdb::ClientContext &context,
+  //
+  // Returns TRUE only when every named table was actually scanned. A scan can
+  // fail (sync_table_scan_and_consume returns nullopt: the table vanished, a
+  // deferred materialization threw, any exception mid-scan) and a name can be
+  // skipped for want of a table lock; both leave that table's baseline where
+  // it was. A caller that treats "the commit ran a reconcile" as "the baseline
+  // is now seeded" must therefore read the verdict — a silent failure leaves
+  // the baseline empty for good. Every failure is also reported through
+  // record_error_best_effort and pinned by `cdc: a failed reconcile scan keeps
+  // the debt and says so`.
+  bool sync_tables(duckdb::ClientContext &context,
                    const std::vector<std::string> &table_refs,
                    bool do_parallel,
-                   duckdb::MetaTransaction *meta_transaction = nullptr) {
+                   duckdb::MetaTransaction *meta_transaction = nullptr,
+                   InternalReadPolicy policy = InternalReadPolicy::Forbidden,
+                   const char *site = "sync_tables") {
     std::vector<std::string> table_names;
     table_names.reserve(table_refs.size());
     {
@@ -2794,64 +3849,122 @@ public:
       }
     }
 
+    // Scan and consume EVERY table's delta first, then run ONE propagation
+    // pass over all of them. Propagating per table stepped the circuit once
+    // per table, and each step rewrote every downstream view's
+    // single-generation delta buffer — a multi-table commit kept only the
+    // LAST table's effects for dbsp_changes consumers, and a join both of
+    // whose sides changed in the commit missed its both-shared correction.
+    std::vector<std::optional<DuckDBZSet>> deltas(table_names.size());
+    std::vector<std::string> worker_errors;
     if (do_parallel) {
       // TRUE parallelism: each thread acquires its own per-table lock.
       // DB scans for different tables run simultaneously.
-      // Propagation serializes at view_mutex_ (fast; not the bottleneck).
       std::vector<std::future<void>> futures;
-      for (const auto &table_name : table_names) {
+      for (size_t i = 0; i < table_names.size(); i++) {
         futures.push_back(std::async(std::launch::async,
-            [this, &context, table_name, meta_transaction]() {
+            [this, &context, &table_names, &deltas, i, meta_transaction,
+             policy, site]() {
           std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
 
-          auto lock_it = table_locks_.find(table_name);
+          auto lock_it = table_locks_.find(table_names[i]);
           if (lock_it == table_locks_.end())
             return;
 
-          std::optional<DuckDBZSet> delta_opt;
-          {
-            std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-            delta_opt = sync_table_scan_and_consume(context, table_name,
-                                                    meta_transaction);
-          }
-
-          if (!delta_opt.has_value())
-            return;
-
-          if (!delta_opt->empty()) {
-            ensure_no_deferred_before_propagate(context, table_name);
-            propagate_changes(table_name, *delta_opt);
-          }
+          std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+          deltas[i] = sync_table_scan_and_consume(context, table_names[i],
+                                                  meta_transaction, policy,
+                                                  site);
         }));
       }
       for (auto &f : futures) {
-        f.wait();
+        // get(), not wait(): the worker's own scan errors are caught inside
+        // sync_table_scan_and_consume, but anything thrown by the lock
+        // acquisition or by std::async itself would otherwise be swallowed
+        // by the future's destructor and the caller would see a clean run.
+        try {
+          f.get();
+        } catch (const std::exception &e) {
+          worker_errors.push_back(std::string("parallel sync worker: ") +
+                                  e.what());
+        } catch (...) {
+          worker_errors.push_back("parallel sync worker: unknown exception");
+        }
       }
     } else {
       // Sequential: hold struct_mutex_ shared for the entire loop so the
       // table_locks_ map stays stable; acquire each table lock in turn.
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
-      for (const auto &name : table_names) {
-        auto lock_it = table_locks_.find(name);
+      for (size_t i = 0; i < table_names.size(); i++) {
+        auto lock_it = table_locks_.find(table_names[i]);
         if (lock_it == table_locks_.end())
           continue;
 
-        std::optional<DuckDBZSet> delta_opt;
-        {
-          std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-          delta_opt = sync_table_scan_and_consume(context, name,
-                                                  meta_transaction);
-        }
-
-        if (!delta_opt.has_value())
-          continue;
-
-        if (!delta_opt->empty()) {
-          ensure_no_deferred_before_propagate(context, name);
-          propagate_changes(name, *delta_opt);
-        }
+        std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+        deltas[i] = sync_table_scan_and_consume(context, table_names[i],
+                                                meta_transaction, policy,
+                                                site);
       }
     }
+
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    {
+      std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+      for (size_t i = 0; i < table_names.size(); i++) {
+        if (deltas[i].has_value() && !deltas[i]->empty()) {
+          ensure_no_deferred_before_propagate(context, table_names[i]);
+          sources.emplace_back(table_names[i], &*deltas[i]);
+        }
+      }
+      if (!sources.empty()) {
+        propagate_changes_multi(sources);
+      }
+      // Retirement is NOT here. Every state a scan can retire — DEFERRED and
+      // PROVISIONAL alike — is retired by the ONE rule in
+      // retire_scanned_baseline, which sync_table_scan_and_consume runs for
+      // this and every other scan path. A scan that FAILED never reaches it,
+      // so a failed reconcile can never drop a debt without paying it.
+    }
+
+    // Report AFTER the locks above are released: record_error_best_effort
+    // takes struct_mutex_ exclusively, and try-locking a shared_mutex this
+    // thread already holds shared is undefined behaviour.
+    // Read once, before the first record_error_best_effort overwrites it with
+    // one of these messages.
+    const std::string scan_error = last_error();
+    bool all_ok = worker_errors.empty();
+    for (const auto &msg : worker_errors) {
+      record_error_best_effort("DBSP: " + msg);
+      note_reconcile_failure("DBSP: " + msg);
+      std::cerr << "DBSP: " << msg << "\n";
+    }
+    for (size_t i = 0; i < table_names.size(); i++) {
+      if (!deltas[i].has_value()) {
+        all_ok = false;
+        const std::string msg = "DBSP: reconcile scan did not run for '" +
+                                table_names[i] +
+                                "'; its baseline is unchanged. Last error: " +
+                                scan_error;
+        record_error_best_effort(msg);
+        note_reconcile_failure(msg);
+        std::cerr << msg << "\n";
+      }
+    }
+    return all_ok;
+  }
+
+  // How many reconcile scans have failed, and what the last one said.
+  //
+  // A failed reconcile is the one way a view can be left stale with the
+  // manager knowing it: `sync_table_scan_and_consume` reports failure by
+  // RETURNING, so nothing throws out to the caller and the only trace used to
+  // be a stderr line, which a host embedding the extension never sees.
+  // `dbsp_stats()` publishes both as `reconcile_failures` and
+  // `last_reconcile_error`.
+  uint64_t reconcile_failures() const { return reconcile_failures_.load(); }
+  std::string last_reconcile_error() const {
+    std::lock_guard<std::mutex> g(reconcile_error_mutex_);
+    return last_reconcile_error_;
   }
 
   // Enable/disable baseline spilling (Phase K1). Existing tables migrate
@@ -2971,9 +4084,9 @@ private:
       auto catalog_txn = catalog.GetCatalogTransaction(context);
 
       // Table must exist - we can't create tables from within table functions
-      auto existing = schema_entry.GetEntry(
-          catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
-          duckdb::Identifier(storage_table));
+      auto existing =
+          schema_entry.GetEntry(catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
+                                duckdb::Identifier(storage_table));
       if (!existing) {
         last_error_ =
             "Storage table '" + storage_table +
@@ -3026,9 +4139,9 @@ public:
       auto catalog_txn = catalog.GetCatalogTransaction(context);
 
       // Check if storage table exists
-      auto table_ptr = schema_entry.GetEntry(
-          catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
-          duckdb::Identifier(storage_table));
+      auto table_ptr =
+          schema_entry.GetEntry(catalog_txn, duckdb::CatalogType::TABLE_ENTRY,
+                                duckdb::Identifier(storage_table));
       if (!table_ptr) {
         // Table doesn't exist - nothing to load
         return true;
@@ -3339,6 +4452,89 @@ public:
     return it->second.get();
   }
 
+  // Why a READ of this view cannot be served, if it cannot. The question is
+  // the same one the apply path asks — the worst TrackedTable::Baseline in the
+  // view's source tree — and the states are defined there.
+  //
+  // A view replayed over an UNSEEDED baseline holds the empty answer:
+  // measured, `dbsp_query` returned NULL where SQL read 10.0, on the
+  // connection holding `BEGIN; dbsp_create_view(...)` open AND on every other
+  // connection, until that transaction ended.
+  //
+  // A PROVISIONAL source is repaired by a scan that runs from the COMMIT hook,
+  // which fires AFTER the bind that serves a read. So the FIRST read after the
+  // deferring transaction's commit, with no statement in between, was served
+  // from the short baseline: measured `view 10.0 / sql 13.0` on both backends,
+  // with the very next read returning 13.0. A transiently wrong answer with no
+  // error is the one thing the design does not allow, so the read surfaces ask
+  // this question too.
+  //
+  // Sources can be other views, so the walk is transitive. A cyclic definition
+  // cannot be created (create_view rejects cycles), but `seen` keeps a
+  // corrupted one from looping. UNSEEDED is reported in preference to
+  // PROVISIONAL: it is the stricter condition and it cannot be repaired by a
+  // scan at all.
+  //
+  // CONSULTATION POINT 2 of 2: the WORST TrackedTable::Baseline in the view's
+  // source tree, and the table holding it. SEEDED means the read may proceed.
+  struct ViewReadBlock {
+    TrackedTable::Baseline state = TrackedTable::Baseline::Seeded;
+    std::string table;
+    // Meaningful for DEFERRED only: TrackedTable::pre_trigger_rows() of the
+    // blocking table, so the read gate can say WHO can lift the block.
+    bool pre_trigger_rows = false;
+  };
+
+  ViewReadBlock view_read_block(const std::string &view_name) {
+    std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    std::shared_lock<std::shared_mutex> view_lock(view_mutex_);
+    std::unordered_set<std::string> seen;
+    ViewReadBlock out;
+    view_read_block_locked(view_name, seen, out);
+    return out;
+  }
+
+  // Shared by the establish gate (retire_scanned_baseline) and the read
+  // gate's message (EnsureViewReadable): whether an UNTAINTED baseline may
+  // be established by a scan taken now. (A1, correctness-first owner
+  // decision 2026-09-10: an older open transaction may hold untracked
+  // pre-establish writes invisible to this scan. Reads no table data, only
+  // start timestamps.)
+  //
+  // With a live statement transaction, the reference is its own start: only
+  // a transaction OLDER than the scan is waited on (self never blocks). With
+  // no live transaction — the commit-hook sweep runs after Commit() cleared
+  // it — there is nothing to be older than, so only a completely empty
+  // active set establishes: anyone still open may hold folded writes, and
+  // the committer itself cannot be told apart. That keeps the commit-pays
+  // path (alone) while refusing the third-party establish the old rule
+  // allowed. Anything else unresolvable answers false: refusing is safe.
+  bool untainted_establish_allowed(duckdb::ClientContext &context,
+                                   const std::string &table_name) {
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return false;
+      }
+      auto &tm = duckdb::TransactionManager::Get(*attached);
+      if (!tm.IsDuckTransactionManager()) {
+        return true;
+      }
+      uint64_t mine;
+      try {
+        mine = static_cast<uint64_t>(
+            duckdb::DuckTransaction::Get(context, *attached).start_time);
+      } catch (...) {
+        // No live statement transaction (commit-hook sweep): establish only
+        // when nobody at all is still active.
+        return no_active_snapshots(*attached);
+      }
+      return no_active_snapshot_before(*attached, mine);
+    } catch (...) {
+      return false;
+    }
+  }
+
   // Scan a view's rows under shared locks: safe against concurrent
   // propagate_changes/create_view, which take view_mutex_ exclusively.
   // Returns false if the view does not exist.
@@ -3440,6 +4636,9 @@ public:
       return true;
     }
     if (!enable) {
+      // Sticky: an explicit disable outlives any later load_from_duck_table,
+      // which would otherwise re-enable mirroring off __dbsp_mv_meta.
+      mv_tables_user_disabled_ = true;
       mv_tables_enabled_ = false;
       std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
       std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
@@ -3454,6 +4653,12 @@ public:
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
     std::unique_lock<std::shared_mutex> view_lock(view_mutex_);
     mv_db_ = &duckdb::DatabaseInstance::GetDatabase(context);
+    // WHITELISTED for the __dbsp_mv_meta read and the __mv_* writes below.
+    // Both are DBSP's OWN mirror bookkeeping, never the user's tables: the
+    // backfill copies a VIEW RESULT out of the circuit, so it reads no user
+    // table at all and needs no view of their uncommitted rows.
+    enforce_internal_read_policy(context, InternalReadPolicy::AllowedInTxn,
+                                 "set_mv_tables (mirror backfill)");
     InternalQueryGuard guard;
     try {
       duckdb::Connection con(*mv_db_);
@@ -3492,11 +4697,103 @@ public:
         }
       }
       mv_tables_enabled_ = true;
+      mv_tables_user_disabled_ = false;
       return true;
     } catch (const std::exception &e) {
       last_error_ = std::string("mv_tables enable failed: ") + e.what();
       return false;
     }
+  }
+
+  // Declare the view's unique, non-null row key. The delta-apply DELETE
+  // then matches those columns by equality instead of comparing every
+  // column of the row, which is the difference between an equi-join and a
+  // full scan of the view per edit (17x on 1M rows x 199 columns; see
+  // mv_apply_delta). Idempotent; pass an empty vector to clear.
+  //
+  // Refuses a key that is not actually a key. Uniqueness and non-nullness
+  // are checked against the view's CURRENT backing rows, which is the best
+  // this can do -- a key that stops being unique later would silently
+  // retract the wrong row, so callers must declare a key that the view's
+  // SQL guarantees (a GROUP BY's grouping columns, or a dense coordinate
+  // grid), never one that merely happens to be unique today.
+  bool set_view_key(const std::string &view_name,
+                    const std::vector<std::string> &cols) {
+    std::unique_lock<std::shared_mutex> struct_lock(struct_mutex_);
+    auto it = views_.find(view_name);
+    if (it == views_.end()) {
+      last_error_ = "set_view_key: unknown view '" + view_name + "'";
+      return false;
+    }
+    if (cols.empty()) {
+      it->second->set_key_columns({});
+      return true;
+    }
+    const auto &schema = it->second->result_schema();
+    for (const auto &c : cols) {
+      if (!is_valid_identifier(c)) {
+        last_error_ = "set_view_key: invalid column name '" + c + "'";
+        return false;
+      }
+      bool found = false;
+      for (const auto &sc : schema.columns) {
+        if (sc.name == c) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        last_error_ =
+            "set_view_key: column '" + c + "' is not in view '" + view_name + "'";
+        return false;
+      }
+    }
+    if (!mv_tables_enabled_) {
+      last_error_ = "set_view_key: mv_tables is not enabled";
+      return false;
+    }
+    std::string keylist;
+    std::string nullcheck;
+    for (size_t i = 0; i < cols.size(); i++) {
+      if (i > 0) {
+        keylist += ", ";
+        nullcheck += " OR ";
+      }
+      keylist += mv_quote(cols[i]);
+      nullcheck += mv_quote(cols[i]) + " IS NULL";
+    }
+    const std::string qt = mv_quote(mv_table_for(view_name));
+    try {
+      InternalQueryGuard guard;
+      duckdb::Connection con(*mv_db_);
+      auto dup = con.Query("SELECT 1 FROM " + qt + " GROUP BY " + keylist +
+                           " HAVING COUNT(*) > 1 LIMIT 1");
+      if (dup->HasError()) {
+        last_error_ = "set_view_key: uniqueness check failed: " + dup->GetError();
+        return false;
+      }
+      if (dup->RowCount() > 0) {
+        last_error_ = "set_view_key: columns are not unique over view '" +
+                      view_name + "'";
+        return false;
+      }
+      auto nulls =
+          con.Query("SELECT 1 FROM " + qt + " WHERE " + nullcheck + " LIMIT 1");
+      if (nulls->HasError()) {
+        last_error_ = "set_view_key: null check failed: " + nulls->GetError();
+        return false;
+      }
+      if (nulls->RowCount() > 0) {
+        last_error_ =
+            "set_view_key: key columns contain NULL in view '" + view_name + "'";
+        return false;
+      }
+    } catch (const std::exception &e) {
+      last_error_ = std::string("set_view_key failed: ") + e.what();
+      return false;
+    }
+    it->second->set_key_columns(cols);
+    return true;
   }
 
 private:
@@ -3581,9 +4878,28 @@ private:
     return mv_meta_upsert(con, name);
   }
 
+  // F9 per-view mirror cache on the persistent mirror connection (see the
+  // mv_con_ member comment): the TEMP stage table (created once per
+  // connection) and the three statement STRINGS. Deliberately NOT
+  // duckdb::PreparedStatement: DuckDB bakes data-dependent optimizations
+  // into the prepared plan — a DELETE ... USING stage prepared while the
+  // stage was empty stays a no-op forever (reproduced: the join is pruned
+  // at prepare time), which silently stops retractions and corrupts the
+  // mirror. Statement strings re-plan per execute against current data.
+  struct MvViewStmts {
+    bool stage_ready = false;
+    std::string stage_raw; // appender target
+    std::string truncate_sql;
+    std::string del_sql;
+    std::string ins_sql;
+  };
+
   bool mv_apply_delta(duckdb::Connection &con, const std::string &name,
                       const NativeMaterializedView &view,
-                      const DuckDBZSet &delta) {
+                      const DuckDBZSet &delta, MvViewStmts *stmts = nullptr,
+                      bool defer_meta = false) {
+    DbspScopeTimer t_mv("mv_apply_delta",
+                        name + " rows=" + std::to_string(delta.size()));
     // Fast path needs every delta weight at ±1 (retract exactly one copy
     // per row). Anything else — multiplicities — rebuilds the table from
     // its own current rows + the delta (the table IS the result for
@@ -3599,26 +4915,39 @@ private:
       return true;
     }
     const std::string qt = mv_quote(mv_table_for(name));
-    auto res = con.Query("CREATE OR REPLACE TEMP TABLE __mv_stage (" +
-                         mv_columns_ddl(schema) + ", __w BIGINT)");
-    if (res->HasError()) {
-      last_error_ = "mv stage create failed: " + res->GetError();
-      return false;
-    }
-    mv_append_rows(con, "__mv_stage", delta, /*with_weight=*/true);
+    // The retract predicate. Without a declared key this must compare
+    // EVERY column, so applying a one-row delta scans the whole view
+    // across all its columns -- O(rows x columns) per commit, and the
+    // dominant cost of an incremental edit (measured ~0.5ms per column on
+    // a 1M-row view; 199 columns = 113ms to retract ONE row).
+    //
+    // A declared key collapses that to an equi-join the planner can hash:
+    // 17x on 1M rows x 199 columns. Plain `=`, never IS NOT DISTINCT FROM
+    // -- the latter is not an equi-join key, so the planner cannot hash it
+    // and the predicate stays a full scan (measured SLOWER than matching
+    // all columns). That is why the key must be NON-NULL, and why adding a
+    // key alongside the all-columns match buys nothing.
+    //
+    // Key uniqueness is verified against the initial result at create time
+    // (see create_view); see NativeMaterializedView::key_columns().
+    const auto &keys = view.key_columns();
     std::string match;
-    for (size_t i = 0; i < schema.columns.size(); i++) {
-      if (i > 0) {
-        match += " AND ";
+    if (!keys.empty()) {
+      for (size_t i = 0; i < keys.size(); i++) {
+        if (i > 0) {
+          match += " AND ";
+        }
+        const std::string c = mv_quote(keys[i]);
+        match += "t." + c + " = s." + c;
       }
-      const std::string c = mv_quote(schema.columns[i].name);
-      match += "t." + c + " IS NOT DISTINCT FROM s." + c;
-    }
-    res = con.Query("DELETE FROM " + qt + " t USING __mv_stage s WHERE " +
-                    "s.__w < 0 AND " + match);
-    if (res->HasError()) {
-      last_error_ = "mv delete failed: " + res->GetError();
-      return false;
+    } else {
+      for (size_t i = 0; i < schema.columns.size(); i++) {
+        if (i > 0) {
+          match += " AND ";
+        }
+        const std::string c = mv_quote(schema.columns[i].name);
+        match += "t." + c + " IS NOT DISTINCT FROM s." + c;
+      }
     }
     std::string cols;
     for (size_t i = 0; i < schema.columns.size(); i++) {
@@ -3627,6 +4956,63 @@ private:
       }
       cols += mv_quote(schema.columns[i].name);
     }
+
+    // F9 cached path (persistent mirror connection): per-view TEMP stage
+    // created once per connection and truncated per commit — a commit
+    // runs three cached-string statements plus the appender instead of
+    // CREATE OR REPLACE + DROP + two built-fresh statements. Any error
+    // (rolled-back stage create, schema drift after a view recreate, ...)
+    // drops the cache and falls through to the self-contained path below
+    // for this call.
+    if (stmts != nullptr) {
+      bool ok = true;
+      if (!stmts->stage_ready) {
+        stmts->stage_raw = "__mv_stage_" + mv_table_for(name);
+        const std::string st = mv_quote(stmts->stage_raw);
+        auto res = con.Query("CREATE TEMP TABLE IF NOT EXISTS " + st + " (" +
+                             mv_columns_ddl(schema) + ", __w BIGINT)");
+        ok = !res->HasError();
+        if (ok) {
+          stmts->truncate_sql = "DELETE FROM " + st;
+          stmts->del_sql = "DELETE FROM " + qt + " t USING " + st +
+                           " s WHERE s.__w < 0 AND " + match;
+          stmts->ins_sql = "INSERT INTO " + qt + " SELECT " + cols +
+                           " FROM " + st + " WHERE __w > 0";
+          stmts->stage_ready = true;
+        }
+      }
+      if (ok) {
+        auto tr = con.Query(stmts->truncate_sql);
+        ok = !tr->HasError();
+      }
+      if (ok) {
+        mv_append_rows(con, stmts->stage_raw, delta, /*with_weight=*/true);
+        auto dr = con.Query(stmts->del_sql);
+        ok = !dr->HasError();
+        if (ok) {
+          auto ir = con.Query(stmts->ins_sql);
+          ok = !ir->HasError();
+        }
+      }
+      if (ok) {
+        return defer_meta ? true : mv_meta_upsert(con, name);
+      }
+      *stmts = MvViewStmts{}; // stale — rebuild lazily next commit
+    }
+
+    auto res = con.Query("CREATE OR REPLACE TEMP TABLE __mv_stage (" +
+                         mv_columns_ddl(schema) + ", __w BIGINT)");
+    if (res->HasError()) {
+      last_error_ = "mv stage create failed: " + res->GetError();
+      return false;
+    }
+    mv_append_rows(con, "__mv_stage", delta, /*with_weight=*/true);
+    res = con.Query("DELETE FROM " + qt + " t USING __mv_stage s WHERE " +
+                    "s.__w < 0 AND " + match);
+    if (res->HasError()) {
+      last_error_ = "mv delete failed: " + res->GetError();
+      return false;
+    }
     res = con.Query("INSERT INTO " + qt + " SELECT " + cols +
                     " FROM __mv_stage WHERE __w > 0");
     if (res->HasError()) {
@@ -3634,7 +5020,7 @@ private:
       return false;
     }
     con.Query("DROP TABLE __mv_stage");
-    return mv_meta_upsert(con, name);
+    return defer_meta ? true : mv_meta_upsert(con, name);
   }
 
   // General fallback: reconstruct the multiset from the CURRENT backing
@@ -3698,18 +5084,33 @@ private:
     return true;
   }
 
+  void mv_reset_mirror_conn() {
+    mv_stmts_.clear();
+    mv_meta_ready_ = false;
+    mv_con_.reset();
+    mv_con_db_ = nullptr;
+  }
+
   // Mirror the deltas of this pass's touched views. Runs at the end of
   // propagate_changes, locks held; InternalQueryGuard keeps the hooks out.
   // ONE internal transaction per pass: either every touched view's table
-  // advances together with the meta rows, or none do.
+  // advances together with the meta rows, or none do. Meta rows are
+  // upserted in ONE batched statement per pass (was: CREATE IF NOT EXISTS
+  // + INSERT per view per commit).
   void mv_after_propagate(const std::vector<std::string> &touched) {
     if (!mv_tables_enabled_.load() || mv_db_ == nullptr || touched.empty()) {
       return;
     }
     InternalQueryGuard guard;
     try {
-      duckdb::Connection con(*mv_db_);
+      if (!mv_con_ || mv_con_db_ != mv_db_) {
+        mv_reset_mirror_conn();
+        mv_con_ = std::make_unique<duckdb::Connection>(*mv_db_);
+        mv_con_db_ = mv_db_;
+      }
+      duckdb::Connection &con = *mv_con_;
       con.Query("BEGIN");
+      std::vector<std::string> applied;
       for (const auto &name : touched) {
         auto it = views_.find(name);
         if (it == views_.end()) {
@@ -3719,16 +5120,48 @@ private:
         if (delta.empty()) {
           continue;
         }
-        if (!mv_apply_delta(con, name, *it->second, delta)) {
+        applied.push_back(name);
+        if (!mv_apply_delta(con, name, *it->second, delta,
+                            &mv_stmts_[name], /*defer_meta=*/true)) {
           con.Query("ROLLBACK");
           mv_tables_enabled_ = false;
+          mv_reset_mirror_conn();
           return;
+        }
+      }
+      if (!applied.empty()) {
+        if (!mv_meta_ready_) {
+          auto res =
+              con.Query("CREATE TABLE IF NOT EXISTS __dbsp_mv_meta ("
+                        "view_name VARCHAR PRIMARY KEY, commit_seq BIGINT)");
+          if (res->HasError()) {
+            throw std::runtime_error("mv meta create failed: " +
+                                     res->GetError());
+          }
+          mv_meta_ready_ = true;
+        }
+        std::string sql = "INSERT OR REPLACE INTO __dbsp_mv_meta VALUES ";
+        const std::string seq = std::to_string(commit_seq_.load());
+        for (size_t i = 0; i < applied.size(); i++) {
+          if (i > 0) {
+            sql += ", ";
+          }
+          sql += "('" + escape_string(applied[i]) + "', " + seq + ")";
+        }
+        auto res = con.Query(sql);
+        if (res->HasError()) {
+          throw std::runtime_error("mv meta upsert failed: " +
+                                   res->GetError());
         }
       }
       con.Query("COMMIT");
     } catch (const std::exception &e) {
+      if (mv_con_) {
+        mv_con_->Query("ROLLBACK");
+      }
       last_error_ = std::string("mv mirror failed: ") + e.what();
       mv_tables_enabled_ = false;
+      mv_reset_mirror_conn();
     }
   }
 
@@ -3898,66 +5331,180 @@ public:
     return it->second->state_total_weight();
   }
 
-  // Apply a delta captured from a transaction's local storage (G2 fast
-  // path): O(delta) — no table scan, no diff. The caller has already
-  // validated the delta against the committed table (count guard).
-  // `context` enables lazy-baseline materialization (D3c); without it a
-  // deferred manager rejects the fast path (caller falls back to sync).
-  bool apply_captured_delta(const std::string &table_name,
-                            const DuckDBZSet &delta,
-                            duckdb::ClientContext *context = nullptr) {
-    if (delta.empty()) {
-      return true;
-    }
-    DbspScopeTimer t_total("apply_captured_delta",
-                           table_name + " rows=" +
-                               std::to_string(delta.size()));
+  // Apply ONE commit's exact per-table deltas (trigger-fed) and propagate
+  // them in a SINGLE circuit pass. Returns the tables that could not be
+  // served — the caller reconciles those by scan at the same commit.
+  //
+  // One pass over all tables, never one per table: a per-table step rewrote
+  // every downstream view's single-generation delta buffer, so a view reading
+  // both tables kept only the LAST table's effects, and a join both of whose
+  // sides changed in the commit missed its both-shared correction (see
+  // propagate_changes_multi).
+  std::vector<std::string> apply_captured_deltas(
+      const std::unordered_map<std::string, DuckDBZSet> &deltas,
+      duckdb::ClientContext *context = nullptr) {
+    std::vector<std::string> failed;
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    sources.reserve(deltas.size());
     std::shared_lock<std::shared_mutex> struct_lock(struct_mutex_);
-    auto it = tracked_tables_.find(table_name);
-    if (it == tracked_tables_.end()) {
-      return false;
+    for (const auto &[table_name, delta] : deltas) {
+      if (delta.empty()) {
+        continue;
+      }
+      auto it = tracked_tables_.find(table_name);
+      if (it == tracked_tables_.end()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      // CONSULTATION POINT 1 of 2. Only a SEEDED baseline serves an exact
+      // delta; UNSEEDED and PROVISIONAL are handed back to the caller, which
+      // reconciles them by scan at this same commit (TrackedTable::Baseline
+      // says what each state costs and what repairs it).
+      if (!it->second->serves_exact_delta()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      auto lock_it = table_locks_.find(table_name);
+      if (lock_it == table_locks_.end()) {
+        failed.push_back(table_name);
+        continue;
+      }
+      if (has_deferred() &&
+          !prepare_deferred_for_delta(context, table_name, delta)) {
+        failed.push_back(table_name);
+        continue;
+      }
+      DbspScopeTimer t_total("apply_captured_deltas",
+                             table_name + " rows=" +
+                                 std::to_string(delta.size()));
+      {
+        std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
+        it->second->apply_delta(delta);
+      }
+      sources.emplace_back(table_name, &delta);
     }
-    auto lock_it = table_locks_.find(table_name);
-    if (lock_it == table_locks_.end()) {
-      return false;
+    if (!sources.empty()) {
+      propagate_changes_multi(sources);
+      // Observable per-TABLE, matching the single-table path's count.
+      exact_delta_syncs_ += sources.size();
     }
-    if (has_deferred() &&
-        !prepare_deferred_for_delta(context, table_name, delta)) {
-      // Rebuild scheduled (or no context): the committed rows are already
-      // in storage, so the rebuild/scan fallback reconciles them.
-      return false;
-    }
-    {
-      std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      it->second->apply_delta(delta);
-    }
-    propagate_changes(table_name, delta);
-    captured_delta_syncs_++;
-    return true;
+    return failed;
   }
 
-  // Number of commits served by captured deltas instead of scan-and-diff
-  // (observable so tests can prove the fast path actually ran)
-  uint64_t captured_delta_syncs() const { return captured_delta_syncs_; }
+  // Number of table deltas applied exactly (trigger-fed) instead of
+  // scan-and-diff (observable so tests can prove the fast path actually ran)
+  uint64_t exact_delta_syncs() const { return exact_delta_syncs_; }
 
-  // Monotonic count of baseline mutations; UPDATE/DELETE write-capture
-  // snapshots it at transaction begin and falls back when it moved by
-  // commit time (an interleaved commit may have invalidated the capture's
-  // committed-state read). See docs/DESIGN_WRITE_CAPTURE.md.
+  // Tables currently held PROVISIONAL (TrackedTable::mark_provisional). Zero
+  // in the ordinary single-writer session, and tests assert that.
+  uint64_t provisional_tables() const { return provisional_count_.load(); }
+
+  // Tracked tables whose baseline no scan has ESTABLISHED yet — UNSEEDED
+  // (nobody has asked) or DEFERRED (a seed was asked for and could not run).
+  //
+  // A different question from untrusted_baselines(): this one is "what is
+  // still OWED", not "what can be paid right now", and it is what lets
+  // `dbsp_sync()` report honestly instead of saying "Synced" for a call that
+  // established nothing.
+  std::vector<std::string> unestablished_baselines() const {
+    std::vector<std::string> out;
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    for (const auto &[name, table] : tracked_tables_) {
+      if (!table->established()) {
+        out.push_back(name);
+      }
+    }
+    return out;
+  }
+
+  // Same question for one table. False for a name that is not tracked, which
+  // is not "owed" — it is not ours.
+  bool baseline_established(const std::string &table_key) const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    auto it = tracked_tables_.find(table_key);
+    return it == tracked_tables_.end() || it->second->established();
+  }
+
+  // Every tracked table whose baseline is not SEEDED and whose debt a scan of
+  // committed storage can pay right now, BY NAME. This is what the commit hook
+  // scans, and it replaces both a per-connection "somewhere a baseline is
+  // unseeded" flag — which named no table and could therefore only be paid by
+  // a full sync_all — and a separate provisional-only sweep.
+  //
+  // A table is included only once its readiness watermark has cleared. For
+  // DEFERRED that means the transaction whose openness deferred the seed has
+  // ENDED, so a scan of committed storage now sees the rows it could not see
+  // before; for PROVISIONAL it means every transaction alive at seed time has
+  // ended, so the scan finally sees the pre-tracking write. Scanning earlier
+  // would read the same incomplete state again and, worse, would mark the
+  // baseline TRUSTED while it is still short.
+  //
+  // Cost in the steady state: a shared lock and one enum load per tracked
+  // table, with no table ever returned.
+  std::vector<std::string> untrusted_baselines(duckdb::ClientContext &context) {
+    std::vector<std::string> out;
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    for (const auto &[name, table] : tracked_tables_) {
+      const auto state = table->baseline();
+      // UNSEEDED is NOT a debt. The public dbsp_track() leaves a baseline
+      // empty ON PURPOSE and documents dbsp_sync() as the way to fill it;
+      // scanning it here would both cost a scan nobody asked for and, worse,
+      // establish a baseline WITHOUT the concurrency check seed_baseline runs
+      // (mark_provisional_if_concurrent), so a table tracked while another
+      // connection held a write open would be marked trusted while short.
+      if (state != TrackedTable::Baseline::Deferred &&
+          state != TrackedTable::Baseline::Provisional) {
+        continue;
+      }
+      if (ready_watermark_cleared(context, name, *table)) {
+        out.push_back(name);
+      }
+    }
+    return out;
+  }
+
+  // Scan every table untrusted_baselines() names, once. Runs from the commit
+  // hook AFTER this commit's own deltas were handled, so a table that is still
+  // untrusted had its delta refused and scanned already — the scan here can
+  // never double-count. sync_tables seeds what it scans and retires a
+  // provisional baseline whose scan SUCCEEDED.
+  //
+  // This is the step that repairs a view no later commit happens to touch: in
+  // the reproduction, connection A's pre-tracking INSERT commits and it is the
+  // NEXT statement on B — a bare `SELECT 1` — whose commit finds the watermark
+  // clear and pays the scan.
+  //
+  // The READ path calls it too, guarded by "the reader holds no transaction of
+  // its own". That is safe for exactly the reason the watermark exists: a table
+  // whose deferring or seeding transaction is still alive is not ready, so a
+  // reader can never establish a baseline the open transaction would have
+  // changed. It is what lets the first read after a ROLLBACK answer instead of
+  // refusing.
+  //
+  // Returns false when a scan it asked for did not run, so a caller that
+  // treats "the commit reconciled" as "the baseline is now seeded" cannot be
+  // misled. Nothing is retired on a failed scan: the per-table state stands
+  // and the next commit tries again.
+  bool reconcile_untrusted_baselines(duckdb::ClientContext &context,
+                                     InternalReadPolicy policy,
+                                     const char *site) {
+    std::vector<std::string> owed = untrusted_baselines(context);
+    if (owed.empty()) {
+      return true;
+    }
+    if (std::getenv("DBSP_DEBUG_SEED")) {
+      std::cerr << "[dbsp] untrusted-baseline sweep: " << owed.size()
+                << " table(s) site=" << site << "\n";
+    }
+    return sync_tables(context, owed, /*do_parallel=*/false, nullptr, policy,
+                       site);
+  }
+
+  // Monotonic count of baseline mutations, advanced on every propagated
+  // mutation and on full rebuilds.
   uint64_t commit_seq() const { return commit_seq_; }
   bool dirty_since_save() const { return dirty_since_save_.load(); }
   void mark_saved() { dirty_since_save_ = false; }
-
-  // Write-capture commit-guard failures (each one fell back to
-  // scan-and-diff — loud, countable, never silent)
-  uint64_t capture_guard_fallbacks() const { return capture_guard_fallbacks_; }
-  void note_capture_guard_fallback() { capture_guard_fallbacks_++; }
-
-  // Test knob: force the scan-and-diff path for differential comparison
-  bool write_capture_enabled() const { return write_capture_enabled_; }
-  void set_write_capture_enabled(bool enabled) {
-    write_capture_enabled_ = enabled;
-  }
 
   // Live shared join arrangements (I1); lets tests prove sharing happened
   size_t shared_arrangement_count() const {
@@ -3974,6 +5521,12 @@ public:
   // Number of scan-and-diff table scans performed (tests use this to prove
   // sync scoping skips untouched tables)
   uint64_t scan_syncs() const { return scan_syncs_; }
+
+  // Number of tracked tables (diagnostics; sync-scoping decisions).
+  size_t tracked_table_total() const {
+    std::shared_lock<std::shared_mutex> lock(struct_mutex_);
+    return tracked_tables_.size();
+  }
 
   size_t get_tracked_table_count(const std::string &table_name) const {
     std::shared_lock<std::shared_mutex> lock(struct_mutex_);
@@ -4101,8 +5654,12 @@ public:
     try {
       // Create _dbsp_views table if it doesn't exist. Fresh connection:
       // `context` may be mid-query (recovery runs inside table functions).
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      // WHITELISTED. DDL over DBSP's OWN bookkeeping table, never the user's,
+      // so it never needs to see their uncommitted catalog — the hazard the
+      // sweep's DDL hit.
+      InternalConnection con_owner(context, InternalReadPolicy::AllowedInTxn,
+                                    "initialize_persistence_table");
+      auto &con = *con_owner;
       auto result = con.Query(
         "CREATE TABLE IF NOT EXISTS _dbsp_views ("
         "  name VARCHAR PRIMARY KEY,"
@@ -4160,13 +5717,18 @@ private:
   // Finalize()), so that path was removed.
   // Guard: OnConnectionOpened must not run first-time recovery here -
   // the calling thread may hold struct_mutex_ and recovery re-acquires it.
+  //
+  // `policy`/`site` enforce the law above under DBSP_STRICT_INTERNAL_QUERY=1
+  // (see InternalReadPolicy): every caller states in code whether reading
+  // committed-only state here is legal for it, and why.
   static int64_t
   stream_table_rows(duckdb::ClientContext &context,
                     const std::string &table_key,
-                    const std::function<void(DuckDBRow &&)> &emit) {
-    InternalQueryGuard guard;
-    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
-    duckdb::Connection fresh_con(fresh_db);
+                    const std::function<void(DuckDBRow &&)> &emit,
+                    InternalReadPolicy policy, const char *site) {
+    InternalConnection fresh_con_owner(context, policy,
+                                  site);
+    auto &fresh_con = *fresh_con_owner;
     // Streaming execution (H5): rows are consumed chunk by chunk below,
     // so materializing the whole table into a QueryResult first was one
     // extra full-table copy per sync
@@ -4258,14 +5820,19 @@ private:
     return total;
   }
 
-  // Live COUNT(*) + bit_xor(hash) of a table, matching the watermark format
-  // written by save_checkpoint. Returns false on query failure.
+  // Committed COUNT(*) + bit_xor(hash) of a USER table, on a fresh internal
+  // connection, in the watermark format save_checkpoint writes. Returns false
+  // on query failure. Same hazard shape as stream_table_rows — it reads
+  // committed-only state — so it carries the caller's policy rather than
+  // deciding for itself.
   static bool live_watermark(duckdb::ClientContext &context,
                              const std::string &table_key, int64_t &count,
-                             std::string &hash) {
+                             std::string &hash, InternalReadPolicy policy,
+                             const char *site) {
     try {
-      InternalQueryGuard guard;
-      duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+      InternalConnection con_owner(context, policy,
+                                    site);
+      auto &con = *con_owner;
       // Shadow-proof alias — see save_checkpoint's watermark loop.
       auto wm = con.Query("SELECT COUNT(*), CAST(bit_xor(hash("
                           "__dbsp_wm_row)) AS VARCHAR) FROM " +
@@ -4290,7 +5857,8 @@ private:
   std::optional<DuckDBZSet> sync_table_scan_and_consume(
       duckdb::ClientContext &context,
       const std::string &table_name,
-      duckdb::MetaTransaction *meta_transaction = nullptr) {
+      duckdb::MetaTransaction *meta_transaction,
+      InternalReadPolicy policy, const char *site) {
     DbspScopeTimer timer("source_sync", table_name);
 
     auto it = tracked_tables_.find(table_name);
@@ -4307,12 +5875,13 @@ private:
     // baseline is unrecoverable, so the reconciliation delta for the
     // restored views cannot be computed — install current storage as the
     // baseline and schedule a full view rebuild (next QueryBegin).
-    if (it->second->is_deferred()) {
+    if (it->second->restore_pending()) {
       int64_t live_count = 0;
       std::string live_hash;
-      if (live_watermark(context, table_name, live_count, live_hash) &&
-          live_count == it->second->deferred_weight() &&
-          live_hash == it->second->deferred_hash()) {
+      if (live_watermark(context, table_name, live_count, live_hash, policy,
+                         site) &&
+          live_count == it->second->restore_weight() &&
+          live_hash == it->second->restore_hash()) {
         return DuckDBZSet(); // unchanged since restore: stay lazy
       }
       try {
@@ -4333,14 +5902,19 @@ private:
       it->second->begin_rebuild();
       scan_syncs_++;
 
-      stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
-        it->second->add_scanned_row(std::move(row));
-      });
+      stream_table_rows(
+          context, table_name,
+          [&](DuckDBRow &&row) { it->second->add_scanned_row(std::move(row)); },
+          policy, site);
 
       // Diff against the previous baseline and swap the new one in
       // (spill mode: digest-index compare + on-disk payloads; RAM mode:
-      // whole-map diff + move)
-      return it->second->finish_rebuild();
+      // whole-map diff + move). finish_rebuild installs CONTENT only; whether
+      // this scan may also retire an untrusted TRUST state is one question,
+      // asked in one place, immediately below.
+      auto delta = it->second->finish_rebuild();
+      retire_scanned_baseline(context, table_name, *it->second);
+      return delta;
 
     } catch (const std::exception &e) {
       last_error_ = std::string("Exception in sync_table_scan_and_consume: ") + e.what();
@@ -4381,7 +5955,7 @@ private:
                                    const DuckDBZSet *pending,
                                    bool view_lock_held) {
     auto it = tracked_tables_.find(table_name);
-    if (it == tracked_tables_.end() || !it->second->is_deferred()) {
+    if (it == tracked_tables_.end() || !it->second->restore_pending()) {
       return true;
     }
     DbspScopeTimer timer("baseline_materialize", table_name);
@@ -4398,7 +5972,7 @@ private:
       return true;
     }
 
-    int64_t expected = tt.deferred_weight();
+    int64_t expected = tt.restore_weight();
     if (pending) {
       for (const auto &[row, w] : *pending) {
         expected += w;
@@ -4407,12 +5981,23 @@ private:
 
     tt.begin_rebuild();
     const int64_t scanned = stream_table_rows(
-        context, table_name, [&](DuckDBRow &&row) {
-          tt.add_scanned_row(std::move(row));
-        }); // throws on scan failure: baseline stays deferred
+        context, table_name,
+        [&](DuckDBRow &&row) { tt.add_scanned_row(std::move(row)); },
+        // WHITELISTED, same reason as rebuild_all_views: this reaches
+        // QueryBegin through materialize_all_deferred and REFRESHES a
+        // checkpoint-restored baseline whose content is by construction the
+        // committed table, rather than establishing a new one.
+        InternalReadPolicy::AllowedInTxn,
+        "materialize_deferred_locked"); // throws on scan failure: baseline
+                                        // stays deferred
     const bool clean = (scanned == expected);
 
-    tt.install_rebuild();
+    // establishes=false: this MATERIALIZES a restore-pending baseline whose
+    // trust state mark_restore_pending already set to SEEDED — the restore
+    // verified its watermark against live storage. It has nothing to
+    // establish, and saying so keeps the one establishing site the seeding
+    // scan.
+    tt.install_rebuild(/*establishes=*/false);
     deferred_tables_--;
 
     if (!clean) {
@@ -4467,6 +6052,8 @@ private:
         continue;
       }
       DbspScopeTimer timer("arr_backfill", source_name);
+      g_arr_backfills++;
+      arr->begin_initial_fill(); // streaming build (flat PODs)
       if (tt_it != tracked_tables_.end()) {
         DuckDBZSet chunk;
         tt_it->second->scan_state([&](const DuckDBRow &row, int64_t w) {
@@ -4491,6 +6078,8 @@ private:
         // set_result()'d before calling us, so get_result() is real.
         arr->apply(view_it->second->get_result());
       }
+      // Same streamed-build finish as the register-time backfill above.
+      arr->finish_initial_fill();
       arr->needs_backfill = false;
     }
   }
@@ -4516,7 +6105,7 @@ private:
         continue;
       }
       std::unique_lock<std::shared_mutex> table_lock(*lock_it->second);
-      if (tt->is_deferred()) {
+      if (tt->restore_pending()) {
         materialize_deferred_locked(context, name, nullptr, false);
       }
     }
@@ -4529,7 +6118,7 @@ private:
     if (it == tracked_tables_.end()) {
       return false;
     }
-    if (!it->second->is_deferred()) {
+    if (!it->second->restore_pending()) {
       return true;
     }
     return materialize_deferred_locked(context, edited_table, pending, false);
@@ -4582,6 +6171,452 @@ private:
     }
   }
 
+  // Establish `table_name`'s baseline so it equals the table content a view
+  // replayed over it would have to agree with.
+  //
+  // The scan runs on an INTERNAL connection (stream_table_rows opens its own),
+  // which by construction cannot see an open user transaction's uncommitted
+  // rows. Trusting it there produced a permanently wrong view: measured with
+  // `BEGIN; INSERT INTO t VALUES (2, 3.0); CREATE MATERIALIZED VIEW tv AS
+  // SELECT SUM(v) FROM t; COMMIT` the view read 3.0 where SQL read 13.0, and
+  // it never healed (7.0 against 17.0 after the next edit). It is the same law
+  // the trigger sweep already keeps: never read committed-only state on an
+  // internal connection while the user holds a transaction open.
+  //
+  // So inside a user transaction the baseline is deliberately left UNSEEDED
+  // and the connection is told to reconcile it later (baseline_unseeded). The
+  // repair is NOT free-standing: it happens at the next COMMIT that runs with
+  // AUTO-SYNC ON, which widens itself to a full scan-and-diff — the delta is
+  // then (committed content − empty baseline) and propagates into the view,
+  // making it exact from that commit on. A rollback has no commit to do that,
+  // so it asks for a view rebuild from committed storage instead.
+  //
+  // With auto-sync OFF nothing reconciles on its own: the caller must run an
+  // explicit dbsp_sync(), or turn auto-sync back on and commit once. The flag
+  // survives every intervening commit until a reconcile actually runs, so no
+  // ordering of those makes the view stay wrong.
+  //
+  // Returns false only when a scan that SHOULD have run failed; the caller
+  // must not replay an unseeded baseline as though it were table content.
+  // Record one failed reconcile scan. See reconcile_failures().
+  void note_reconcile_failure(const std::string &message) {
+    reconcile_failures_++;
+    std::lock_guard<std::mutex> g(reconcile_error_mutex_);
+    last_reconcile_error_ = message;
+  }
+
+  // Caller holds struct_mutex_ and view_mutex_ shared. See view_read_block().
+  // Keeps walking after finding a PROVISIONAL source so an UNSEEDED one
+  // anywhere in the tree wins — the enum is ordered worst-first, so "worst
+  // wins" is a `<` on it and needs no second ranking of its own.
+  void view_read_block_locked(const std::string &name,
+                              std::unordered_set<std::string> &seen,
+                              ViewReadBlock &out) {
+    if (out.state == TrackedTable::Baseline::Unseeded) {
+      return; // nothing outranks this
+    }
+    if (!seen.insert(name).second) {
+      return;
+    }
+    auto tbl = tracked_tables_.find(name);
+    if (tbl != tracked_tables_.end()) {
+      const auto state = tbl->second->baseline();
+      if (state < out.state) {
+        out = {state, name, tbl->second->pre_trigger_rows()};
+      }
+      return;
+    }
+    auto vw = views_.find(name);
+    if (vw == views_.end()) {
+      return;
+    }
+    for (const auto &src : vw->second->source_tables()) {
+      view_read_block_locked(src, seen, out);
+      if (out.state == TrackedTable::Baseline::Unseeded) {
+        return;
+      }
+    }
+  }
+
+  // `new_tracking`: this call is the one that ADDS the table to the tracked
+  // set (track_table_internal), rather than a later retry over a table that
+  // was already tracked (create_view). It is what decides whether uncommitted
+  // rows in the caller's transaction are a problem — see
+  // TrackedTable::pre_trigger_rows(). Rows written to an ALREADY-TRACKED table
+  // are accounted for whether or not its triggers exist yet: the triggers feed
+  // them, or `capture_.touched` names the table at that transaction's commit,
+  // because the statement that wrote it folded with the table tracked.
+  bool seed_baseline(duckdb::ClientContext &context,
+                     const std::string &table_name, bool new_tracking) {
+    if (std::getenv("DBSP_DEBUG_SEED")) {
+      std::cerr << "[dbsp] seed_baseline " << table_name
+                << " user_txn_open=" << user_transaction_open(context) << "\n";
+    }
+    if (user_transaction_open(context)) {
+      // Record the debt ON THE TABLE, which is where the baseline lives. Both
+      // consultation points already refuse to trust a DEFERRED baseline, and
+      // the commit hook's sweep finds it BY NAME and pays it with one scoped
+      // scan — from any connection, once the deferring transaction has ended.
+      // It used to be a sticky per-CONNECTION boolean that named no table, so
+      // only a full sync_all on that one connection could pay it.
+      auto it = tracked_tables_.find(table_name);
+      if (it != tracked_tables_.end()) {
+        const auto probe = probe_deferring_transaction(context, table_name);
+        if (!probe.answered) {
+          // No watermark means no way to know when this transaction ends, and
+          // so no way to ever retire the debt. Refuse to take it on; the
+          // caller drops the half-tracked table (track_table_internal) or
+          // fails the create (create_view).
+          throw duckdb::InvalidInputException(
+              "DBSP cannot track '%s' inside an open transaction: it could "
+              "not read that transaction's state (the table's catalog was not "
+              "found, or it has no DuckDB transaction manager), so it can tell "
+              "neither whether the transaction has already changed the table "
+              "nor when it ends. COMMIT or ROLLBACK first, then track the "
+              "table.",
+              table_name);
+        }
+        // Record the debt, without moving a recorded watermark forward past
+        // the retrying transaction itself: a retry (new_tracking=false) runs
+        // over an ALREADY-tracked table, so every write the caller holds went
+        // to triggers or commit capture — widening to the probe's watermark
+        // would hold the debt until the caller itself ends, availability for
+        // no coverage gain. The recorded watermark already covers everyone
+        // open at TRACK time, and anyone who opened later is trigger-covered.
+        // The one exception is a table that never recorded a debt (Unseeded
+        // direct track): there the probe's watermark is the first coverage,
+        // taken as-is.
+        const uint64_t recorded = it->second->ready_watermark();
+        it->second->mark_seed_deferred(
+            (new_tracking || recorded == 0) ? probe.watermark : recorded,
+            new_tracking && probe.tainted);
+      }
+      return true;
+    }
+    if (!sync_table_internal(context, table_name)) {
+      return false;
+    }
+    // CRITICAL: clear the pending changes the initial sync produced. The
+    // caller either initialized a view from this state already, or is about to
+    // replay it — applying them again would double-count.
+    auto it = tracked_tables_.find(table_name);
+    if (it != tracked_tables_.end()) {
+      it->second->consume_changes();
+      mark_provisional_if_concurrent(context, table_name, *it->second);
+    }
+    return true;
+  }
+
+  // What a deferral must know about the CALLER's transaction, asked ONCE, at
+  // the moment the table JOINS the tracked set, from one lookup of the table's
+  // catalog and one DuckTransaction. Both answers describe the same
+  // transaction, so they cannot disagree about which one the debt waits on.
+  //
+  //   tainted   — does this transaction hold ANY uncommitted change right now?
+  //               `DuckTransaction::ChangesMade()` is the engine's own
+  //               question — `undo_buffer.ChangesMade() ||
+  //               storage->ChangesMade()` (duckdb/src/transaction/
+  //               duck_transaction.cpp) — i.e. any delete or update of
+  //               committed rows, any catalog change or sequence use (the undo
+  //               buffer), or any append (local storage). It reads the
+  //               caller's OWN transaction state, not committed storage, so
+  //               the internal-connection law does not apply to it.
+  //   watermark — a start timestamp strictly newer than every transaction
+  //               active on the catalog RIGHT NOW (`probe_new_start_timestamp`,
+  //               which mints one by opening and rolling back a probe
+  //               transaction — the manager's counter is not publicly
+  //               readable). The minimum visibility bound must cover the
+  //               watermark before any track-time snapshot is considered gone;
+  //               durability can conservatively delay that point. This
+  //               INCLUDES a concurrent writer that started after
+  //               the deferring transaction but before the track: its
+  //               untracked pre-establish writes are invisible to any scan
+  //               taken while it is open, and establishing without them bakes
+  //               them out permanently (A1: measured `view 13.0` against SQL
+  //               `17.0`, permanently). The deferring transaction's own
+  //               start + 1 is NOT enough — it clears while such a writer is
+  //               still open. DuckDB removes a transaction from the active set
+  //               inside Commit(), BEFORE the TransactionCommit callbacks
+  //               (duckdb/src/transaction/transaction_context.cpp), so the
+  //               deferring connection's own commit hook sees it cleared and
+  //               pays the debt there — and so does any other connection's,
+  //               once every covered transaction has ended.
+  //
+  // CONSERVATIVE, deliberately. The engine does record WHICH table each
+  // uncommitted change belongs to — DeleteInfo, UpdateInfo and AppendInfo all
+  // carry a DuckTableEntry* — but only inside the undo buffer, whose
+  // iteration is private (UndoBuffer::IterateEntries), as is the buffer
+  // itself (DuckTransaction::undo_buffer); the per-table checkpoint locks a
+  // write takes (DuckTransaction::active_locks) have no accessor either.
+  // Nothing public answers "did THIS transaction change THIS table", so the
+  // rule is "did this transaction change ANYTHING". The first version asked
+  // `LocalStorage::Find(table)`, which IS per-table but reports only a
+  // transaction-local APPEND buffer: a DELETE or UPDATE of committed rows goes
+  // to the undo buffer and creates no local storage, so the deferral read
+  // untainted and a third connection's scan established a baseline that was
+  // short — measured `view 13.0` against SQL `10.0`, permanently, for both
+  // shapes (`tainted_delete_third_party_scan`,
+  // `tainted_update_third_party_scan`). What the coarser rule costs: a
+  // transaction that writes ANYTHING (another table, a CREATE TABLE, a
+  // sequence) and then tracks a table is tainted, so reads of views over that
+  // table are refused until it ends — availability, for one transaction's
+  // length, on a rare shape. A wrong answer is worse than a refusal. Never
+  // approximated from statement text.
+  //
+  // `answered` false means neither field means anything: the table's catalog
+  // was not found, or it has no DuckDB transaction manager, or the lookup
+  // threw. `require_trigger_capable_catalog` does not exclude that
+  // (catalog_supports_triggers is permissive on a throw), so the branch is not
+  // provably unreachable — and seed_baseline REFUSES the deferral there rather
+  // than record a debt it has no watermark to retire. There is no fail-safe
+  // value to store: "tainted, and never cleared until the deferring
+  // transaction ends" needs a watermark to know when that is, and without one
+  // the table would sit DEFERRED for the life of the process. Refusing the
+  // track, and saying why, is the honest answer.
+  struct DeferralProbe {
+    bool answered = false;
+    bool tainted = true;
+    uint64_t watermark = 0;
+  };
+  DeferralProbe probe_deferring_transaction(duckdb::ClientContext &context,
+                                            const std::string &table_name) {
+    DeferralProbe probe;
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return probe;
+      }
+      auto &tm = duckdb::TransactionManager::Get(*attached);
+      if (!tm.IsDuckTransactionManager()) {
+        return probe;
+      }
+      auto &txn = duckdb::DuckTransaction::Get(context, *attached);
+      probe.tainted = txn.ChangesMade();
+      // Widened (A1, correctness-first owner decision): strictly newer than
+      // every transaction active right now, not the caller's own start + 1.
+      // Zero means the probe could not mint one — answer nothing rather than
+      // record a debt no watermark can retire (same refusal as below).
+      const uint64_t watermark = probe_new_start_timestamp(context, *attached);
+      if (watermark == 0) {
+        return probe;
+      }
+      probe.watermark = watermark;
+      probe.answered = true;
+      return probe;
+    } catch (...) {
+      return DeferralProbe{};
+    }
+  }
+
+  // A baseline scanned from committed storage is short by whatever an ALREADY
+  // OPEN transaction on another connection wrote to this table before it was
+  // tracked: the scan cannot see those rows, and no trigger fired for them
+  // because there were no triggers when the statement ran. That commit reports
+  // nothing, and the view stays short forever (`10.0` against `13.0`, then
+  // `14.0` against `17.0`).
+  //
+  // So: if any transaction OLDER than this one is active on the table's
+  // catalog, mark the table provisional and record a watermark newer than
+  // every transaction alive right now. TrackedTable::mark_provisional explains
+  // what the flag costs and what retires it.
+  //
+  // "Older than this one" is detected when the minimum active snapshot bound
+  // is before my start; that is the shape that produced the defect. A
+  // transaction that begins DURING
+  // this seeding statement is not covered here — its writes to a still-
+  // untriggered table are the trigger-install window, which the sweep already
+  // answers by marking that transaction's own commit untrusted
+  // (`capture_.triggers_installed` → scan).
+  //
+  // Cost when nothing else is open: the minimum active snapshot bound is this
+  // transaction's own start, the comparison is false, and the table is never
+  // provisional — no extra scan, ever. That is the ordinary single-writer
+  // case.
+  // The reference is the CALLER'S OWN transaction start, and it has to be:
+  // a start timestamp probed on the spot instead would count the caller's own
+  // statement transaction as a concurrent older one and mark every table it
+  // touched PROVISIONAL. Measured while trying exactly that on the reconcile
+  // path (measured with the older start-timestamp API):
+  // `lowest_active_start=36 mine=53(probe)` for a bare `dbsp_sync()`, which
+  // then refused every read of the view it had just repaired. So this
+  // question can only be asked where there IS a caller transaction to be
+  // relative to — the seeding scan — and `retire_scanned_baseline` says what
+  // covers the reconcile path instead.
+  void mark_provisional_if_concurrent(duckdb::ClientContext &context,
+                                      const std::string &table_name,
+                                      TrackedTable &table) {
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return;
+      }
+      const uint64_t mine = static_cast<uint64_t>(
+          duckdb::DuckTransaction::Get(context, *attached).start_time);
+      if (no_active_snapshot_before(*attached, mine)) {
+        return; // nothing older than this transaction is open
+      }
+      const uint64_t watermark = probe_new_start_timestamp(context, *attached);
+      if (watermark == 0) {
+        return;
+      }
+      if (table.baseline() != TrackedTable::Baseline::Provisional) {
+        provisional_count_++;
+      }
+      table.mark_provisional(watermark);
+      if (std::getenv("DBSP_DEBUG_SEED")) {
+        std::cerr << "[dbsp] provisional " << table_name
+                  << " active_snapshot_before_mine=1 mine=" << mine
+                  << " watermark=" << watermark << "\n";
+      }
+    } catch (const std::exception &e) {
+      // A watermark that cannot be taken must not fail the seeding: the table
+      // stays non-provisional, which is exactly the behaviour before this gate.
+      record_error_best_effort(std::string("DBSP: could not take a seed "
+                                           "watermark for '") +
+                               table_name + "': " + e.what());
+    }
+  }
+
+  // THE rule that retires an untrusted baseline, for BOTH states that have
+  // one, run after every scan that succeeded (sync_table_scan_and_consume is
+  // the single funnel: dbsp_sync, the commit sweep, the read-path repair and
+  // crash recovery all reach storage through it).
+  //
+  // Three questions, and only a YES to all of them makes a baseline SEEDED:
+  //
+  //   1. Is anything owed at all? SEEDED tables are done.
+  //   2. Could THIS scan see the CALLER's own rows? A scan taken while the
+  //      caller holds a transaction open cannot, so it establishes nothing —
+  //      this is what makes an in-window `dbsp_sync()` honest instead of
+  //      silently serving a short baseline.
+  //   3. Has the transaction the STATE is waiting on ended? That is the stored
+  //      readiness watermark, and it is the same question for both untrusted
+  //      states: for PROVISIONAL, every transaction alive at seed time; for
+  //      DEFERRED, the transaction whose openness deferred the seed. The
+  //      reference is that transaction's start, recorded when the state was
+  //      taken — NOT the caller's, which is why this question can be asked
+  //      from a commit hook where there is no caller transaction at all.
+  //
+  // A NO to (2) leaves the state exactly where it was.
+  //
+  // A NO to (3) depends on WHOSE rows are missing, and that is the whole of
+  // the rule for DEFERRED:
+  //
+  //   * UNTAINTED (TrackedTable::pre_trigger_rows() false) — the deferring
+  //     transaction tracked the table BEFORE it wrote to it, so every write it
+  //     makes is accounted for: by its triggers, or by `capture_.touched`
+  //     naming the table at its own commit. Those account for the DEFERRING
+  //     transaction only. A scan may therefore establish the baseline ONLY
+  //     once no transaction OLDER than the scan itself is still open: an
+  //     older open transaction may hold untracked pre-establish writes that
+  //     are invisible here and would be baked out permanently once SEEDED
+  //     (A1, correctness-first owner decision 2026-09-10). In hook context
+  //     there is no caller transaction, so "older" degrades to "anyone else
+  //     open" and the deferring connection's own commit still pays when it
+  //     is alone. This refuses the untainted third-party establish the old
+  //     rule allowed — the 110.0-during-the-window pins become
+  //     refusal-in-window, the accepted availability cost.
+  //   * TAINTED — the deferring transaction already held uncommitted changes
+  //     when the table was tracked (any at all — appends, deletes, updates:
+  //     `DuckTransaction::ChangesMade()`, see probe_deferring_transaction for
+  //     why it is not per-table). Nothing will ever report those changes, so
+  //     only a scan taken once that transaction is GONE can establish the
+  //     baseline. Measured without this distinction: A opens a transaction,
+  //     writes an UNTRACKED table, creates a view over it; B, holding no
+  //     transaction, runs `dbsp_sync()`; B's scan marks the baseline SEEDED at
+  //     10.0; A's commit then finds nothing owed and the view reads `10.0`
+  //     against SQL `13.0`, permanently. Pinned by `third_party_scan`.
+  //
+  // A tainted table therefore stays DEFERRED — reads refused, which is the
+  // acceptable price for the rare write-then-track-in-one-transaction shape —
+  // until the deferring transaction ends and the watermark clears. The first
+  // statement-context scan after that establishes it; a commit-hook sweep
+  // scans but cannot establish while anyone is still registered (A1).
+  //
+  // The seeding-path concurrency check (mark_provisional_if_concurrent) is NOT
+  // asked here, and cannot be: it needs a reference start timestamp, and a
+  // reconcile has no caller transaction to use. A timestamp probed on the spot
+  // counts the caller's OWN statement transaction as an older concurrent one —
+  // measured with the older start-timestamp API,
+  // `lowest_active_start=36 mine=53(probe)` on a bare `dbsp_sync()`, which
+  // then marked the table PROVISIONAL and refused every read of the view it
+  // had just repaired. The stored watermark needs no reference of its own,
+  // but it answers a NARROWER question: has the transaction that deferred a
+  // seed on THIS table (or, for PROVISIONAL, every transaction alive at ITS
+  // seed time) ended. It knows nothing of a transaction that wrote the table
+  // while it was untracked and never deferred anything on it — that shape is
+  // OPEN, see *Concurrent non-deferring writer* in
+  // docs/DESIGN_TRIGGER_SOURCE.md.
+  void retire_scanned_baseline(duckdb::ClientContext &context,
+                               const std::string &table_name,
+                               TrackedTable &table) {
+    const auto state = table.baseline();
+    if (state == TrackedTable::Baseline::Seeded) {
+      return;
+    }
+    if (user_transaction_open(context)) {
+      return;
+    }
+    if (state == TrackedTable::Baseline::Provisional) {
+      if (ready_watermark_cleared(context, table_name, table)) {
+        table.retire_provisional();
+        provisional_count_--;
+      }
+      return;
+    }
+    if (table.pre_trigger_rows() &&
+        !ready_watermark_cleared(context, table_name, table)) {
+      return; // rows nobody will report, and their transaction is still alive
+    }
+    // UNTAINTED establish (A1, correctness-first): no older open transaction.
+    // The widened readiness watermark covers every transaction open at TRACK
+    // time for the sweep pre-filter; this refuses the establish itself while
+    // ANY transaction older than the establishing scan is still open — such
+    // a transaction may hold untracked pre-establish writes invisible here
+    // that would be baked out permanently once SEEDED. With no live
+    // statement transaction (commit-hook sweep) only an empty active set
+    // establishes. Refusal is transient: the next scan after that
+    // transaction ends establishes normally. This is the accepted
+    // availability cost: reads during the window are refused instead of
+    // served (the 110.0 pins).
+    if (!untainted_establish_allowed(context, table_name)) {
+      return;
+    }
+    table.mark_seeded();
+  }
+
+  // Has the transaction this table's state is waiting on ended? PROVISIONAL
+  // waits on every transaction that was active when it was seeded; DEFERRED
+  // waits on the one whose openness deferred the seed. Neither state is ever
+  // entered with a zero watermark any more — a deferral whose watermark cannot
+  // be taken is REFUSED (probe_deferring_transaction), and a provisional mark
+  // without one is never taken — so the zero branch below is the field's
+  // resting value on a SEEDED table, where nothing consults it.
+  bool ready_watermark_cleared(duckdb::ClientContext &context,
+                               const std::string &table_name,
+                               const TrackedTable &table) {
+    const uint64_t watermark = table.ready_watermark();
+    if (watermark == 0) {
+      return true;
+    }
+    try {
+      auto attached = attached_of_table_key(context, table_name);
+      if (!attached) {
+        return false;
+      }
+      const bool cleared =
+          no_active_snapshot_before(*attached, watermark);
+      if (std::getenv("DBSP_DEBUG_SEED")) {
+        std::cerr << "[dbsp] watermark check " << table_name
+                  << " cleared=" << cleared << " watermark=" << watermark
+                  << "\n";
+      }
+      return cleared;
+    } catch (...) {
+      return false;
+    }
+  }
+
   bool track_table_internal(duckdb::ClientContext &context,
                             const std::string &table_ref) {
     // Called with struct_mutex_ exclusively held.
@@ -4596,6 +6631,14 @@ private:
     if (tracked_tables_.count(table_name)) {
       return true;
     }
+
+    // Change capture is statement triggers, and CREATE TRIGGER needs storage
+    // version v2.0.0 or higher. Refuse BEFORE the table joins the tracked set,
+    // so `CREATE MATERIALIZED VIEW` over a source in an older database fails
+    // with one readable error naming the migration. Without this the view was
+    // created, the source was tracked, and every later statement on that
+    // connection — including COMMIT and ROLLBACK — threw from the sweep.
+    require_trigger_capable_catalog(context, table_name);
 
     TableSchema schema;
     if (!get_table_schema(context, table_name, schema)) {
@@ -4627,18 +6670,33 @@ private:
       std::lock_guard<std::mutex> g(seeds_mutex_);
       auto seed = deferred_seeds_.find(table_name);
       if (seed != deferred_seeds_.end()) {
-        tracked_tables_[table_name]->mark_deferred(seed->second.first,
+        tracked_tables_[table_name]->mark_restore_pending(seed->second.first,
                                                    seed->second.second);
         deferred_tables_++;
         return true;
       }
     }
 
-    sync_table_internal(context, table_name);
-    // CRITICAL: Clear pending changes from initial sync so they don't get
-    // propagated as deltas to views that were already initialized with this
-    // state in CDCManager::create_view
-    tracked_tables_[table_name]->consume_changes();
+    const auto untrack = [&] {
+      tracked_tables_.erase(table_name);
+      table_schemas_.erase(table_name);
+      table_locks_.erase(table_name);
+    };
+    bool seeded = false;
+    try {
+      seeded = seed_baseline(context, table_name, /*new_tracking=*/true);
+    } catch (...) {
+      // seed_baseline refused to defer (probe_deferring_transaction could not
+      // answer): the table must not stay tracked with a debt nothing can
+      // retire. Drop it and let the refusal reach the statement that asked.
+      untrack();
+      throw;
+    }
+    if (!seeded) {
+      last_error_ = "Failed to seed the baseline of '" + table_name + "'";
+      untrack();
+      return false;
+    }
     return true;
   }
 
@@ -4653,6 +6711,52 @@ private:
   // Speed lever: a pre-counted big table spills BEFORE the scan and, when
   // every column type has a fast path, streams PRE-SERIALIZED rows
   // straight off the chunk vectors — no per-cell Value boxing anywhere.
+  // Lever A (create-path RAM): a freshly scanned SPILLED baseline holds
+  // its whole digest index as a RAM hash map (~100B/row — ~14GB at 144M)
+  // until the first save folds it into the sorted mmap'd sidecar. Fold
+  // and self-adopt IMMEDIATELY after the scan instead: the same fold the
+  // first save would pay (that save then clean-skips), and the map is
+  // freed for the rest of the create. Only called where table content is
+  // COMMIT-STABLE (initial track scan, rebuild refresh) — never from the
+  // mid-statement materialize path, whose SQL watermark could observe
+  // in-flight writes. No-op unless spilled, durable, and not already
+  // flat-mapped. Caller holds the table lock.
+  //
+  // TWO callers, and they do not share a policy — sync_table_internal (the
+  // SEEDING path, Forbidden) and rebuild_all_views (a refresh from QueryBegin,
+  // AllowedInTxn) — so this carries the CALLER's, exactly as live_watermark
+  // does. A hard-coded policy here would misdescribe one of them, and the
+  // throw it raised would land inside the best-effort catch below and be
+  // swallowed; hence also the hoist noted at the check itself.
+  void fold_fresh_baseline(duckdb::ClientContext &context,
+                           const std::string &table_name, TrackedTable &tt,
+                           InternalReadPolicy policy, const char *site) {
+    if (!tt.spilled() || tt.baseline_flat_mapped()) {
+      return;
+    }
+    // OUTSIDE the try: the catch below is a best-effort net for a failed fold,
+    // and a swallowed law violation is not a failed fold — it is the diagnostic
+    // the strict switch exists to produce.
+    enforce_internal_read_policy(context, policy, site);
+    try {
+      InternalConnection con_owner(context, policy, site);
+      auto &con = *con_owner;
+      auto wm = con.Query(
+          "SELECT COUNT(*), CAST(bit_xor(hash(__dbsp_wm_row)) AS VARCHAR) "
+          "FROM " +
+          quote_table_key(table_name) + " __dbsp_wm_row");
+      if (wm->HasError() || wm->RowCount() != 1) {
+        return;
+      }
+      DbspScopeTimer t("baseline_fold", table_name);
+      tt.save_spill_index(wm->GetValue(0, 0).GetValue<int64_t>(),
+                          wm->GetValue(1, 0).ToString());
+    } catch (...) {
+      // Best-effort: a failed fold just leaves the RAM map in place; the
+      // first save folds it as before.
+    }
+  }
+
   bool sync_table_internal(duckdb::ClientContext &context,
                            const std::string &table_name) {
     auto it = tracked_tables_.find(table_name);
@@ -4664,8 +6768,14 @@ private:
       if (!tt.spilled()) {
         const size_t th = TrackedTable::auto_spill_threshold();
         if (th != 0) {
-          InternalQueryGuard guard;
-          duckdb::Connection con(duckdb::DatabaseInstance::GetDatabase(context));
+          // FORBIDDEN. A COUNT(*) over the USER's table, on the SEEDING path:
+          // the same shape and the same path as the seeding scan below, and it
+          // decides whether that scan spills. A count taken without the
+          // caller's uncommitted rows is the wrong count for them.
+          InternalConnection con_owner(
+              context, InternalReadPolicy::Forbidden,
+              "sync_table_internal (auto-spill probe)");
+          auto &con = *con_owner;
           auto cnt = con.Query("SELECT COUNT(*) FROM " +
                                quote_table_key(table_name));
           if (!cnt->HasError() && cnt->RowCount() == 1 &&
@@ -4682,14 +6792,28 @@ private:
             context, table_name,
             [&](const std::vector<uint8_t> &bytes) {
               tt.add_scanned_bytes(bytes);
-            });
+            },
+            // FORBIDDEN, and it means it: this is the SEEDING scan, the one
+            // that ESTABLISHES a baseline. seed_baseline already refuses to
+            // reach here inside an open user transaction (it defers and
+            // records the debt instead), so a throw under the strict switch
+            // means that refusal has been bypassed.
+            InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
       if (!streamed) {
-        stream_table_rows(context, table_name, [&](DuckDBRow &&row) {
-          tt.add_scanned_row(std::move(row));
-        });
+        stream_table_rows(
+            context, table_name,
+            [&](DuckDBRow &&row) { tt.add_scanned_row(std::move(row)); },
+            InternalReadPolicy::Forbidden, "sync_table_internal (seeding)");
       }
-      tt.install_rebuild();
+      // establishes=true: THE seeding scan, and the only site that passes
+      // true. seed_baseline refuses to reach here inside an open user
+      // transaction, and runs the concurrency check
+      // (mark_provisional_if_concurrent) over the baseline this installs.
+      tt.install_rebuild(/*establishes=*/true);
+      fold_fresh_baseline(context, table_name, tt,
+                          InternalReadPolicy::Forbidden,
+                          "sync_table_internal (baseline fold)");
       return true;
     } catch (const std::exception &e) {
       (void)e;
@@ -4706,10 +6830,11 @@ private:
   // mid-table).
   static bool stream_table_serialized(
       duckdb::ClientContext &context, const std::string &table_key,
-      const std::function<void(const std::vector<uint8_t> &)> &emit) {
-    InternalQueryGuard guard;
-    auto &fresh_db = duckdb::DatabaseInstance::GetDatabase(context);
-    duckdb::Connection fresh_con(fresh_db);
+      const std::function<void(const std::vector<uint8_t> &)> &emit,
+      InternalReadPolicy policy, const char *site) {
+    InternalConnection fresh_con_owner(context, policy,
+                                  site);
+    auto &fresh_con = *fresh_con_owner;
     auto sql_result =
         fresh_con.SendQuery("SELECT * FROM " + quote_table_key(table_key));
     if (!sql_result || sql_result->HasError()) {
@@ -4826,11 +6951,36 @@ private:
   // O(Δ) end to end — no view is ever reset or recomputed from full state.
   void propagate_changes(const std::string &source_name,
                          const DuckDBZSet &delta) {
-    if (delta.empty())
+    propagate_changes_multi({{source_name, &delta}});
+  }
+
+  // One circuit pass for ALL of a commit's table deltas. Stepping once per
+  // source is not just slower — it is WRONG twice over for a multi-table
+  // commit: (1) each pass rewrites every downstream view's
+  // single-generation delta buffer, so dbsp_changes consumers keep only
+  // the LAST source's effects; (2) a join both of whose sides changed in
+  // the commit needs both deltas in ONE apply_changes_batch for its
+  // −Δl⋈Δr both-shared correction to fire. Duplicate source names are a
+  // caller error (last one wins in the pending map).
+  void propagate_changes_multi(
+      const std::vector<std::pair<std::string, const DuckDBZSet *>>
+          &all_sources) {
+    std::vector<std::pair<std::string, const DuckDBZSet *>> sources;
+    sources.reserve(all_sources.size());
+    for (const auto &s : all_sources) {
+      if (s.second != nullptr && !s.second->empty()) {
+        sources.push_back(s);
+      }
+    }
+    if (sources.empty())
       return;
-    // Every baseline mutation lands here; write-capture commit guards
-    // compare against this to detect interleaved commits (see
-    // docs/DESIGN_WRITE_CAPTURE.md).
+    // Every baseline mutation lands here, and commit_seq_ is the delta
+    // generation stamped on each view's single-generation delta buffer
+    // (view_delta_generation_) so a dbsp_changes consumer can skip a stale
+    // one. One bump per PASS: all views stepped below share this pass's
+    // generation. (It also backs dbsp_stats()'s commit_seq. The write-capture
+    // commit guards it was originally written for are gone, along with their
+    // design doc.)
     commit_seq_++;
     dirty_since_save_ = true;
 
@@ -4856,14 +7006,16 @@ private:
     // view applies at most once per pass (topological order guarantees
     // every dependent reads first).
     std::unordered_map<std::string, const DuckDBZSet *> pending;
-    pending[source_name] = &delta;
+    for (const auto &s : sources) {
+      pending[s.first] = s.second;
+    }
 
     // Shared arrangements are updated BEFORE any consuming view steps —
     // join nodes rely on the arrangement being post-delta and drop their
     // Δl⋈Δr term to compensate (Δl⋈R_new = Δl⋈R_old + Δl⋈Δr)
-    {
-      DbspScopeTimer t_arr("arrangements", source_name);
-      apply_to_arrangements(source_name, delta);
+    for (const auto &s : sources) {
+      DbspScopeTimer t_arr("arrangements", s.first);
+      apply_to_arrangements(s.first, *s.second);
     }
 
     // Group the topological order into levels: views in the same level
@@ -4871,10 +7023,17 @@ private:
     // Everything they read while stepping is frozen for the level —
     // pending deltas from earlier levels, shared arrangements (updated
     // before views step / between levels), and their own private state.
+    std::vector<std::string> source_names;
+    source_names.reserve(sources.size());
+    for (const auto &s : sources) {
+      source_names.push_back(s.first);
+    }
     const std::vector<std::string> topo =
-        dep_graph_.topological_order(source_name);
+        dep_graph_.topological_order(source_names);
     std::unordered_map<std::string, size_t> level_of;
-    level_of[source_name] = 0;
+    for (const auto &name : source_names) {
+      level_of[name] = 0;
+    }
     std::vector<std::vector<std::string>> levels;
     for (const auto &view_name : topo) {
       auto it = views_.find(view_name);
@@ -4897,8 +7056,8 @@ private:
     // D-lazy (Global Constraint): a delta arriving for a pending view, or
     // any of its pending ancestors, must realize it FIRST -- deltas must
     // never apply to un-restored state, and no join node may probe a
-    // still-`needs_backfill` shared arrangement. `topo` is source_name's
-    // transitive DEPENDENT set only (things downstream of source_name) --
+    // still-`needs_backfill` shared arrangement. `topo` is the sources'
+    // transitive DEPENDENT set only (things downstream of the sources) --
     // it is NOT the same as "every pending ancestor of the views about to
     // step". Counter-example (reviewer-reproduced): v2 = side1 LEFT JOIN
     // v1, v1 the shared/arrangement-probed side, v3 depends on v2. Editing
@@ -4923,7 +7082,7 @@ private:
     // locked's own early return), in exchange for not having to reach
     // into PlannedCircuitView-specific arrangement metadata here, and for
     // working uniformly across every NativeMaterializedView kind. Views
-    // genuinely unrelated to source_name's dependent cone -- not in topo
+    // genuinely unrelated to the sources' dependent cones -- not in topo
     // and not feeding anything in it -- are still never touched, so this
     // does not regress laziness for the unrelated-view case D-lazy exists
     // for; it only closes the sibling-branch correctness gap. Mirrors the
@@ -4950,13 +7109,18 @@ private:
       if (!views_.count(name)) {
         continue; // a table dependency: nothing to realize, walk stops
       }
-      realize_pending_view_locked(name);
       for (const auto &dep : dep_graph_.get_dependencies(name)) {
         if (realize_seen.insert(dep).second) {
           realize_worklist.push_back(dep);
         }
       }
     }
+    // Walk first, realize after: the closure walk needs no realized state
+    // (dep_graph_ edges only), which lets the whole worklist realize as
+    // ONE batch — per-view blob fetch, decode, and own-arrangement
+    // backfill fanned across worker threads — instead of a sequential
+    // fetch/decode/backfill per view in walk order.
+    realize_pending_views_locked(realize_worklist);
 
     struct StepResult {
       std::string view_name;
@@ -5215,11 +7379,26 @@ private:
   // consumers building change feeds need this to skip stale buffers.
   // Guarded by view_mutex_ alongside views_.
   std::unordered_map<std::string, uint64_t> view_delta_generation_;
+  // INCREMENTAL SAVE: per-view delta generation as of the last COMMITted
+  // checkpoint, and the catalog it was written to. A view still at its
+  // saved generation has unchanged operator state, so its existing
+  // _dbsp_ckpt rows are still valid and the next save preserves them
+  // instead of re-serializing. Cleared wholesale whenever the catalog
+  // differs, so a cross-catalog save never preserves rows that are not
+  // there. Guarded by view_mutex_ alongside views_.
+  std::unordered_map<std::string, uint64_t> view_saved_generation_;
+  std::string view_saved_catalog_;
   // D-lazy: checkpoint blobs for views the load fast path cold-created but
   // has not yet decoded (NativeMaterializedView::is_pending_restore()).
   // Tier 3 (view_mutex_) -- see stash_pending_view/realize_pending_view.
   std::unordered_map<std::string, PendingViewCkpt> pending_restore_;
   std::unordered_map<std::string, ViewDefinition> view_definitions_;
+  // Exact image of the view definitions as of the last COMMITted full save
+  // to view_defs_saved_catalog_ — lets an unchanged save skip rewriting the
+  // whole _dbsp_views table. See save_to_duck_table for why this is the
+  // content and not a change counter.
+  std::string view_defs_saved_image_;
+  std::string view_defs_saved_catalog_;
   DependencyGraph dep_graph_;
   std::string last_error_;
   // ON by default: a materialized view keeps itself current. Turn off
@@ -5243,11 +7422,19 @@ private:
   // checkpoint had nothing" from "this call restored 0 because everything
   // was already loaded by an earlier call".
   size_t last_skipped_count_ = 0;
-  std::atomic<uint64_t> captured_delta_syncs_{0};
+  std::atomic<uint64_t> exact_delta_syncs_{0};
+  // Tables currently PROVISIONAL. The commit hook's sweep loads this and
+  // returns when it is zero, which is every commit of an ordinary session.
+  std::atomic<uint64_t> provisional_count_{0};
+  // See reconcile_failures(). Its own mutex, not struct_mutex_: the reporting
+  // loop in sync_tables runs with no manager lock held on purpose, and
+  // record_error_best_effort's exclusive struct_mutex_ next to it is already
+  // the delicate part of that sequence.
+  std::atomic<uint64_t> reconcile_failures_{0};
+  mutable std::mutex reconcile_error_mutex_;
+  std::string last_reconcile_error_;
   std::atomic<uint64_t> scan_syncs_{0};
-  // Write-capture (UPDATE/DELETE) observability + conflict detection:
-  // commit_seq_ advances on every propagated baseline mutation and on
-  // full rebuilds; guard failures fall back to scan-and-diff, loudly.
+  // Advances on every propagated baseline mutation and on full rebuilds.
   std::atomic<uint64_t> commit_seq_{0};
   // Set by anything that changes persistable state (commits, view DDL);
   // cleared by a successful save_checkpoint. The close-time auto-save
@@ -5261,7 +7448,30 @@ private:
   // (full write at create/enable, per-commit delta apply after each
   // propagation). Reads still come from circuit state until Phase 1c.
   std::atomic<bool> mv_tables_enabled_{false};
+  // The USER said dbsp_mv_tables(false). Distinct from mv_tables_enabled_,
+  // which several error paths also clear on their own: only an explicit
+  // disable sets this, and only an explicit enable clears it. It is what
+  // load_from_duck_table's __dbsp_mv_meta block honours, so a reattach or a
+  // crash-recovery load cannot resurrect mirroring the user turned off.
+  std::atomic<bool> mv_tables_user_disabled_{false};
   duckdb::DatabaseInstance *mv_db_ = nullptr; // captured at create_view
+  // F9: persistent mirror connection + per-view stage/SQL cache. A fresh
+  // Connection per commit made every mirror pass recreate its stage and
+  // rebuild ~7 statements per touched view (~40 views/commit on wfp —
+  // measured 1.49ms mean per view, ~42% of a steady edit). The connection
+  // and the per-view TEMP stages live until the next save_checkpoint:
+  // a live Connection holds a strong DatabaseInstance reference, and the
+  // manager hangs off the instance, so holding it forever is an ownership
+  // CYCLE that blocks instance shutdown (reproduced as a suite hang) —
+  // save_checkpoint releases it (every close path saves; autopersists
+  // rebuild the cache lazily on the next commit). Any mirror failure or
+  // mv_db_ change also resets (mv_reset_mirror_conn). Used ONLY by
+  // mv_after_propagate — other mirror writers keep their own short-lived
+  // connections. (MvViewStmts is defined above mv_apply_delta.)
+  std::unique_ptr<duckdb::Connection> mv_con_;
+  duckdb::DatabaseInstance *mv_con_db_ = nullptr;
+  std::unordered_map<std::string, MvViewStmts> mv_stmts_;
+  bool mv_meta_ready_ = false;
   // Phase 1c: views whose sink stopped integrating — the __mv_ table IS
   // the result; reads, replays and backfills stream from it. Guarded by
   // view_mutex_.
@@ -5272,8 +7482,6 @@ private:
   // tables ADOPTS their tables instead of re-backfilling. Cold-created
   // views (no/declined checkpoint) recompute fresh and must backfill.
   std::unordered_set<std::string> ckpt_restored_views_;
-  std::atomic<uint64_t> capture_guard_fallbacks_{0};
-  std::atomic<bool> write_capture_enabled_{true};
   // D3c lazy baselines: count of deferred tables (lock-free hot-path
   // check), pending full-rebuild flag (out-of-band change detected against
   // a deferred baseline; consumed by rebuild_all_views), and the
@@ -5284,6 +7492,13 @@ private:
   std::mutex seeds_mutex_;
   std::unordered_map<std::string, std::pair<int64_t, std::string>>
       deferred_seeds_;
+  // View-arrangement sidecar identity (seeds_mutex_): (seq, 16-hex id) of
+  // the checkpoint currently on disk for this database. Loads seed it
+  // from the checkpoint's 'saveid' row; every save mints a fresh id (see
+  // the design note at save_checkpoint's sidecar loop). Empty id = no
+  // adoptable checkpoint identity known.
+  int64_t view_arr_seq_ = -1;
+  std::string view_arr_id_;
   size_t last_deferred_count_ = 0;
   // D-lazy: default ON (see enable_lazy_restore/disable_lazy_restore), and
   // views left pending by the last load_from_duck_table call (mirrors
@@ -5309,6 +7524,68 @@ private:
                   static_cast<unsigned long long>(
                       std::hash<std::string>{}(fingerprint)));
     return spill_dir_ + "/sharr_" + hex + ".flat";
+  }
+
+  // Recovery inc 3 + view-arrangement sidecars: adopt a shared
+  // arrangement's durable sidecar when its stamp matches (wc, wh) — the
+  // source's verified identity (a deferred table's load-checked watermark,
+  // or the loaded checkpoint's save-id for a pending view's arrangement).
+  // Delta chain first: a delta sidecar whose stamp matches names the base
+  // it overlays; adopt that base and convert each replacement bucket into
+  // overlay deltas. On success `flat` (plus any overlay) holds exactly the
+  // stamped content and the sidecar bookkeeping fields are set.
+  bool adopt_arrangement_sidecar(SharedArrangement &arr,
+                                 const std::string &fingerprint, int64_t wc,
+                                 const std::string &wh) {
+    int64_t base_wc = -1;
+    std::string base_wh;
+    flatpacked::ReplacementBuckets repl;
+    if (flatpacked::load_flat_delta_file(sharr_path(fingerprint) + ".d",
+                                         fingerprint, wc, wh, base_wc,
+                                         base_wh, repl) &&
+        flatpacked::load_flat_index_file(sharr_path(fingerprint), fingerprint,
+                                         base_wc, base_wh, arr.flat)) {
+      for (auto &[kb, rows] : repl) {
+        // overlay delta = replacement − base bucket
+        std::unordered_map<std::string, int64_t> m;
+        for (const auto &[rb, w] : rows) {
+          m[rb] += w;
+        }
+        const auto *fe = arr.flat.find(kb);
+        if (fe != nullptr) {
+          for (uint32_t b = 0; b < fe->bucket_n; b++) {
+            const auto &be = arr.flat.bucket_at(fe->bucket_off + b);
+            m[std::string(reinterpret_cast<const char *>(
+                              arr.flat.arena_data() + be.row_off),
+                          be.row_len)] -= be.weight;
+          }
+        }
+        std::vector<std::pair<std::string, int64_t>> deltas;
+        for (auto &[rb, w] : m) {
+          if (w != 0) {
+            deltas.emplace_back(rb, w);
+          }
+        }
+        if (!deltas.empty()) {
+          arr.packed[kb] = std::move(deltas);
+        }
+      }
+      arr.flat_file_wm_count = base_wc;
+      arr.flat_file_wm_hash = base_wh;
+      // The delta's content is already on disk for this stamp.
+      arr.sidecar_saved_wm_count = wc;
+      arr.sidecar_saved_wm_hash = wh;
+      return true;
+    }
+    if (flatpacked::load_flat_index_file(sharr_path(fingerprint), fingerprint,
+                                         wc, wh, arr.flat)) {
+      arr.flat_file_wm_count = wc;
+      arr.flat_file_wm_hash = wh;
+      arr.sidecar_saved_wm_count = wc;
+      arr.sidecar_saved_wm_hash = wh;
+      return true;
+    }
+    return false;
   }
 
   // Best-effort capture of the default catalog's file path (durable spill

@@ -6,11 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(TARGET_NAME dbsp)
 set(EXT_VERSION_DBSP "0.1.0")
-# The duckdb/ submodule tracks current DuckDB main (bumped regularly), so
-# the tip compatibility path is the only one the submodule pin actually
-# supports; pass -DDBSP_TIP_PORT=OFF only against a separately checked-out
-# pre-tip DuckDB tree (e.g. an old release branch).
-option(DBSP_TIP_PORT "Use current DuckDB tip compatibility path" ON)
 option(DBSP_USE_PARENT_DUCKDB
        "Use DuckDB targets from the containing extension build" OFF)
 
@@ -21,10 +16,13 @@ if(NOT EXISTS "${DUCKDB_SOURCE_DIR}/src/include/duckdb.hpp")
     message(FATAL_ERROR "DuckDB source not found at ${DUCKDB_SOURCE_DIR}. Run build.sh to fetch it.")
 endif()
 
-# Standalone builds own a DuckDB tree. When loaded by DuckDB's extension
-# build, the parent already owns DuckDB and adding it again creates duplicate
-# extension targets.
-if(NOT DBSP_USE_PARENT_DUCKDB AND NOT TARGET duckdb_static)
+# Standalone builds own the DuckDB tree. An extension build may opt into the
+# DuckDB targets already provided by its parent to avoid adding DuckDB twice.
+if(DBSP_USE_PARENT_DUCKDB)
+    if(NOT TARGET duckdb_static)
+        message(FATAL_ERROR "DBSP_USE_PARENT_DUCKDB=ON requires a parent DuckDB build with target duckdb_static")
+    endif()
+elseif(NOT TARGET duckdb_static)
     set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
     set(BUILD_SHELL ON CACHE BOOL "" FORCE)
     set(BUILD_EXTENSIONS "" CACHE STRING "" FORCE)
@@ -34,7 +32,16 @@ endif()
 # Extension source
 # Extension build
 set(DUCKDB_MODULE_BASE_DIR "${DUCKDB_SOURCE_DIR}")
-set(DUCKDB_NORMALIZED_VERSION "v1.5.4")
+find_package(Git REQUIRED)
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} -C "${DUCKDB_SOURCE_DIR}" rev-parse --short=10 HEAD
+    OUTPUT_VARIABLE DUCKDB_NORMALIZED_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE DUCKDB_GIT_HASH_RESULT
+)
+if(NOT DUCKDB_GIT_HASH_RESULT EQUAL 0 OR NOT DUCKDB_NORMALIZED_VERSION)
+    message(FATAL_ERROR "Could not determine the DuckDB extension version from ${DUCKDB_SOURCE_DIR}")
+endif()
 set(DUCKDB_EXTENSION_DBSP_EXT_VERSION ${EXT_VERSION_DBSP})
 set(PARAMETERS "-warnings")
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS}
@@ -49,23 +56,14 @@ target_include_directories(${TARGET_NAME}_loadable_extension PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${DUCKDB_SOURCE_DIR}/src/include
     ${DUCKDB_SOURCE_DIR}/extension/core_functions/include
+    # DuckDB 2.0: core headers (cast_helpers.hpp) include "fmt/format.h".
+    # DuckDB adds third_party/fmt/include at its own project scope, which does
+    # not reach targets defined in this parent project.
     ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
 )
 
-# SaaS-fork engine hook consumer. Requires the patched engine
-# (patches/v1.5.4-dbsp-txn-callback.patch applied to a v1.5.4-era duckdb/
-# tree) — the duckdb::TransactionModifications/TransactionModificationCallback
-# types it consumes don't exist in stock DuckDB. Since the submodule pin now
-# tracks current tip (unpatched, and the patch predates the tip API moves),
-# this defaults OFF; the capture stack does the work instead. Pass
-# -DDBSP_ENGINE_HOOK=ON only against a separately patched v1.5.4-era tree.
-option(DBSP_ENGINE_HOOK "Consume the patched engine's txn-modification callback" OFF)
-if(DBSP_ENGINE_HOOK)
-    target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_ENGINE_HOOK)
-endif()
-if(DBSP_TIP_PORT)
-    target_compile_definitions(${TARGET_NAME}_loadable_extension PRIVATE DBSP_TIP_PORT)
-endif()
+# The DuckDB tree in duckdb/ is STOCK — the extension carries no engine patch.
+# Change capture comes from generated statement triggers (dbsp_trigger_source.hpp).
 
 message(STATUS "")
 message(STATUS "DBSP DuckDB Extension v${EXT_VERSION_DBSP}")
@@ -93,7 +91,4 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/benchmark_runner.cpp")
     target_link_libraries(benchmark_runner duckdb_static
                           duckdb_generated_extension_loader
                           core_functions_extension parquet_extension)
-    if(DBSP_ENGINE_HOOK)
-        target_compile_definitions(benchmark_runner PRIVATE DBSP_ENGINE_HOOK)
-    endif()
 endif()

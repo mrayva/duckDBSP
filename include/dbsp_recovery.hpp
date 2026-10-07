@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 #include <string>
+#include <mutex>
+#include <map>
 #include <vector>
 #include <memory>
 
@@ -51,13 +53,26 @@ public:
 
   /**
    * @brief Mark that session started (called on connection open)
+   *
+   * REFCOUNTED PER DATABASE. Several sessions can be open on one database
+   * file, and the crash marker must survive until the LAST of them closes —
+   * otherwise the first close drops the shared lock and every session still
+   * running is unprotected: a crash after that point looks like a clean
+   * exit, so the next open skips recovery.
+   *
+   * @param db  the DatabaseInstance this session belongs to, so the close
+   *            path can find its recovery directory without re-deriving it
+   *            from a half-torn-down context.
    */
-  void mark_session_start();
+  void mark_session_start(const void *db = nullptr);
 
   /**
-   * @brief Mark that session ended cleanly (called on connection close)
+   * @brief Mark that one session ended cleanly (called on connection close)
+   *
+   * Drops the lock only when this was the last session on that database.
+   * With no argument, ends EVERY tracked session (process teardown).
    */
-  void mark_session_end();
+  void mark_session_end(const void *db = nullptr);
 
   /**
    * @brief Get recovery directory path
@@ -116,7 +131,30 @@ private:
    */
   std::string determine_recovery_path(const std::string &db_path) const;
 
-  std::string recovery_path_;  ///< Path to recovery directory
+  /// The recovery directory of the recovery currently running. Only valid
+  /// inside recover_from_crash (which holds recovery_mutex_ throughout);
+  /// state that must outlive a recovery lives in db_paths_/session_counts_.
+  std::string recovery_path_;
+  /// An explicitly configured directory, or empty for "derive it from the
+  /// database file". Kept SEPARATE from recovery_path_: deriving from the
+  /// mutated member made the second database opened in a process inherit
+  /// the FIRST one's directory, so it wrote no marker of its own and read
+  /// the first one's live lock as a crash.
+  const std::string configured_path_;
+  /// Live sessions per recovery directory. The lock file is written when a
+  /// path's count reaches 1 and removed when it falls back to 0, so a
+  /// database with two sessions open stays crash-protected until both go.
+  std::map<std::string, int> session_counts_;
+  /// DatabaseInstance -> its recovery directory, recorded at session start.
+  /// The close path runs during teardown, where re-deriving the path from
+  /// the context is unreliable.
+  std::map<const void *, std::string> db_paths_;
+  mutable std::mutex sessions_mutex_;
+  /// Serializes recover_from_crash, which mutates recovery_path_ and now
+  /// runs once per DATABASE rather than once per process. Separate from
+  /// sessions_mutex_ because that call path takes that lock too, and
+  /// std::mutex is not recursive.
+  mutable std::mutex recovery_mutex_;
   bool recovery_enabled_;      ///< Whether recovery is enabled
   bool session_started_;       ///< Whether session has been marked as started
 };

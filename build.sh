@@ -4,48 +4,52 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
-# Set to 1 to build against a patched v1.5.4-era engine instead (SaaS-fork
-# engine-hook consumer, patches/v1.5.4-dbsp-txn-callback.patch). Requires
-# your own patched duckdb/ checkout — the submodule tracks current tip,
-# which the patch does not apply to. Legacy path, unmaintained.
-DBSP_ENGINE_HOOK="${DBSP_ENGINE_HOOK:-0}"
+DUCKDB_VERSION="v2.1.0-dev84912"
+DUCKDB_COMMIT="a770db1197ec428f11d7b9529c66389b4e40c87d"
 
 echo "=== DBSP DuckDB Extension Build ==="
 echo ""
 
-# duckdb/ is a git submodule tracking current DuckDB main. Content check, not
-# just the directory: a fresh checkout of this repo leaves duckdb/ as an
-# EMPTY submodule placeholder until initialized.
+# Check if DuckDB source exists. Content check, not just the directory: a CI
+# checkout of this repo leaves duckdb/ as an EMPTY submodule dir, and git
+# commands run inside it silently resolve against THIS repo.
+# Pin the exact tested tip commit; branch names and alpha tags can drift.
 if [ ! -f "$SCRIPT_DIR/duckdb/CMakeLists.txt" ]; then
-    echo "Initializing duckdb/ submodule..."
-    git -C "$SCRIPT_DIR" submodule update --init --depth 1 duckdb
+    echo "Fetching DuckDB ${DUCKDB_VERSION} (${DUCKDB_COMMIT})..."
+    git init -q "$SCRIPT_DIR/duckdb"
+    git -C "$SCRIPT_DIR/duckdb" remote add origin https://github.com/duckdb/duckdb.git
+    git -C "$SCRIPT_DIR/duckdb" fetch --depth 1 origin "$DUCKDB_COMMIT"
+    git -C "$SCRIPT_DIR/duckdb" checkout --detach FETCH_HEAD
 fi
 
-if [ "$DBSP_ENGINE_HOOK" = "1" ]; then
-    # Guard: duckdb/ must be its own git checkout (patch checks below would
-    # otherwise run against the wrong repo).
-    DUCKDB_TOPLEVEL=$(git -C "$SCRIPT_DIR/duckdb" rev-parse --show-toplevel 2>/dev/null || true)
-    if [ "$DUCKDB_TOPLEVEL" != "$SCRIPT_DIR/duckdb" ]; then
-        echo "ERROR: $SCRIPT_DIR/duckdb is not a standalone DuckDB checkout (toplevel: ${DUCKDB_TOPLEVEL:-none})." >&2
-        exit 1
-    fi
+# Guard: duckdb/ must be its own git checkout (the version stamping and any
+# git query below would otherwise run against the wrong repo).
+DUCKDB_TOPLEVEL=$(git -C "$SCRIPT_DIR/duckdb" rev-parse --show-toplevel 2>/dev/null || true)
+if [ "$DUCKDB_TOPLEVEL" != "$SCRIPT_DIR/duckdb" ]; then
+    echo "ERROR: $SCRIPT_DIR/duckdb is not a standalone DuckDB checkout (toplevel: ${DUCKDB_TOPLEVEL:-none})." >&2
+    exit 1
+fi
 
-    # Apply the engine patches (the patch files ARE the fork — stock DuckDB
-    # lacks the txn-callback symbols the extension needs). Idempotent: skip
-    # patches the tree already carries, fail loudly if one neither applies
-    # nor reverse-applies.
-    for patch in "$SCRIPT_DIR"/patches/*.patch; do
-        if git -C "$SCRIPT_DIR/duckdb" apply --check --reverse "$patch" 2>/dev/null; then
-            echo "Patch already applied: $(basename "$patch")"
-        elif git -C "$SCRIPT_DIR/duckdb" apply --check "$patch" 2>/dev/null; then
-            echo "Applying patch: $(basename "$patch")"
-            git -C "$SCRIPT_DIR/duckdb" apply "$patch"
-        else
-            echo "ERROR: $(basename "$patch") neither applies cleanly nor is already applied." >&2
-            echo "The duckdb/ tree has drifted from the patch — reconcile before building." >&2
-            exit 1
-        fi
-    done
+# The engine tree is STOCK. There is no patch step: change capture comes from
+# generated statement triggers, which are plain SQL objects the stock engine
+# already supports. A dirty duckdb/ tree is therefore a mistake, not a build
+# input — say so rather than compiling something nobody can reproduce.
+if [ -n "$(git -C "$SCRIPT_DIR/duckdb" status --porcelain)" ]; then
+    echo "ERROR: $SCRIPT_DIR/duckdb has local modifications; this fork builds against a STOCK engine." >&2
+    echo "       Run: git -C \"$SCRIPT_DIR/duckdb\" checkout -- ." >&2
+    exit 1
+fi
+
+# Submodule checkout state is controlled by the superproject, but standalone
+# clones and existing worktrees may still point elsewhere. Enforce the same
+# tested commit in either case instead of silently building a different tip.
+DUCKDB_CURRENT_COMMIT=$(git -C "$SCRIPT_DIR/duckdb" rev-parse HEAD)
+if [ "$DUCKDB_CURRENT_COMMIT" != "$DUCKDB_COMMIT" ]; then
+    echo "Pinning DuckDB to ${DUCKDB_VERSION} (${DUCKDB_COMMIT})..."
+    if ! git -C "$SCRIPT_DIR/duckdb" cat-file -e "${DUCKDB_COMMIT}^{commit}" 2>/dev/null; then
+        git -C "$SCRIPT_DIR/duckdb" fetch --depth 1 origin "$DUCKDB_COMMIT"
+    fi
+    git -C "$SCRIPT_DIR/duckdb" checkout --detach "$DUCKDB_COMMIT"
 fi
 
 # Create build directory
@@ -62,15 +66,13 @@ fi
 if command -v ninja >/dev/null 2>&1 && [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     CMAKE_EXTRA_ARGS+=("-GNinja")
 fi
-if [ "$DBSP_ENGINE_HOOK" = "1" ]; then
-    CMAKE_EXTRA_ARGS+=("-DDBSP_ENGINE_HOOK=ON" "-DDBSP_TIP_PORT=OFF")
-fi
 
 # Configure
 echo "Configuring..."
-cmake .. \
+DUCKDB_VERSION="$DUCKDB_VERSION" cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DDUCKDB_SOURCE_DIR="$SCRIPT_DIR/duckdb" \
+    -DDUCKDB_EXPLICIT_VERSION="$DUCKDB_VERSION" \
     "${CMAKE_EXTRA_ARGS[@]}"
 
 # Build (parallelism capped at 8 — higher has frozen this machine before)
@@ -82,6 +84,12 @@ fi
 JOBS=$(( NCPU < 8 ? NCPU : 8 ))
 echo "Building (-j${JOBS})..."
 cmake --build . -j"${JOBS}"
+
+# The DuckDB shell is NOT part of `all`: the root CMakeLists sets BUILD_SHELL ON
+# but pulls the DuckDB tree in with EXCLUDE_FROM_ALL, so the `shell` target has to
+# be named explicitly. verify_extension.sh looks for build/duckdb/duckdb first.
+echo "Building DuckDB shell (-j${JOBS})..."
+cmake --build . --target shell -j"${JOBS}"
 
 echo ""
 echo "=== Build Complete ==="
